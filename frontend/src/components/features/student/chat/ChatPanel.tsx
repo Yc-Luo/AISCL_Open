@@ -1,0 +1,1063 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+import {
+  SendHorizontal,
+  Bot,
+  AtSign,
+  Smile,
+  Image as ImageIcon,
+  Loader2,
+  X,
+  RotateCw,
+  ZoomIn,
+  ZoomOut,
+  Download,
+  Reply,
+  Undo2
+} from 'lucide-react'
+import { storageService } from '../../../../services/api/storage'
+import { syncService } from '../../../../services/sync/SyncService'
+
+import { useAuthStore } from '../../../../stores/authStore'
+import { usePresenceStore } from '../../../../stores/presenceStore'
+import { projectService } from '../../../../services/api/project'
+import { userService } from '../../../../services/api/user'
+import api from '../../../../services/api/client'
+import { User } from '../../../../types'
+import { useChatSync } from '../../../../hooks/chat/useChatSync'
+import { ChatMessage, getChatTimestampMs, normalizeChatTimestamp } from '../../../../modules/chat/ChatPersistence' // Use shared type
+import { trackingService } from '../../../../services/tracking/TrackingService'
+import { useContextStore } from '../../../../stores/contextStore'
+import { Toast } from '../../../ui/Toast'
+import AIResponseRenderer from '../ai/AIResponseRenderer'
+
+interface ChatPanelProps {
+  projectId: string
+  isActive?: boolean
+  onUnreadChange?: (state: { chatUnread?: number; chatMentions?: number }) => void
+  onMentionNotification?: (message: string) => void
+}
+
+const getMessageKey = (message: ChatMessage): string => message.client_message_id || message.id
+const AI_TYPING_LABEL = 'AISCL智能助手'
+const AI_TYPING_ALIASES = ['AISCL智能助手', '智能助手', 'AI智能助手']
+const AI_ASSISTANT_NAME = 'AISCL智能助手'
+const MAX_CHAT_IMAGE_BYTES = 10 * 1024 * 1024
+const compareChatMessages = (currentUserId?: string) => (a: ChatMessage, b: ChatMessage) => {
+  const timeDiff = getChatTimestampMs(a.timestamp) - getChatTimestampMs(b.timestamp)
+  if (timeDiff !== 0) return timeDiff
+  const rank = (message: ChatMessage) => {
+    if (message.user_id === currentUserId) return 1
+    if (message.user_id === 'ai_assistant') return 2
+    return 0
+  }
+  const rankDiff = rank(a) - rank(b)
+  if (rankDiff !== 0) return rankDiff
+  return getMessageKey(a).localeCompare(getMessageKey(b))
+}
+
+interface ProjectMemberRef {
+  user_id: string
+}
+
+interface ChatHistoryMessageResponse {
+  id: string
+  client_message_id?: string
+  user_id: string
+  username: string
+  avatar_url?: string
+  content: string
+  message_type: string
+  mentions?: string[]
+  created_at: string
+  ai_meta?: ChatMessage['ai_meta']
+  teacher_support?: ChatMessage['teacher_support']
+  teacher_help_request?: ChatMessage['teacher_help_request']
+  file_info?: ChatMessage['file_info']
+}
+
+interface ChatHistoryResponse {
+  messages: ChatHistoryMessageResponse[]
+}
+
+interface TypingEventPayload {
+  roomId: string
+  userId: string
+  username?: string
+}
+
+export default function ChatPanel({ projectId, isActive = true, onUnreadChange, onMentionNotification }: ChatPanelProps) {
+  const [inputValue, setInputValue] = useState('')
+  const [showMentionMenu, setShowMentionMenu] = useState(false)
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false)
+  const [isUploading, setIsUploading] = useState(false)
+  const [members, setMembers] = useState<User[]>([])
+  const [typingUsers, setTypingUsers] = useState<Set<string>>(new Set())
+
+  // New States for Lightbox, Context Menu, and Reply
+  const [lightboxImage, setLightboxImage] = useState<{ url: string, name: string } | null>(null)
+  const [lightboxZoom, setLightboxZoom] = useState(1)
+  const [lightboxRotation, setLightboxRotation] = useState(0)
+  const [contextMenu, setContextMenu] = useState<{ x: number, y: number, message: ChatMessage } | null>(null)
+  const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null)
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null)
+
+  const messagesEndRef = useRef<HTMLDivElement>(null)
+  const messageListRef = useRef<HTMLDivElement>(null)
+  const contextMenuRef = useRef<HTMLDivElement>(null)
+  const autoScrollRef = useRef(true)
+  const knownMessageKeysRef = useRef<Set<string> | null>(null)
+  const unreadRef = useRef({ chatUnread: 0, chatMentions: 0 })
+  const inputRef = useRef<HTMLInputElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const { user } = useAuthStore()
+  const isPresenceOnline = usePresenceStore(state => state.isOnline)
+  const currentStage = useContextStore((state) => state.currentStage)
+  const experimentVersionId = useContextStore((state) => state.experimentVersionId)
+
+  // Use new Chat Sync Hook
+  const { messages, setMessages, sendMessage, connected } = useChatSync({
+    projectId,
+  })
+  const displayedMessages = [...messages].sort(compareChatMessages(user?.id))
+
+  useEffect(() => {
+    knownMessageKeysRef.current = null
+    unreadRef.current = { chatUnread: 0, chatMentions: 0 }
+    onUnreadChange?.({ chatUnread: 0, chatMentions: 0 })
+    setLightboxImage(null)
+    setReplyingTo(null)
+    setContextMenu(null)
+    // Only reset transient chat UI when switching projects. Parent callbacks may
+    // be recreated during normal renders; depending on them here closes the image
+    // preview immediately after it opens.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId])
+
+  useEffect(() => {
+    if (!isActive) return
+    unreadRef.current = { chatUnread: 0, chatMentions: 0 }
+    onUnreadChange?.({ chatUnread: 0, chatMentions: 0 })
+  }, [isActive, onUnreadChange])
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    if (!autoScrollRef.current) return
+    window.requestAnimationFrame(() => {
+      messagesEndRef.current?.scrollIntoView({ behavior, block: 'end' })
+    })
+  }, [])
+
+  useEffect(() => {
+    const currentKeys = new Set(displayedMessages.map(getMessageKey))
+    if (!knownMessageKeysRef.current) {
+      knownMessageKeysRef.current = currentKeys
+      return
+    }
+
+    let unreadDelta = 0
+    let mentionDelta = 0
+    displayedMessages.forEach((message) => {
+      const key = getMessageKey(message)
+      if (knownMessageKeysRef.current?.has(key)) return
+      knownMessageKeysRef.current?.add(key)
+
+      const fromSelf = message.user_id === user?.id
+      const isSystem = message.message_type === 'system'
+      const isMentioned = message.mentions.includes(user?.id || '') || Boolean(user?.username && message.content.includes(`@${user.username}`))
+      if (!fromSelf && !isSystem && !isActive) {
+        unreadDelta += 1
+        if (isMentioned) mentionDelta += 1
+      }
+      if (!fromSelf && isMentioned && !isActive) {
+        const notification = `${message.username || '小组成员'} 在群聊中提到了你。`
+        if (onMentionNotification) {
+          onMentionNotification(notification)
+        } else {
+          setToast({ message: notification, type: 'success' })
+        }
+      }
+    })
+
+    if (unreadDelta || mentionDelta) {
+      unreadRef.current = {
+        chatUnread: unreadRef.current.chatUnread + unreadDelta,
+        chatMentions: unreadRef.current.chatMentions + mentionDelta,
+      }
+      onUnreadChange?.(unreadRef.current)
+    }
+  }, [displayedMessages, isActive, onMentionNotification, onUnreadChange, user?.id, user?.username])
+
+  const handleMessageListScroll = () => {
+    const el = messageListRef.current
+    if (!el) return
+    autoScrollRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 96
+  }
+
+  // Fetch project members for mention list
+  useEffect(() => {
+    const fetchMembers = async () => {
+      try {
+        const project = await projectService.getProject(projectId)
+        const memberIds = project.members.map((member: ProjectMemberRef) => member.user_id)
+        if (memberIds.length > 0) {
+          const memberUsers = await userService.getUsers(memberIds)
+          setMembers(memberUsers.filter((member) => member.role === 'student'))
+        }
+      } catch (error) {
+        console.error('Failed to fetch members:', error)
+      }
+    }
+
+    if (projectId) {
+      fetchMembers()
+    }
+  }, [projectId])
+
+  // Removed direct socket event listeners (user_joined, user_left) for now
+  // These should be handled by observing Room Store or via SyncService events in the future
+
+  // Fetch historical messages from API
+  useEffect(() => {
+    let isMounted = true;
+    if (!projectId) return
+
+    const fetchMessages = async () => {
+      try {
+        const response = await api.get<ChatHistoryResponse>(`/chat/projects/${projectId}/messages?limit=50`)
+        if (response.data && response.data.messages && isMounted) {
+          // Convert API response to ChatMessage format
+          const history: ChatMessage[] = response.data.messages.map((m) => ({
+            id: m.id,
+            client_message_id: m.client_message_id,
+            user_id: m.user_id,
+            username: m.username,
+            avatar_url: m.avatar_url,
+            content: m.content,
+            message_type: m.message_type,
+            mentions: m.mentions || [],
+            timestamp: normalizeChatTimestamp(m.created_at), // Map created_at to timestamp
+            ai_meta: m.ai_meta,
+            teacher_support: m.teacher_support,
+            teacher_help_request: m.teacher_help_request,
+            file_info: m.file_info,
+            isPending: false
+          })).reverse() // API returns newest first
+
+          setMessages(currentMessages => {
+            // Deduplicate using Map
+            const msgMap = new Map<string, ChatMessage>();
+
+            // 1. Add history first
+            history.forEach((m: ChatMessage) => msgMap.set(getMessageKey(m), m));
+
+            // 2. Add current messages, but do not overwrite persisted history with pending optimistic copies
+            currentMessages.forEach((m: ChatMessage) => {
+              const key = getMessageKey(m)
+              const existing = msgMap.get(key)
+              if (existing && !existing.isPending && m.isPending) {
+                return
+              }
+              msgMap.set(key, existing ? { ...existing, ...m } : m)
+            })
+
+            // 3. Convert back to array and sort by timestamp
+            return Array.from(msgMap.values()).sort((a, b) =>
+              getChatTimestampMs(a.timestamp) - getChatTimestampMs(b.timestamp)
+            );
+          })
+        }
+      } catch (error) {
+        console.error('Failed to fetch chat history:', error)
+      }
+    }
+
+    fetchMessages()
+
+    return () => { isMounted = false; }
+  }, [connected, projectId, setMessages])
+
+  useEffect(() => {
+    scrollToBottom('smooth')
+  }, [messages, scrollToBottom, typingUsers.size])
+
+  useEffect(() => {
+    if (!messages.some((msg) => msg.user_id === 'ai_assistant' && msg.content.trim())) return
+    setTypingUsers((prev) => {
+      const next = new Set(prev)
+      AI_TYPING_ALIASES.forEach(label => next.delete(label))
+      return next
+    })
+  }, [messages])
+
+  const EMOJIS = ['😊', '😂', '🥰', '😍', '🤔', '😎', '😭', '😮', '👍', '🔥', '🙌', '✨', '🎉', '💡', '✅', '❌']
+
+  const insertAIMention = () => {
+    setInputValue(prev => {
+      if (prev.includes(`@${AI_ASSISTANT_NAME}`)) return prev
+      return prev.endsWith(' ') || prev === '' ? `${prev}@${AI_ASSISTANT_NAME} ` : `${prev} @${AI_ASSISTANT_NAME} `
+    })
+    setShowMentionMenu(false)
+    setShowEmojiPicker(false)
+    inputRef.current?.focus()
+  }
+
+  const handleEmojiSelect = (emoji: string) => {
+    setInputValue(prev => prev + emoji)
+    setShowEmojiPicker(false)
+    inputRef.current?.focus()
+  }
+
+  // Handle image selection
+  const handleImageClick = () => {
+    if (fileInputRef.current) {
+      fileInputRef.current.accept = 'image/*'
+      fileInputRef.current.click()
+    }
+  }
+
+  // Lightbox Handlers
+  const handleDownload = (url: string, name: string) => {
+    const link = document.createElement('a')
+    link.href = url
+    link.download = name
+    link.target = '_blank'
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+  }
+
+  // Context Menu Handlers
+  const handleContextMenu = (e: React.MouseEvent, msg: ChatMessage) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setContextMenu({ x: e.clientX, y: e.clientY, message: msg })
+  }
+
+  const handleReplyMessage = (msg: ChatMessage) => {
+    setReplyingTo(msg)
+    setContextMenu(null)
+    inputRef.current?.focus()
+  }
+
+  const handleRecallMessage = async (msg: ChatMessage) => {
+    if (msg.user_id !== user?.id) return
+    // Optimistically update or just trigger sync
+    try {
+      await sendMessage(msg.id, [], undefined, undefined, true) // Pass msg.id as content for recall
+      setContextMenu(null)
+    } catch (err) {
+      console.error('Failed to recall:', err)
+      setToast({ message: '撤回失败，请稍后重试。', type: 'error' })
+    }
+  }
+
+  // Close the custom context menu only on an outside left-button pointer down.
+  // A global click listener is too broad: some browsers emit a click-like event
+  // after contextmenu, which immediately closes the menu that was just opened.
+  useEffect(() => {
+    if (!contextMenu) return
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (event.button !== 0) return
+      const target = event.target as Node | null
+      if (target && contextMenuRef.current?.contains(target)) return
+      setContextMenu(null)
+    }
+
+    window.addEventListener('pointerdown', handlePointerDown, true)
+    return () => window.removeEventListener('pointerdown', handlePointerDown, true)
+  }, [contextMenu])
+
+  // Listen for typing events
+  useEffect(() => {
+    const onTyping = (data: TypingEventPayload) => {
+      if (data.roomId !== `project:${projectId}`) return
+      setTypingUsers(prev => {
+        const next = new Set(prev)
+        next.add(data.userId === 'ai_assistant' ? AI_TYPING_LABEL : (data.username || 'Someone'))
+        return next
+      })
+      scrollToBottom('smooth')
+    }
+    const onStopTyping = (data: TypingEventPayload) => {
+      if (data.roomId !== `project:${projectId}`) return
+      setTypingUsers(prev => {
+        const next = new Set(prev)
+        if (data.userId === 'ai_assistant') {
+          AI_TYPING_ALIASES.forEach(label => next.delete(label))
+          if (data.username) next.delete(data.username)
+        } else {
+          const user = members.find(m => m.id === data.userId)
+          if (user) next.delete(user.username)
+          if (data.username) next.delete(data.username)
+        }
+        return next
+      })
+    }
+
+    syncService.on('typing', onTyping)
+    syncService.on('stop_typing', onStopTyping)
+
+    return () => {
+      syncService.off('typing', onTyping)
+      syncService.off('stop_typing', onStopTyping)
+    }
+  }, [members, projectId, scrollToBottom])
+
+
+  const handleImageUpload = async (fileInput: React.ChangeEvent<HTMLInputElement> | File) => {
+    const file = fileInput instanceof File ? fileInput : fileInput.target.files?.[0]
+    if (!file || !projectId) return
+    if (!file.type.startsWith('image/')) {
+      setToast({ message: '请选择图片文件。', type: 'error' })
+      return
+    }
+    if (file.size > MAX_CHAT_IMAGE_BYTES) {
+      setToast({ message: '图片过大，请压缩到 10MB 以内后再发送。', type: 'error' })
+      return
+    }
+
+    setIsUploading(true)
+    try {
+      const resource = await storageService.uploadResourceFile({
+        file,
+        project_id: projectId,
+        source_type: 'chat_attachment',
+      })
+      const imageUrl = storageService.getResourceViewUrl(resource.id)
+
+      await sendMessage('', [], {
+        name: file.name,
+        size: file.size,
+        url: imageUrl,
+        mimeType: file.type,
+        resourceId: resource.id,
+      })
+
+      trackingService.track({
+        module: 'chat',
+        action: 'chat_message_send',
+        metadata: {
+          projectId,
+          type: 'image',
+          size: file.size,
+          resourceId: resource.id,
+        }
+      })
+
+      trackingService.trackResearchEvent({
+        project_id: projectId,
+        experiment_version_id: experimentVersionId || undefined,
+        actor_type: 'student',
+        event_domain: 'dialogue',
+        event_type: 'peer_image_send',
+        stage_id: currentStage || undefined,
+        payload: {
+          mime_type: file.type,
+          file_size: file.size,
+          resource_id: resource.id,
+          has_reply_context: !!replyingTo,
+        }
+      })
+
+    } catch (error) {
+      console.error('Image upload failed:', error)
+      setToast({ message: '图片发送失败，请检查网络后重试。', type: 'error' })
+    } finally {
+      setIsUploading(false)
+      if (fileInputRef.current) fileInputRef.current.value = ''
+    }
+  }
+
+  const handlePaste = async (e: React.ClipboardEvent) => {
+    const items = e.clipboardData.items
+    let sawFile = false
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].kind === 'file') sawFile = true
+      if (items[i].type.indexOf('image') !== -1) {
+        const file = items[i].getAsFile()
+        if (file) {
+          handleImageUpload(file)
+        }
+      }
+    }
+    if (sawFile && !Array.from(items).some((item) => item.type.includes('image'))) {
+      setToast({ message: '聊天框目前仅支持粘贴图片文件。', type: 'error' })
+    }
+  }
+
+  // Handle member selection from mention list
+  const handleSelectMention = (member: User) => {
+    const cursorPos = inputRef.current?.selectionStart || inputValue.length
+    const before = inputValue.substring(0, cursorPos)
+    const after = inputValue.substring(cursorPos)
+
+    // Add space before @ if needed
+    const prefix = before === '' || before.endsWith(' ') ? '' : ' '
+    const newMention = `${prefix}@${member.username} `
+
+    setInputValue(before + newMention + after)
+    setShowMentionMenu(false)
+
+    // Set focus back and move cursor
+    setTimeout(() => {
+      inputRef.current?.focus()
+      const newPos = cursorPos + newMention.length
+      inputRef.current?.setSelectionRange(newPos, newPos)
+    }, 0)
+  }
+
+
+
+  const handleSend = async () => {
+    if (!inputValue.trim() && !replyingTo) return
+    if (!connected) return
+
+    const sendContent = inputValue.replace(/＠/g, '@')
+    const previousReplyingTo = replyingTo
+
+    // Extract mentions...
+    const mentionRegex = /@([\w\u4e00-\u9fa5]+)/g
+    const mentionedUsernames: string[] = []
+    let match
+    while ((match = mentionRegex.exec(sendContent)) !== null) {
+      mentionedUsernames.push(match[1])
+    }
+
+    const mentions: string[] = []
+    mentionedUsernames.forEach(username => {
+      const member = members.find(m => m.username === username)
+      if (member) mentions.push(member.id)
+    })
+    const isAIAddressed = sendContent.includes(`@${AI_ASSISTANT_NAME}`)
+    if (isAIAddressed && !mentions.includes('ai_assistant')) {
+      mentions.push('ai_assistant')
+    }
+
+    setInputValue('')
+    setReplyingTo(null)
+    setShowMentionMenu(false)
+    setShowEmojiPicker(false)
+
+    try {
+      await sendMessage(sendContent, mentions, undefined, previousReplyingTo?.id)
+    } catch (error) {
+      console.error('Failed to send chat message:', error)
+      setInputValue(sendContent)
+      setReplyingTo(previousReplyingTo)
+      setToast({ message: '消息发送失败，请检查网络后重试。', type: 'error' })
+      return
+    }
+
+    trackingService.track({
+      module: 'chat',
+      action: 'chat_message_send',
+      metadata: {
+        projectId,
+        type: 'text',
+        length: sendContent.length,
+        hasMentions: mentions.length > 0,
+        isReply: !!previousReplyingTo
+      }
+    })
+  }
+
+  const handleKeyPress = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleSend()
+    } else if (e.key === 'Escape') {
+      setShowMentionMenu(false)
+      setShowEmojiPicker(false)
+    }
+  }
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = e.target.value
+    setInputValue(value)
+  }
+
+  // Members excluding current user for mentions
+  const otherMembers = members.filter(m => m.id !== user?.id)
+
+  return (
+    <div className="flex flex-col h-full relative overflow-hidden bg-gray-50/50">
+      <style>{`
+        @keyframes msgSlideUp {
+          from { opacity: 0; transform: translateY(12px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        .message-animate {
+          animation: msgSlideUp 0.3s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+        }
+      `}</style>
+
+      {/* Lightbox Overlay */}
+      {lightboxImage && (
+        <div
+          className="fixed inset-0 z-[100] bg-black/95 backdrop-blur-sm flex flex-col items-center justify-center animate-in fade-in duration-200"
+          onClick={(event) => {
+            if (event.target === event.currentTarget) {
+              setLightboxImage(null)
+            }
+          }}
+        >
+          {/* Controls */}
+          <div
+            className="absolute top-0 inset-x-0 p-6 flex items-center justify-between bg-gradient-to-b from-black/60 to-transparent"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <span className="text-white font-medium text-sm truncate max-w-sm">{lightboxImage.name}</span>
+            <div className="flex items-center gap-4">
+              <button
+                type="button"
+                onClick={() => setLightboxZoom(prev => Math.min(prev + 0.5, 4))}
+                className="p-2 text-white/70 hover:text-white transition-colors"
+                title="Zoom In"
+              >
+                <ZoomIn className="w-5 h-5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setLightboxZoom(prev => Math.max(prev - 0.5, 0.5))}
+                className="p-2 text-white/70 hover:text-white transition-colors"
+                title="Zoom Out"
+              >
+                <ZoomOut className="w-5 h-5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setLightboxRotation(prev => prev + 90)}
+                className="p-2 text-white/70 hover:text-white transition-colors"
+                title="Rotate"
+              >
+                <RotateCw className="w-5 h-5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDownload(lightboxImage.url, lightboxImage.name)}
+                className="p-2 text-white/70 hover:text-white transition-colors"
+                title="Download"
+              >
+                <Download className="w-5 h-5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setLightboxImage(null)}
+                className="p-2 bg-white/10 hover:bg-white/20 text-white rounded-full transition-all"
+                title="Close"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+          </div>
+
+          <div className="flex-1 w-full flex items-center justify-center p-12 overflow-auto">
+            <img
+              src={lightboxImage.url}
+              className="max-w-full max-h-full transition-transform duration-300 shadow-2xl"
+              style={{ transform: `scale(${lightboxZoom}) rotate(${lightboxRotation}deg)` }}
+              alt="Preview"
+              onClick={(event) => event.stopPropagation()}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Context Menu */}
+      {contextMenu && (
+        <div
+          ref={contextMenuRef}
+          className="fixed z-[110] w-48 bg-white border border-gray-100 rounded-xl shadow-[0_10px_40px_-10px_rgba(0,0,0,0.1)] py-2 animate-in zoom-in-95 duration-100"
+          style={{ top: contextMenu.y, left: contextMenu.x }}
+          onClick={(e) => e.stopPropagation()}
+          onPointerDown={(e) => e.stopPropagation()}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <button
+            onClick={() => handleReplyMessage(contextMenu.message)}
+            className="w-full px-4 py-2.5 text-left text-sm text-gray-700 hover:bg-indigo-50 flex items-center gap-3 transition-colors"
+          >
+            <Reply className="w-4 h-4 text-indigo-500" />
+            <span>引用回复</span>
+          </button>
+          {contextMenu.message.user_id === user?.id && (
+            <button
+              onClick={() => handleRecallMessage(contextMenu.message)}
+              className="w-full px-4 py-2.5 text-left text-sm text-red-600 hover:bg-red-50 flex items-center gap-3 transition-colors"
+            >
+              <Undo2 className="w-4 h-4" />
+              <span>撤回消息</span>
+            </button>
+          )}
+        </div>
+      )}
+
+      <div ref={messageListRef} onScroll={handleMessageListScroll} className="flex-1 overflow-y-auto p-4 space-y-2">
+        {!connected && (
+          <div className="mb-3 rounded-xl border border-amber-100 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800">
+            聊天连接暂时中断，恢复后再发送消息。
+          </div>
+        )}
+        {displayedMessages.length === 0 && (
+          <div className="mx-auto mt-8 max-w-sm rounded-3xl border border-dashed border-indigo-100 bg-indigo-50/50 px-5 py-6 text-center">
+            <div className="mx-auto mb-3 flex h-11 w-11 items-center justify-center rounded-2xl bg-white text-indigo-600 shadow-sm">
+              <Bot className="h-5 w-5" />
+            </div>
+            <div className="text-sm font-bold text-slate-800">开始小组讨论</div>
+            <p className="mt-2 text-xs leading-5 text-slate-500">
+              可以先说明当前任务理解，或使用 @ 提及同伴和智能体获得支持。新的 @ 提醒会在侧栏折叠时显示。
+            </p>
+          </div>
+        )}
+        {displayedMessages.map((msg: ChatMessage, index: number) => {
+          const isOwnMessage = msg.user_id === user?.id
+          const isAIMessage = msg.user_id === 'ai_assistant' || msg.user_id.startsWith('auto_prompt:')
+          const isMentioned = msg.mentions.includes(user?.id || '') || Boolean(user?.username && msg.content.includes(`@${user.username}`))
+          const prevMsg = index > 0 ? displayedMessages[index - 1] : null
+
+          // Grouping logic: hide name/time if same user and within 5 mins
+          const isSameUser = prevMsg && prevMsg.user_id === msg.user_id
+          const isRecent = prevMsg && (getChatTimestampMs(msg.timestamp) - getChatTimestampMs(prevMsg.timestamp) < 300000)
+          const shouldShowHeader = !isSameUser || !isRecent || msg.message_type === 'system'
+          const showAvatar = msg.message_type !== 'system' && !isOwnMessage && shouldShowHeader
+          const replyMessage = msg.reply_to ? displayedMessages.find(m => m.id === msg.reply_to) : null
+
+          return (
+            <div
+              key={getMessageKey(msg)}
+              id={`message-${msg.id}`}
+              data-chat-message-key={getMessageKey(msg)}
+              data-chat-sender-id={msg.user_id}
+              data-chat-message-type={msg.message_type}
+              className={`flex items-end gap-2 ${isOwnMessage ? 'justify-end' : 'justify-start'} ${shouldShowHeader ? 'mt-4' : 'mt-1'} message-animate`}
+              onContextMenu={(e) => handleContextMenu(e, msg)}
+            >
+              {showAvatar ? (
+                isAIMessage ? (
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-100 text-indigo-600 shadow-sm">
+                    <Bot className="h-4 w-4" />
+                  </div>
+                ) : msg.avatar_url ? (
+                  <img src={msg.avatar_url} className="h-8 w-8 shrink-0 rounded-full border border-gray-100 object-cover" alt={msg.username} />
+                ) : (
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-slate-100 text-xs font-bold text-slate-600">
+                    {(msg.username || 'U')[0]?.toUpperCase()}
+                  </div>
+                )
+              ) : !isOwnMessage && msg.message_type !== 'system' ? (
+                <div className="h-8 w-8 shrink-0" />
+              ) : null}
+              <div
+                className={`max-w-[92%] lg:max-w-[84%] px-3 py-2 rounded-xl transition-all ${isOwnMessage
+                  ? 'bg-indigo-600 text-white rounded-tr-none shadow-indigo-100 shadow-md'
+                  : msg.message_type === 'system'
+                    ? 'bg-gray-100 text-gray-600 text-center mx-auto text-xs py-1 px-4 rounded-full'
+                    : isAIMessage
+                      ? 'bg-indigo-50 border border-indigo-100 text-slate-900 rounded-tl-none shadow-sm'
+                      : isMentioned
+                        ? 'bg-amber-50 border border-amber-200 text-gray-900 rounded-tl-none shadow-sm'
+                    : 'bg-white border border-gray-200 text-gray-900 rounded-tl-none shadow-sm'
+                  } ${isMentioned ? 'ring-2 ring-yellow-400' : ''}`}
+              >
+                {msg.is_recalled ? (
+                  <div className="text-[11px] italic opacity-60 flex items-center gap-1.5 py-0.5">
+                    <Undo2 className="w-3 h-3" />
+                    <span>消息已撤回</span>
+                  </div>
+                ) : (
+                  <>
+                    {/* Reply Context */}
+                    {msg.reply_to && (
+                      <div className={`mb-2 p-2 rounded-lg text-xs border-l-2 bg-black/5 flex flex-col gap-0.5 max-w-full overflow-hidden ${msg.user_id === user?.id ? 'border-white/30 text-white/70' : 'border-indigo-400 text-gray-500'
+                        }`}>
+                        <div className="font-semibold">{replyMessage?.username || '已删除消息'}</div>
+                        <div className="truncate">{replyMessage?.content || (replyMessage?.message_type === 'file' ? '[图片]' : '消息不可读')}</div>
+                      </div>
+                    )}
+
+                    {msg.message_type !== 'system' && shouldShowHeader && (
+                      <div className="flex items-center justify-between gap-3 mb-1 opacity-70">
+                        <span className="text-xs font-semibold truncate max-w-[120px]">
+                          {msg.user_id === user?.id ? user.username : msg.username}
+                        </span>
+                        <span className="text-[10px] whitespace-nowrap">
+                          {new Date(normalizeChatTimestamp(msg.timestamp)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                      </div>
+                    )}
+
+                    {msg.ai_meta && (
+                      <div className="mb-2 rounded-lg border border-indigo-100 bg-indigo-50/80 px-3 py-2 text-xs text-indigo-800">
+                        <div className="font-semibold">{msg.ai_meta.primary_agent || msg.ai_meta.primary_view || 'AISCL智能助手'}</div>
+                        <div className="mt-1 text-[11px] leading-5 text-indigo-700">
+                          {msg.ai_meta.rationale_summary || '已结合项目任务、近期讨论与当前问题生成回应。'}
+                        </div>
+                        {(msg.ai_meta.routing_summary?.length || msg.ai_meta.processing_summary?.length) ? (
+                          <details className="mt-1">
+                            <summary className="cursor-pointer select-none text-[11px] font-medium text-indigo-600">查看本轮思考路径</summary>
+                            <ul className="mt-1 list-disc space-y-0.5 pl-4 text-[11px] leading-5 text-indigo-700">
+                              {[...(msg.ai_meta.routing_summary || []), ...(msg.ai_meta.processing_summary || [])].slice(0, 6).map((item, idx) => (
+                                <li key={`${item}-${idx}`}>{item}</li>
+                              ))}
+                            </ul>
+                          </details>
+                        ) : null}
+                      </div>
+                    )}
+
+                    {msg.teacher_support && (
+                      <div className="mb-2 rounded-lg border border-emerald-100 bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
+                        <div className="font-semibold">教师支持</div>
+                        <div className="mt-1 text-[11px] text-emerald-700">
+                          {msg.teacher_support.support_type || '同伴式支持'} · 已发送到小组
+                        </div>
+                      </div>
+                    )}
+
+                    {msg.message_type !== 'file' && msg.content && (
+                      <div className={`text-sm ${msg.user_id === 'ai_assistant' ? 'overflow-x-auto' : ''}`}>
+                        {msg.user_id === 'ai_assistant' ? (
+                          <AIResponseRenderer content={msg.content} />
+                        ) : (
+                          msg.content.split(/(@[\w\u4e00-\u9fa5]+)/g).map((part: string, index: number) => {
+                            if (part.startsWith('@')) {
+                              return (
+                                <span
+                                  key={index}
+                                  className="font-semibold"
+                                  style={{
+                                    color: msg.user_id === user?.id ? '#E0E7FF' : '#4F46E5'
+                                  }}
+                                >
+                                  {part}
+                                </span>
+                              )
+                            }
+                            return <span key={index}>{part}</span>
+                          })
+                        )}
+                      </div>
+                    )}
+
+                    {/* Image Rendering */}
+                    {msg.message_type === 'file' && msg.file_info && (
+                      <div className="mt-1">
+                        <img
+                          src={msg.file_info.url}
+                          alt={msg.file_info.name}
+                          className="max-w-full rounded-lg border border-gray-100 shadow-sm cursor-zoom-in hover:brightness-95 transition-all"
+                          onLoad={() => {
+                            scrollToBottom('smooth')
+                          }}
+                          onClick={(event) => {
+                            event.preventDefault()
+                            event.stopPropagation()
+                            setLightboxImage({ url: msg.file_info!.url, name: msg.file_info!.name })
+                            setLightboxZoom(1)
+                            setLightboxRotation(0)
+                          }}
+                        />
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {msg.isPending && (
+                  <div className="text-[10px] mt-1 opacity-50 flex justify-end">
+                    发送中...
+                  </div>
+                )}
+                {msg.send_failed && (
+                  <div className={`text-[10px] mt-1 ${isOwnMessage ? 'text-red-200' : 'text-red-600'} flex justify-end`}>
+                    发送失败
+                  </div>
+                )}
+              </div>
+            </div>
+          )
+        })}
+        {/* Typing Indicator */}
+        {typingUsers.size > 0 && (
+          <div
+            data-chat-typing-indicator="true"
+            className="flex items-center gap-2 mt-2 ml-2 animate-in fade-in slide-in-from-bottom-2"
+          >
+            <div className="bg-gray-100 rounded-full px-4 py-2 flex items-center gap-2 shadow-sm border border-gray-200">
+              <div className="flex gap-1">
+                <span className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce [animation-delay:-0.3s]"></span>
+                <span className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce [animation-delay:-0.15s]"></span>
+                <span className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce"></span>
+              </div>
+              <span className="text-xs text-gray-500 font-medium ml-1">
+                {Array.from(typingUsers).join(', ')} 正在思考...
+              </span>
+            </div>
+          </div>
+        )}
+
+        <div ref={messagesEndRef} />
+      </div>
+
+      <div className="p-4 border-t border-gray-100 bg-white relative">
+        {/* Emoji Picker */}
+        {showEmojiPicker && (
+          <div className="absolute bottom-[calc(100%-8px)] left-4 w-64 bg-white border border-gray-200 rounded-xl shadow-xl z-20 p-3 animate-in fade-in slide-in-from-bottom-2">
+            <div className="grid grid-cols-4 gap-2">
+              {EMOJIS.map(emoji => (
+                <button
+                  key={emoji}
+                  onClick={() => handleEmojiSelect(emoji)}
+                  className="text-2xl p-2 hover:bg-gray-100 rounded-lg transition-colors text-center"
+                >
+                  {emoji}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Member Mentions Menu */}
+        {showMentionMenu && (
+          <div className="absolute bottom-[calc(100%-8px)] left-28 w-60 bg-white border border-gray-200 rounded-xl shadow-xl z-20 overflow-hidden animate-in fade-in slide-in-from-bottom-2">
+            <div className="px-4 py-2 border-b border-gray-100 bg-gray-50/50 text-xs font-semibold text-gray-500">提及小组成员</div>
+            {otherMembers.length > 0 ? (
+              otherMembers.map((member) => {
+                const online = isPresenceOnline(projectId, member.id)
+                return (
+                  <button
+                    key={member.id}
+                    onClick={() => handleSelectMention(member)}
+                    className="w-full px-4 py-3 text-left hover:bg-blue-50 flex items-center gap-3 transition-colors border-b border-gray-50 last:border-0"
+                  >
+                    <div className="relative">
+                      {member.avatar_url ? (
+                        <img src={member.avatar_url} className="w-8 h-8 rounded-full border border-gray-100" alt={member.username} />
+                      ) : (
+                        <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 text-xs font-bold">
+                          {member.username[0]?.toUpperCase()}
+                        </div>
+                      )}
+                      <span className={`absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-white ${online ? 'bg-emerald-500' : 'bg-slate-300'}`} />
+                    </div>
+                    <div>
+                      <div className="text-sm font-medium text-gray-900">{member.username}</div>
+                      <div className="text-[11px] text-gray-400">{online ? '在线' : '离线'}</div>
+                    </div>
+                  </button>
+                )
+              })
+            ) : (
+              <div className="px-4 py-6 text-center text-sm text-gray-500">暂无其他成员</div>
+            )}
+          </div>
+        )}
+
+        <div className="flex flex-col gap-3">
+          {/* Reply Preview */}
+          {replyingTo && (
+            <div className="flex items-center justify-between p-3 bg-indigo-50 border border-indigo-100 rounded-xl mb-2 animate-in slide-in-from-bottom-2">
+              <div className="flex items-center gap-3 overflow-hidden">
+                <Reply className="w-4 h-4 text-indigo-500 shrink-0" />
+                <div className="flex flex-col text-xs overflow-hidden">
+                  <span className="font-bold text-indigo-600">{replyingTo.username}</span>
+                  <span className="text-gray-500 truncate">{replyingTo.content || '[图片]'}</span>
+                </div>
+              </div>
+              <button
+                onClick={() => setReplyingTo(null)}
+                className="p-1 hover:bg-indigo-100 rounded-full text-indigo-400 transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
+          {/* Top Row: Input and Send Button */}
+          <div className="flex items-center gap-2">
+            <div className="flex-1 relative">
+              <input
+                ref={inputRef}
+                type="text"
+                value={inputValue}
+                onChange={handleInputChange}
+                onKeyDown={handleKeyPress}
+                onPaste={handlePaste}
+                placeholder={connected ? '输入消息，或 @ 智能体 / 成员' : '连接恢复后可继续发送消息'}
+                className="w-full px-4 py-3 bg-[#f3f4f6] border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all text-sm"
+                disabled={!connected}
+              />
+            </div>
+            <button
+              onClick={handleSend}
+              disabled={!connected || !inputValue.trim()}
+              className="p-3 bg-indigo-600 text-white rounded-xl hover:bg-indigo-700 disabled:opacity-50 disabled:bg-gray-300 transition-all shadow-sm"
+            >
+              <SendHorizontal className="w-5 h-5" />
+            </button>
+          </div>
+
+          {/* Bottom Row: Actions */}
+          <div className="flex items-center gap-2">
+            <button
+              className={`p-2 rounded-xl transition-all shadow-sm flex items-center justify-center ${showEmojiPicker ? 'bg-yellow-500 text-white' : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'
+                }`}
+              onClick={() => {
+                setShowEmojiPicker(!showEmojiPicker)
+                setShowMentionMenu(false)
+              }}
+              title="Emoji"
+            >
+              <Smile className="w-5 h-5" />
+            </button>
+            <button
+              className="p-2 rounded-xl transition-all shadow-sm flex items-center justify-center bg-white border border-gray-200 text-gray-600 hover:bg-indigo-50 hover:text-indigo-600"
+              onClick={insertAIMention}
+              title="提及 AISCL智能助手"
+            >
+              <Bot className="w-5 h-5" />
+            </button>
+            <button
+              className={`p-2 rounded-xl transition-all shadow-sm flex items-center justify-center ${showMentionMenu ? 'bg-blue-600 text-white' : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'
+                }`}
+              onClick={() => {
+                setShowMentionMenu(!showMentionMenu)
+                setShowEmojiPicker(false)
+              }}
+              title="Mention"
+            >
+              <AtSign className="w-5 h-5" />
+            </button>
+
+            <input
+              type="file"
+              ref={fileInputRef}
+              className="hidden"
+              accept="image/*"
+              onChange={(e) => {
+                const file = e.target.files?.[0]
+                if (file) handleImageUpload(file)
+              }}
+            />
+
+            <button
+              disabled={isUploading}
+              className={`p-2 rounded-xl transition-all shadow-sm flex items-center justify-center ${isUploading ? 'bg-gray-100 text-gray-400' : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'
+                }`}
+              onClick={handleImageClick}
+              title="Send Image"
+            >
+              {isUploading ? <Loader2 className="w-5 h-5 animate-spin" /> : <ImageIcon className="w-5 h-5" />}
+            </button>
+          </div>
+        </div>
+      </div>
+      {toast && (
+        <Toast
+          message={toast.message}
+          type={toast.type}
+          onClose={() => setToast(null)}
+        />
+      )}
+    </div>
+  )
+}

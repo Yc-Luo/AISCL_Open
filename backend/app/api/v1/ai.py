@@ -1,0 +1,1351 @@
+"""AI conversation and intervention API routes."""
+
+import json
+import logging
+from datetime import datetime
+from typing import Dict, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
+
+from app.api.v1.auth import get_current_user
+from app.core.security import limiter
+from app.core.permissions import can_manage_project_scope, check_project_member_permission
+from app.repositories.ai_conversation import AIConversation
+from app.repositories.ai_intervention_rule import AIInterventionRule
+from app.repositories.ai_role import AIRole
+from app.repositories.project import Project
+from app.repositories.user import User
+from app.core.schemas.ai import (
+    AIChatRequest,
+    AIChatResponse,
+    AIContextActionRequest,
+    AIConversationListResponse,
+    AIConversationResponse,
+    AIMessageListResponse,
+    AIMessageResponse,
+    AIRoleListResponse,
+    AIRoleResponse,
+    InterventionCheckRequest,
+    InterventionCheckResult,
+    InterventionRuleCreateRequest,
+    InterventionRuleResponse,
+    InterventionRuleUpdateRequest,
+)
+from app.repositories.ai_message import AIMessage
+from app.services.ai_service import ai_service
+from app.services.intervention_service import intervention_service
+from app.services.rag_service import rag_service
+from app.services.agents.agent_service import agent_service
+from app.services.group_memory_service import group_memory_service
+
+router = APIRouter(prefix="/ai", tags=["ai"])
+logger = logging.getLogger(__name__)
+
+SUBAGENT_VIEW_LABELS: Dict[str, str] = {
+    "evidence_researcher": "资料研究员",
+    "viewpoint_challenger": "观点挑战者",
+    "feedback_prompter": "反馈追问者",
+    "problem_progressor": "问题推进者",
+}
+
+
+def _ai_scaffold_mode(experiment_version: Optional[dict]) -> str:
+    return str((experiment_version or {}).get("ai_scaffold_mode") or "single_agent").strip().lower()
+
+
+def _is_multi_agent_mode(experiment_version: Optional[dict]) -> bool:
+    return _ai_scaffold_mode(experiment_version) == "multi_agent"
+
+
+def _default_chat_model_id(experiment_version: Optional[dict]) -> Optional[str]:
+    return (
+        (experiment_version or {}).get("default_chat_model")
+        or (experiment_version or {}).get("defaultChatModel")
+        or "follow_system_default"
+    )
+
+
+def _group_multi_agent_model_id(experiment_version: Optional[dict]) -> Optional[str]:
+    return (
+        (experiment_version or {}).get("group_multi_agent_model")
+        or (experiment_version or {}).get("group_chat_model")
+        or (experiment_version or {}).get("groupChatModel")
+        or "follow_system_default"
+    )
+
+
+def _tutor_multi_agent_model_id(experiment_version: Optional[dict]) -> Optional[str]:
+    return (
+        (experiment_version or {}).get("tutor_multi_agent_model")
+        or (experiment_version or {}).get("tutor_model")
+        or (experiment_version or {}).get("tutorModel")
+        or "follow_system_default"
+    )
+
+
+def _sse_event(event: str, data: dict | str) -> str:
+    """Build a standards-compliant SSE frame with explicit event names."""
+    if isinstance(data, str):
+        payload = data
+    else:
+        payload = json.dumps(data, ensure_ascii=False)
+
+    normalized_payload = payload.replace("\r\n", "\n").replace("\r", "\n")
+    data_lines = "".join(
+        f"data: {line}\n" for line in normalized_payload.split("\n")
+    )
+    return f"event: {event}\n{data_lines}\n"
+
+
+def _empty_ai_reply_fallback() -> str:
+    return (
+        "本轮没有生成有效回应。你可以把当前问题、已有依据和希望我支持的方向再发一次，"
+        "我会继续帮你们澄清问题、补充证据、挑战观点或推进修订。"
+    )
+
+
+async def ensure_project_access(current_user: User, project: Project) -> None:
+    """Ensure current user can access a project-scoped AI endpoint."""
+    if not await check_project_member_permission(current_user, project):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have permission to access this project",
+        )
+
+
+async def ensure_project_staff_access(current_user: User, project: Project, detail: str) -> None:
+    """Ensure current user can manage project-level AI settings or exports."""
+    if not await can_manage_project_scope(current_user, project):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=detail,
+        )
+
+
+def _infer_tutor_subagent_from_message(
+    message: Optional[str],
+    current_stage: Optional[str],
+) -> str:
+    text = (message or "").strip()
+    score_map: Dict[str, int] = {
+        "evidence_researcher": 0,
+        "viewpoint_challenger": 0,
+        "feedback_prompter": 0,
+        "problem_progressor": 0,
+    }
+    weighted_patterns = [
+        ("viewpoint_challenger", r"反驳|质疑|不同意见|替代方案|反方|反例|漏洞|站不住脚|局限|偏见|争议|挑战|对立观点|另一种解释", 3),
+        ("feedback_prompter", r"修改|优化|改进|完善|修订|修正|调整|反馈|评价标准|标准|不足|薄弱|怎么改|如何改进|如何完善|如何修正|证据够吗|充分吗", 3),
+        ("problem_progressor", r"下一步|推进|计划|步骤|先做什么|怎么开始|如何开展|如何推进|任务|分工|安排|进展|卡住|梳理|路线|流程", 3),
+        ("problem_progressor", r"焦虑|压力|紧张|害怕|担心|烦|崩溃|冲突|争吵|沉默|没人参与|不配合|没动力|不想做|做不下去|太难|不会|放弃|拖延", 3),
+        ("evidence_researcher", r"资料|证据|出处|来源|文献|背景|概念|什么是|材料|案例|信息|查找|搜集|搜索|依据|数据", 3),
+        ("feedback_prompter", r"学习重点|收获|哪里需要注意|怎么提升|如何提高", 2),
+        ("problem_progressor", r"目前进展|现在到哪一步|当前情况|整体情况", 2),
+        ("evidence_researcher", r"帮我解释|帮我说明|了解一下|背景知识", 2),
+    ]
+
+    for subagent, pattern, weight in weighted_patterns:
+        import re
+
+        matches = re.findall(pattern, text)
+        if matches:
+            score_map[subagent] += len(matches) * weight
+
+    best_subagent = max(score_map, key=score_map.get)
+    if score_map[best_subagent] > 0:
+        return best_subagent
+
+    stage = current_stage or ""
+    if any(keyword in stage for keyword in ["explanation_integration", "解释整合", "argumentation", "论证", "协商"]):
+        return "viewpoint_challenger"
+    if any(keyword in stage for keyword in ["application_solution", "应用解决", "revision", "reflection", "修订", "反思"]):
+        return "feedback_prompter"
+    if any(keyword in stage for keyword in ["meaning_exploration", "意义探索", "inquiry", "evidence", "证据", "探究"]):
+        return "evidence_researcher"
+    return "problem_progressor"
+
+
+def _resolve_tutor_primary_view(
+    preferred_subagent: Optional[str],
+    role_id: Optional[str],
+    message: Optional[str],
+    current_stage: Optional[str],
+) -> str:
+    if preferred_subagent and preferred_subagent in SUBAGENT_VIEW_LABELS:
+        return SUBAGENT_VIEW_LABELS[preferred_subagent]
+    inferred_subagent = _infer_tutor_subagent_from_message(message, current_stage)
+    if inferred_subagent in SUBAGENT_VIEW_LABELS:
+        return SUBAGENT_VIEW_LABELS[inferred_subagent]
+    if role_id == "default-tutor":
+        return "问题推进者"
+    return "资料研究员"
+
+
+def _build_tutor_ai_meta(chat_data: AIChatRequest, *, use_role_view: bool = True) -> dict:
+    if use_role_view:
+        primary_view = _resolve_tutor_primary_view(
+            chat_data.preferred_subagent,
+            chat_data.role_id,
+            chat_data.message,
+            chat_data.current_stage,
+        )
+        rationale_summary = (
+            f"结合当前阶段与提问内容，本轮 AI 导师主要采用“{primary_view}”的学习支持视角。"
+            if chat_data.current_stage
+            else f"结合当前提问内容，本轮 AI 导师主要采用“{primary_view}”的学习支持视角。"
+        )
+        processing_summary = [
+            "正在识别当前任务阶段与提问意图",
+            f"正在从“{primary_view}”视角组织回应",
+            "正在生成面向当前任务的学习建议",
+        ]
+    else:
+        primary_view = "AI导师"
+        rationale_summary = "结合当前任务、提问内容和协作记录生成学习支持回应。"
+        processing_summary = [
+            "正在识别当前任务阶段与提问意图",
+            "正在结合项目任务和当前协作记录生成回应",
+            "正在生成面向当前任务的学习建议",
+        ]
+    return {
+        "primary_view": primary_view,
+        "rationale_summary": rationale_summary,
+        "processing_summary": processing_summary,
+    }
+
+
+async def _build_project_ai_context(
+    *,
+    project: Project,
+    chat_data: AIChatRequest,
+    base_context: Optional[dict],
+) -> dict:
+    """Attach task brief and shared group-stage memory to student AI context."""
+    stage_id = chat_data.current_stage or (project.experiment_version or {}).get("current_stage")
+    group_id = f"project:{str(project.id)}"
+    stage_memory = await group_memory_service.get_stage_memory_context(
+        project_id=str(project.id),
+        group_id=group_id,
+        stage_id=stage_id,
+    )
+    group_state = await group_memory_service.refresh_and_get_group_state_context(
+        project_id=str(project.id),
+        group_id=group_id,
+        stage_id=stage_id,
+        project=project,
+    )
+    project_task_context = await group_memory_service.get_project_task_context(project)
+    contextual_notes = []
+    if chat_data.context_source:
+        contextual_notes.append(f"请求来源：{chat_data.context_source}")
+    if chat_data.active_tab:
+        contextual_notes.append(f"当前学习页面：{chat_data.active_tab}")
+    if chat_data.selected_text:
+        contextual_notes.append(f"学习者选中文本：\n{chat_data.selected_text.strip()[:2000]}")
+    if chat_data.selected_resource_id:
+        contextual_notes.append(f"当前选中资源ID：{chat_data.selected_resource_id}")
+    if chat_data.selected_inquiry_node_id:
+        contextual_notes.append(f"当前选中探究节点ID：{chat_data.selected_inquiry_node_id}")
+    contextual_content = "\n\n".join(contextual_notes)
+    base_content = (base_context or {}).get("content") or ""
+    merged_content = "\n\n".join(
+        section for section in [base_content, contextual_content] if section
+    )
+    return {
+        **(base_context or {"content": "", "citations": []}),
+        "content": merged_content,
+        "project_task_context": project_task_context,
+        "stage_memory_context": stage_memory.get("content"),
+        "stage_memory_updated_at": stage_memory.get("updated_at"),
+        "stage_memory_id": stage_memory.get("memory_id"),
+        "stage_memory_version": stage_memory.get("version"),
+        "stage_memory_source_counts": stage_memory.get("source_counts"),
+        "group_state_context": group_state.get("content"),
+        "group_state_updated_at": group_state.get("updated_at"),
+        "group_state_memory_id": group_state.get("memory_id"),
+        "group_state_memory_version": group_state.get("version"),
+        "group_state_source_counts": group_state.get("source_counts"),
+    }
+
+
+async def _build_direct_ai_context(
+    *,
+    project: Project,
+    chat_data: AIChatRequest,
+) -> List[dict]:
+    """Build neutral task/page context for generic LLM without RAG or scaffolds."""
+    context_messages: List[dict] = []
+    context_messages.append({
+        "role": "user",
+        "content": (
+            "请按 AISCL 线上小组协作支架方式回应：先识别小组对话处境，再用平等协作语气回应，追问 1-2 个关键缺口，"
+            "给出下一步支架，并促进成员互帮互助。"
+            "四阶段重点：问题构建=澄清任务/界定问题/识别分歧；意义探索=扩展资料/比较观点/判断证据质量；"
+            "解释整合=组织证据链/形成解释/处理反驳；应用解决=落地方案/检验边界/修订成果。"
+            "如果出现焦虑、没动力、冲突、沉默、怕做错或觉得太难，先降低压力，把任务切成一个 10 分钟内可完成的小动作，"
+            "再回到协作任务。不要用课堂教师或裁判口吻，不要空泛鼓励，不要替小组完成最终答案。"
+        ),
+    })
+    project_task_context = await group_memory_service.get_project_task_context(project)
+    if project_task_context:
+        context_messages.append({
+            "role": "user",
+            "content": f"当前项目任务说明：\n{project_task_context}",
+        })
+
+    page_context = []
+    if chat_data.current_stage:
+        page_context.append(f"当前任务阶段：{chat_data.current_stage}")
+    if chat_data.active_tab:
+        page_context.append(f"当前页面：{chat_data.active_tab}")
+    if chat_data.context_source:
+        page_context.append(f"提问来源：{chat_data.context_source}")
+    if chat_data.selected_text:
+        page_context.append(f"学习者选中的文本：\n{chat_data.selected_text.strip()[:2000]}")
+    if page_context:
+        context_messages.append({
+            "role": "user",
+            "content": "当前提问上下文：\n" + "\n".join(page_context),
+        })
+    return context_messages
+
+
+@router.post("/chat", response_model=AIChatResponse)
+@limiter.limit("30/minute")
+async def chat(
+    chat_data: AIChatRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> AIChatResponse:
+    """Non-streaming AI chat."""
+    # Check project access
+    project = await Project.get(chat_data.project_id)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
+
+    await ensure_project_access(current_user, project)
+
+    experiment_version = (
+        project.experiment_version or {}
+        if getattr(project, "experiment_version", None)
+        else {}
+    )
+    if not _is_multi_agent_mode(experiment_version):
+        direct_context = await _build_direct_ai_context(project=project, chat_data=chat_data)
+        response = await ai_service.raw_chat(
+            project_id=chat_data.project_id,
+            user_id=str(current_user.id),
+            message=chat_data.message or "",
+            conversation_id=chat_data.conversation_id,
+            model_id=_default_chat_model_id(experiment_version),
+            context_messages=direct_context,
+        )
+        return AIChatResponse(
+            conversation_id=response["conversation_id"],
+            message=response["message"],
+            citations=[],
+            suggestions=[],
+            ai_meta=None,
+        )
+
+    # Retrieve context using RAG if enabled. Only multi-agent experimental
+    # conditions use platform context and support metadata.
+    context = None
+    if chat_data.use_rag:
+        try:
+            context = await rag_service.retrieve_context(
+                chat_data.project_id,
+                chat_data.message,
+                user_id=str(current_user.id),
+                actor_type="ai_tutor" if chat_data.role_id == "default-tutor" else "system",
+                stage_id=chat_data.current_stage,
+                experiment_version_id=(
+                    (project.experiment_version or {}).get("version_name")
+                    if getattr(project, "experiment_version", None)
+                    else None
+                ),
+            )
+        except Exception as e:
+            print(f"RAG Error: {e}")
+            context = None
+    context = await _build_project_ai_context(
+        project=project,
+        chat_data=chat_data,
+        base_context=context,
+    )
+    use_role_view = True
+
+    # Chat with AI
+    response = await ai_service.chat(
+        project_id=chat_data.project_id,
+        user_id=str(current_user.id),
+        message=chat_data.message,
+        role_id=chat_data.role_id,
+        conversation_id=chat_data.conversation_id,
+        context=context,
+        message_metadata=(
+            {"ai_meta": _build_tutor_ai_meta(chat_data, use_role_view=use_role_view)}
+            if chat_data.role_id == "default-tutor"
+            else None
+        ),
+    )
+
+    return AIChatResponse(
+        conversation_id=response["conversation_id"],
+        message=response["message"],
+        citations=response.get("citations", []),
+        suggestions=response.get("suggestions", []),
+        ai_meta=response.get("ai_meta"),
+    )
+
+
+@router.post("/action", response_model=AIChatResponse)
+@limiter.limit("20/minute")
+async def ai_action(
+    action_data: AIContextActionRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> AIChatResponse:
+    """Specialized AI context-aware actions."""
+    # Check project access
+    project = await Project.get(action_data.project_id)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
+
+    await ensure_project_access(current_user, project)
+
+    # Define specialized prompts based on action type
+    prompts = {
+        "summarize": f"请对以下{action_data.context_type}的内容进行结构化总结。请使用 Markdown 标题、分点列表或表格形式，确保逻辑清晰、重点突出：\n\n",
+        "knowledge_graph": f"请针对以下{action_data.context_type}的内容，提取核心概念并梳理其关联。请使用 Markdown 层级列表或 Mermaid 语法（graph TD）来展示知识图谱，并附带简要的概念说明：\n\n",
+        "optimize": f"请分析以下{action_data.context_type}的内容并给出专业建议。请采用『现状分析』、『改进建议』、『预期效果』三个板块进行展示，使用 Markdown 格式确保可读性：\n\n",
+        "devil_advocate": f"请作为“恶魔代言人 (Devil's Advocate)”，审视以下论证结构。请识别逻辑谬误、证据薄弱环节，并提出至少 3 个尖锐的反驳观点。请直接以 Markdown 列表形式输出建议：\n\n",
+        "inquiry_clustering": f"请分析以下探究内容中的核心概念，并将其归类为 3-4 个逻辑模块。请使用 Markdown 形式展示每个模块的名称及其包含的要点，帮助我理清思路：\n\n",
+    }
+    
+    system_prompt = (
+        "你是一个极其专业的协作学习助理。你擅长将杂乱的信息转化为结构清晰、视觉友好的 Markdown 文档。\n"
+        "回答原则：\n"
+        "1. 严禁输出大段不换行的文字。\n"
+        "2. 必须使用 Markdown 标题（# ## ###）来区分模块。\n"
+        "3. 核心结论请使用加粗（**关键词**）。\n"
+        "4. 合理使用引用块（>）或代码块来突出重点。\n"
+        "5. 如果内容包含步骤或多个要点，请使用有序或无序列表。"
+    )
+    user_message = f"{prompts.get(action_data.action_type, '')}{action_data.content}"
+    if action_data.additional_query:
+        user_message += f"\n\n用户特别要求：{action_data.additional_query}"
+
+    action_context = await _build_project_ai_context(
+        project=project,
+        chat_data=AIChatRequest(
+            project_id=action_data.project_id,
+            message=action_data.additional_query or action_data.content[:1000],
+            current_stage=action_data.current_stage,
+            use_rag=False,
+        ),
+        base_context={"content": "", "citations": []},
+    )
+
+    # Use ai_service to perform the chat
+    # We pass use_rag=False because the context is already provided explicitly in the content
+    response = await ai_service.chat(
+        project_id=action_data.project_id,
+        user_id=str(current_user.id),
+        message=user_message,
+        role_id=None, # Use default role
+        conversation_id=None, # New session for each action usually
+        context=action_context,
+        system_message_override=system_prompt,
+        category="action",
+    )
+
+    return AIChatResponse(
+        conversation_id=response["conversation_id"],
+        message=response["message"],
+        suggestions=[],
+    )
+
+
+@router.post("/chat/stream")
+@limiter.limit("20/minute")
+async def chat_stream(
+    chat_data: AIChatRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    """Streaming AI chat (SSE)."""
+    # Check project access
+    project = await Project.get(chat_data.project_id)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
+
+    await ensure_project_access(current_user, project)
+
+    conversation: Optional[AIConversation] = None
+    if chat_data.conversation_id:
+        conversation = await AIConversation.get(chat_data.conversation_id)
+        if not conversation:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Conversation not found",
+            )
+    else:
+        fallback_key = "default-tutor" if chat_data.role_id == "default-tutor" else "default"
+        role = await ai_service.get_role(chat_data.role_id) if chat_data.role_id else await ai_service.get_default_role()
+        if not role:
+            role = await ai_service.get_default_role()
+        conversation = AIConversation(
+            project_id=chat_data.project_id,
+            user_id=str(current_user.id),
+            persona_id=ai_service.resolve_role_id(role, fallback_key=fallback_key),
+            category="chat",
+        )
+        await conversation.insert()
+
+    existing_message_count = await AIMessage.find({"conversation_id": str(conversation.id)}).count()
+    should_generate_title = existing_message_count == 0 and bool(chat_data.message)
+
+    async def generate():
+        async def refresh_conversation_title_if_needed() -> None:
+            if not should_generate_title or not chat_data.message:
+                return
+            try:
+                conversation.title = await ai_service.generate_conversation_title(chat_data.message)
+            except Exception as exc:
+                print(f"Conversation title generation skipped: {exc}")
+
+        experiment_version = (
+            project.experiment_version or {}
+            if getattr(project, "experiment_version", None)
+            else {}
+        )
+        graph_version = experiment_version.get("graph_version")
+        full_response = ""
+
+        if not _is_multi_agent_mode(experiment_version):
+            try:
+                direct_context = await _build_direct_ai_context(project=project, chat_data=chat_data)
+                async for chunk in ai_service.raw_chat_stream(
+                    project_id=chat_data.project_id,
+                    user_id=str(current_user.id),
+                    message=chat_data.message or "",
+                    conversation_id=str(conversation.id),
+                    model_id=_default_chat_model_id(experiment_version),
+                    context_messages=direct_context,
+                ):
+                    full_response += chunk
+                    yield _sse_event("delta", chunk)
+
+                conversation.updated_at = datetime.utcnow()
+                await conversation.save()
+                yield _sse_event(
+                    "done",
+                    {
+                        "conversation_id": str(conversation.id),
+                        "citation_count": 0,
+                    },
+                )
+            except Exception as exc:
+                yield _sse_event(
+                    "error",
+                    {"message": "通用 LLM 暂时无法回应，请稍后重试。", "detail": str(exc)},
+                )
+            return
+
+        yield _sse_event(
+            "status",
+            {
+                "step": "received",
+                "message": "已收到问题，正在准备 AI 导师回应。",
+            },
+        )
+        use_role_view = True
+        tutor_meta = _build_tutor_ai_meta(chat_data, use_role_view=use_role_view)
+        yield _sse_event("meta", {"ai_meta": tutor_meta})
+
+        # Retrieve context inside the SSE generator so the client receives
+        # progress feedback during potentially slow RAG calls.
+        context = None
+        if chat_data.use_rag and graph_version != "research-graph-v3-stage-aware":
+            yield _sse_event(
+                "status",
+                {
+                    "step": "retrieval",
+                    "message": "正在检查项目资料、Wiki 和近期协作记录。",
+                },
+            )
+            try:
+                context = await rag_service.retrieve_context(
+                    chat_data.project_id,
+                    chat_data.message,
+                    user_id=str(current_user.id),
+                    actor_type="ai_tutor" if chat_data.role_id == "default-tutor" else "system",
+                    stage_id=chat_data.current_stage,
+                    experiment_version_id=(
+                        (project.experiment_version or {}).get("version_name")
+                        if getattr(project, "experiment_version", None)
+                        else None
+                    ),
+                )
+                yield _sse_event(
+                    "status",
+                    {
+                        "step": "retrieval_done",
+                        "message": (
+                            "已找到可引用来源，正在组织学习支持回应。"
+                            if context and context.get("citations")
+                            else "未找到可引用来源，正在基于任务说明和协作记录回应。"
+                        ),
+                        "citation_count": len(context.get("citations", [])) if context else 0,
+                    },
+                )
+            except Exception as e:
+                print(f"RAG Error: {e}")
+                context = None
+                yield _sse_event(
+                    "status",
+                    {
+                        "step": "retrieval_skipped",
+                        "message": "项目资料检索暂不可用，正在基于当前问题直接回应。",
+                    },
+                )
+
+        # Construct context string if RAG is enabled
+        context = await _build_project_ai_context(
+            project=project,
+            chat_data=chat_data,
+            base_context=context,
+        )
+        final_message = chat_data.message
+        if context:
+            final_message = f"Context:\n{context['content']}\n\nUser Question: {chat_data.message}"
+        
+        try:
+            # Multi-agent mode uses graph routing. The Supervisor handles intent
+            # and delegates to the constrained research sub-agent when needed.
+            primary_view = tutor_meta.get("primary_view") or "AI 导师"
+            yield _sse_event(
+                "status",
+                {
+                    "step": "routing",
+                    "message": f"正在从“{primary_view}”视角组织回应。",
+                    "primary_view": primary_view,
+                },
+            )
+            graph_context = {
+                "project_id": chat_data.project_id,
+                "experiment_version_id": (
+                    experiment_version.get("version_name")
+                    if experiment_version
+                    else None
+                ),
+                "graph_version": experiment_version.get("graph_version"),
+                "ai_scaffold_mode": experiment_version.get("ai_scaffold_mode"),
+                "process_scaffold_mode": experiment_version.get("process_scaffold_mode"),
+                "current_stage": chat_data.current_stage,
+                "enabled_rule_set": chat_data.enabled_rule_set,
+                "enabled_scaffold_roles": chat_data.enabled_scaffold_roles,
+                "preferred_subagent": chat_data.preferred_subagent,
+                "source_actor_type": "system",
+                "user_id": str(current_user.id),
+                "group_id": f"project:{chat_data.project_id}",
+                "project_task_context": context.get("project_task_context") if context else "",
+                "stage_memory_context": context.get("stage_memory_context") if context else "",
+                "stage_memory_updated_at": context.get("stage_memory_updated_at") if context else None,
+                "stage_memory_id": context.get("stage_memory_id") if context else None,
+                "stage_memory_version": context.get("stage_memory_version") if context else None,
+                "stage_memory_source_counts": context.get("stage_memory_source_counts") if context else None,
+                "group_state_context": context.get("group_state_context") if context else "",
+                "group_state_memory_id": context.get("group_state_memory_id") if context else None,
+                "group_state_memory_version": context.get("group_state_memory_version") if context else None,
+                "group_state_source_counts": context.get("group_state_source_counts") if context else None,
+                "runtime_model_id": _tutor_multi_agent_model_id(experiment_version),
+            }
+
+            user_message = AIMessage(
+                conversation_id=str(conversation.id),
+                role="user",
+                content=chat_data.message or "",
+            )
+            await user_message.insert()
+
+            yield _sse_event(
+                "status",
+                {
+                    "step": "generating",
+                    "message": "正在生成面向当前任务的回应。",
+                },
+            )
+            final_event_meta = {}
+            stream_message = (
+                chat_data.message
+                if graph_version == "research-graph-v3-stage-aware"
+                else final_message
+            )
+            async for event in agent_service.chat_stream(
+                persona_key=chat_data.role_id, # Passed but currently ignored by Supervisor logic
+                message=stream_message,
+                session_id=str(conversation.id),
+                subject="General", # Could be retrieved from Project domain
+                context=graph_context,
+            ):
+                if isinstance(event, str):
+                    full_response += event
+                    yield _sse_event("delta", event)
+                    continue
+
+                event_type = event.get("type")
+                if event_type == "routing":
+                    meta = event.get("ai_meta") or {}
+                    tutor_meta.update({
+                        "primary_view": meta.get("primary_view") or meta.get("primary_agent") or tutor_meta.get("primary_view"),
+                        "rationale_summary": meta.get("rationale_summary") or tutor_meta.get("rationale_summary"),
+                        "processing_summary": meta.get("processing_summary") or tutor_meta.get("processing_summary", []),
+                    })
+                    yield _sse_event("meta", {"ai_meta": tutor_meta, "citation_count": event.get("citation_count", 0)})
+                    continue
+                if event_type in {"status"}:
+                    yield _sse_event("status", {"message": event.get("message", ""), "detail": event.get("detail")})
+                    continue
+                if event_type in {"process_start", "process_step", "retrieval_step", "routing_step", "process_done"}:
+                    message = event.get("message") or ""
+                    if message:
+                        existing = tutor_meta.get("processing_summary", [])
+                        if message not in existing:
+                            tutor_meta["processing_summary"] = [*existing, message]
+                    yield _sse_event("process", event)
+                    continue
+                if event_type in {"thinking_start", "thinking", "thinking_end"}:
+                    continue
+                if event_type == "output":
+                    chunk = event.get("content", "")
+                    full_response += chunk
+                    yield _sse_event("delta", chunk)
+                    continue
+                if event_type == "done":
+                    final_event_meta = event
+                    if event.get("final_content"):
+                        full_response = event["final_content"]
+                    if event.get("ai_meta"):
+                        meta = event["ai_meta"]
+                        tutor_meta.update({
+                            "primary_view": meta.get("primary_view") or meta.get("primary_agent") or tutor_meta.get("primary_view"),
+                            "rationale_summary": meta.get("rationale_summary") or tutor_meta.get("rationale_summary"),
+                            "processing_summary": meta.get("processing_summary") or tutor_meta.get("processing_summary", []),
+                        })
+                    continue
+
+            assistant_content = ai_service.sanitize_model_output(full_response.strip())
+            if not assistant_content:
+                logger.warning(
+                    "AI tutor generated empty display content; applying fallback "
+                    "project=%s conversation=%s role=%s stage=%s",
+                    chat_data.project_id,
+                    conversation.id,
+                    chat_data.role_id,
+                    chat_data.current_stage,
+                )
+                assistant_content = _empty_ai_reply_fallback()
+                processing_summary = list(tutor_meta.get("processing_summary") or [])
+                fallback_note = "模型本轮没有返回可显示正文，已启用兜底提示。"
+                if fallback_note not in processing_summary:
+                    processing_summary.append(fallback_note)
+                tutor_meta["processing_summary"] = processing_summary
+                yield _sse_event("delta", assistant_content)
+
+            ai_message = AIMessage(
+                conversation_id=str(conversation.id),
+                role="assistant",
+                content=assistant_content,
+                citations=context.get("citations", []) if context else [],
+                metadata=(
+                    {"ai_meta": tutor_meta}
+                    if chat_data.role_id == "default-tutor"
+                    else None
+                ),
+            )
+            await ai_message.insert()
+            conversation.updated_at = datetime.utcnow()
+            await refresh_conversation_title_if_needed()
+            await conversation.save()
+            yield _sse_event(
+                "done",
+                {
+                    "conversation_id": str(conversation.id),
+                    "message_id": str(ai_message.id),
+                    "citation_count": final_event_meta.get("citation_count", len(context.get("citations", [])) if context else 0),
+                    "final_content": assistant_content,
+                    "ai_meta": tutor_meta,
+                },
+            )
+        except Exception as e:
+            # Fallback for debugging, yield nothing or error
+            print(f"Agent Service Error: {e}")
+            yield _sse_event(
+                "error",
+                {
+                    "message": "AI 服务处理失败，请稍后重试。",
+                    "detail": str(e),
+                },
+            )
+            yield _sse_event("delta", f"[System Error]: {str(e)}")
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/conversations/{project_id}", response_model=AIConversationListResponse)
+async def get_conversations(
+    project_id: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+) -> AIConversationListResponse:
+    """Get AI conversations for a project."""
+    # Check project access
+    project = await Project.get(project_id)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
+
+    await ensure_project_access(current_user, project)
+
+    can_view_all_conversations = await can_manage_project_scope(current_user, project)
+
+    # Get conversations
+    # Filter: Only show conversations that have at least one message
+    # We use an aggregation pipeline to filter conversations by existence of messages
+    match_query = {"project_id": project_id, "category": "chat"}
+    if not can_view_all_conversations:
+        match_query["user_id"] = str(current_user.id)
+
+    pipeline = [
+        {"$match": match_query},
+        {"$addFields": {"id_str": {"$toString": "$_id"}}},
+        {
+            "$lookup": {
+                "from": "ai_messages",
+                "localField": "id_str",
+                "foreignField": "conversation_id",
+                "as": "messages",
+            }
+        },
+        {"$match": {"messages": {"$not": {"$size": 0}}}},
+        {"$sort": {"updated_at": -1}},
+        {"$skip": skip},
+        {"$limit": limit},
+    ]
+
+    conversations_cursor = AIConversation.aggregate(pipeline)
+    conversations = await conversations_cursor.to_list()
+
+    # Calculate total for pagination (also filtering out empty ones)
+    count_pipeline = [
+        {"$match": match_query},
+        {"$addFields": {"id_str": {"$toString": "$_id"}}},
+        {
+            "$lookup": {
+                "from": "ai_messages",
+                "localField": "id_str",
+                "foreignField": "conversation_id",
+                "as": "messages",
+            }
+        },
+        {"$match": {"messages": {"$not": {"$size": 0}}}},
+        {"$count": "total"},
+    ]
+    count_result = await AIConversation.aggregate(count_pipeline).to_list()
+    total = count_result[0]["total"] if count_result else 0
+
+    return AIConversationListResponse(
+        conversations=[
+            AIConversationResponse(
+                id=str(c["_id"]),
+                project_id=c["project_id"],
+                user_id=c["user_id"],
+                role_id=c.get("persona_id") or "default",
+                title=c.get("title", "新对话"),
+                created_at=c["created_at"],
+                updated_at=c["updated_at"],
+            )
+            for c in conversations
+        ],
+        total=total,
+    )
+
+
+@router.get("/conversations/{conversation_id}/messages", response_model=AIMessageListResponse)
+async def get_messages(
+    conversation_id: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+) -> AIMessageListResponse:
+    """Get messages for a conversation."""
+    conversation = await AIConversation.get(conversation_id)
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        )
+
+    project = await Project.get(conversation.project_id)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
+
+    if str(conversation.user_id) != str(current_user.id):
+        await ensure_project_staff_access(
+            current_user,
+            project,
+            "You don't have permission to access this conversation",
+        )
+
+    messages = (
+        await AIMessage.find({"conversation_id": conversation_id})
+        .skip(skip)
+        .limit(limit)
+        .sort("created_at")
+        .to_list()
+    )
+    total = await AIMessage.find({"conversation_id": conversation_id}).count()
+
+    return AIMessageListResponse(
+        messages=[
+            AIMessageResponse(
+                id=str(m.id),
+                conversation_id=m.conversation_id,
+                role=m.role,
+                content=ai_service.sanitize_model_output(m.content),
+                citations=m.citations,
+                ai_meta=((m.metadata or {}).get("ai_meta") if m.metadata else None),
+                created_at=m.created_at,
+            )
+            for m in messages
+        ],
+        total=total,
+    )
+
+
+@router.get("/roles", response_model=AIRoleListResponse)
+async def get_ai_roles(
+    current_user: User = Depends(get_current_user),
+) -> AIRoleListResponse:
+    """Get available AI roles."""
+    roles = await AIRole.find().sort("is_default", -1).to_list()
+
+    return AIRoleListResponse(
+        roles=[
+            AIRoleResponse(
+                id=str(r.id),
+                name=r.name,
+                icon=r.icon,
+                description=r.description,
+                temperature=r.temperature,
+                is_default=r.is_default,
+                created_at=r.created_at,
+            )
+            for r in roles
+        ]
+    )
+
+
+@router.post("/conversations", response_model=AIConversationResponse, status_code=status.HTTP_201_CREATED)
+async def create_conversation(
+    conversation_data: AIChatRequest,
+    current_user: User = Depends(get_current_user),
+) -> AIConversationResponse:
+    """Initialize a new AI conversation."""
+    # Check project access
+    project = await Project.get(conversation_data.project_id)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
+
+    await ensure_project_access(current_user, project)
+            
+    # Check/Create conversation
+    # If conversation_id is provided, verify it exists
+    if conversation_data.conversation_id:
+        conversation = await AIConversation.get(conversation_data.conversation_id)
+        if conversation:
+            return AIConversationResponse.from_orm(conversation)
+            
+    # Create new conversation
+    # Resolve role alias to real ObjectId immediately
+    persona_id = conversation_data.role_id or "default"
+    role = await ai_service.get_role(persona_id)
+    if not role:
+        # Fallback to default if not found
+        role = await ai_service.get_default_role()
+    
+    # Use the resolved real ID (or "default" only if DB is truly empty/broken, which schema might reject if it assumes ObjectId)
+    # The AIConversation model defines persona_id as Optional[str]. We should store the real ID.
+    final_persona_id = str(role.id) if role else "default"
+
+    conversation = AIConversation(
+        project_id=conversation_data.project_id,
+        user_id=str(current_user.id),
+        persona_id=final_persona_id,
+    )
+    await conversation.insert()
+
+    return AIConversationResponse(
+        id=str(conversation.id),
+        project_id=conversation.project_id,
+        user_id=conversation.user_id,
+        role_id=final_persona_id,
+        title=conversation.title,
+        created_at=conversation.created_at,
+        updated_at=conversation.updated_at,
+    )
+
+
+@router.delete("/conversations/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_conversation(
+    conversation_id: str,
+    current_user: User = Depends(get_current_user),
+) -> None:
+    """Delete an AI conversation and its messages."""
+    conversation = await AIConversation.get(conversation_id)
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        )
+
+    if str(conversation.user_id) != str(current_user.id):
+        project = await Project.get(conversation.project_id)
+        if not project:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Project not found",
+            )
+        await ensure_project_staff_access(
+            current_user,
+            project,
+            "You don't have permission to delete this conversation",
+        )
+
+    # Delete associated messages
+    await AIMessage.find({"conversation_id": conversation_id}).delete()
+    
+    # Delete conversation
+    await conversation.delete()
+
+
+@router.get("/intervention-rules/{project_id}", response_model=List[InterventionRuleResponse])
+async def get_intervention_rules(
+    project_id: str,
+    current_user: User = Depends(get_current_user),
+) -> List[InterventionRuleResponse]:
+    """Get intervention rules for a project."""
+    # Check project access
+    project = await Project.get(project_id)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
+
+    await ensure_project_staff_access(
+        current_user,
+        project,
+        "Only owner, admin, and scoped teacher can view intervention rules",
+    )
+
+    # Get rules (project-specific and global)
+    rules = (
+        await AIInterventionRule.find(
+            {
+                "$or": [
+                    {"project_id": project_id},
+                    {"project_id": None},  # Global rules
+                ]
+            }
+        )
+        .sort("-priority")
+        .to_list()
+    )
+
+    return [
+        InterventionRuleResponse(
+            id=str(r.id),
+            project_id=r.project_id,
+            rule_type=r.rule_type,
+            name=r.name,
+            description=r.description,
+            priority=r.priority,
+            enabled=r.enabled,
+            silence_threshold=r.silence_threshold,
+            emotion_keywords=r.emotion_keywords,
+            trigger_keywords=r.trigger_keywords,
+            minimum_evidence_count=r.minimum_evidence_count,
+            minimum_counterargument_count=r.minimum_counterargument_count,
+            revision_stall_threshold=r.revision_stall_threshold,
+            max_ai_assistance_ratio=r.max_ai_assistance_ratio,
+            action_type=r.action_type,
+            message_template=r.message_template,
+            ai_role_id=r.ai_role_id,
+            created_at=r.created_at,
+            updated_at=r.updated_at,
+        )
+        for r in rules
+    ]
+
+
+@router.post("/intervention-rules", response_model=InterventionRuleResponse, status_code=status.HTTP_201_CREATED)
+async def create_intervention_rule(
+    rule_data: InterventionRuleCreateRequest,
+    current_user: User = Depends(get_current_user),
+) -> InterventionRuleResponse:
+    """Create an intervention rule."""
+    # Check project access if project_id is provided
+    if rule_data.project_id:
+        project = await Project.get(rule_data.project_id)
+        if not project:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Project not found",
+            )
+
+        await ensure_project_staff_access(
+            current_user,
+            project,
+            "Only owner, admin, and scoped teacher can create intervention rules",
+        )
+    else:
+        # Only admin can create global rules
+        if current_user.role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only admin can create global intervention rules",
+            )
+
+    # Create rule
+    from datetime import datetime
+
+    rule = AIInterventionRule(
+        project_id=rule_data.project_id,
+        rule_type=rule_data.rule_type,
+        name=rule_data.name,
+        description=rule_data.description,
+        priority=rule_data.priority,
+        enabled=rule_data.enabled,
+        silence_threshold=rule_data.silence_threshold,
+        emotion_keywords=rule_data.emotion_keywords,
+        trigger_keywords=rule_data.trigger_keywords,
+        minimum_evidence_count=rule_data.minimum_evidence_count,
+        minimum_counterargument_count=rule_data.minimum_counterargument_count,
+        revision_stall_threshold=rule_data.revision_stall_threshold,
+        max_ai_assistance_ratio=rule_data.max_ai_assistance_ratio,
+        action_type=rule_data.action_type,
+        message_template=rule_data.message_template,
+        ai_role_id=rule_data.ai_role_id,
+    )
+    await rule.insert()
+
+    return InterventionRuleResponse(
+        id=str(rule.id),
+        project_id=rule.project_id,
+        rule_type=rule.rule_type,
+        name=rule.name,
+        description=rule.description,
+        priority=rule.priority,
+        enabled=rule.enabled,
+        silence_threshold=rule.silence_threshold,
+        emotion_keywords=rule.emotion_keywords,
+        trigger_keywords=rule.trigger_keywords,
+        minimum_evidence_count=rule.minimum_evidence_count,
+        minimum_counterargument_count=rule.minimum_counterargument_count,
+        revision_stall_threshold=rule.revision_stall_threshold,
+        max_ai_assistance_ratio=rule.max_ai_assistance_ratio,
+        action_type=rule.action_type,
+        message_template=rule.message_template,
+        ai_role_id=rule.ai_role_id,
+        created_at=rule.created_at,
+        updated_at=rule.updated_at,
+    )
+
+
+@router.put("/intervention-rules/{rule_id}", response_model=InterventionRuleResponse)
+async def update_intervention_rule(
+    rule_id: str,
+    rule_data: InterventionRuleUpdateRequest,
+    current_user: User = Depends(get_current_user),
+) -> InterventionRuleResponse:
+    """Update an intervention rule."""
+    rule = await AIInterventionRule.get(rule_id)
+    if not rule:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Intervention rule not found",
+        )
+
+    # Check permission
+    if rule.project_id:
+        project = await Project.get(rule.project_id)
+        if project:
+            await ensure_project_staff_access(
+                current_user,
+                project,
+                "You don't have permission to update this rule",
+            )
+    else:
+        if current_user.role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only admin can update global rules",
+            )
+
+    # Update rule
+    from datetime import datetime
+
+    if rule_data.name:
+        rule.name = rule_data.name
+    if rule_data.description is not None:
+        rule.description = rule_data.description
+    if rule_data.priority is not None:
+        rule.priority = rule_data.priority
+    if rule_data.enabled is not None:
+        rule.enabled = rule_data.enabled
+    if rule_data.silence_threshold is not None:
+        rule.silence_threshold = rule_data.silence_threshold
+    if rule_data.emotion_keywords is not None:
+        rule.emotion_keywords = rule_data.emotion_keywords
+    if rule_data.trigger_keywords is not None:
+        rule.trigger_keywords = rule_data.trigger_keywords
+    if rule_data.minimum_evidence_count is not None:
+        rule.minimum_evidence_count = rule_data.minimum_evidence_count
+    if rule_data.minimum_counterargument_count is not None:
+        rule.minimum_counterargument_count = rule_data.minimum_counterargument_count
+    if rule_data.revision_stall_threshold is not None:
+        rule.revision_stall_threshold = rule_data.revision_stall_threshold
+    if rule_data.max_ai_assistance_ratio is not None:
+        rule.max_ai_assistance_ratio = rule_data.max_ai_assistance_ratio
+    if rule_data.action_type:
+        rule.action_type = rule_data.action_type
+    if rule_data.message_template:
+        rule.message_template = rule_data.message_template
+    if rule_data.ai_role_id is not None:
+        rule.ai_role_id = rule_data.ai_role_id
+
+    rule.updated_at = datetime.utcnow()
+    await rule.save()
+
+    return InterventionRuleResponse(
+        id=str(rule.id),
+        project_id=rule.project_id,
+        rule_type=rule.rule_type,
+        name=rule.name,
+        description=rule.description,
+        priority=rule.priority,
+        enabled=rule.enabled,
+        silence_threshold=rule.silence_threshold,
+        emotion_keywords=rule.emotion_keywords,
+        trigger_keywords=rule.trigger_keywords,
+        minimum_evidence_count=rule.minimum_evidence_count,
+        minimum_counterargument_count=rule.minimum_counterargument_count,
+        revision_stall_threshold=rule.revision_stall_threshold,
+        max_ai_assistance_ratio=rule.max_ai_assistance_ratio,
+        action_type=rule.action_type,
+        message_template=rule.message_template,
+        ai_role_id=rule.ai_role_id,
+        created_at=rule.created_at,
+        updated_at=rule.updated_at,
+    )
+
+
+@router.delete("/intervention-rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_intervention_rule(
+    rule_id: str,
+    current_user: User = Depends(get_current_user),
+) -> None:
+    """Delete an intervention rule."""
+    rule = await AIInterventionRule.get(rule_id)
+    if not rule:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Intervention rule not found",
+        )
+
+    # Check permission
+    if rule.project_id:
+        project = await Project.get(rule.project_id)
+        if project:
+            await ensure_project_staff_access(
+                current_user,
+                project,
+                "You don't have permission to delete this rule",
+            )
+    else:
+        if current_user.role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only admin can delete global rules",
+            )
+
+    await rule.delete()
+
+
+@router.post("/interventions/check", response_model=List[InterventionCheckResult])
+@limiter.limit("60/minute")
+async def check_intervention_rules(
+    intervention_request: InterventionCheckRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> List[InterventionCheckResult]:
+    """Evaluate currently applicable intervention rules for a project."""
+    project = await Project.get(intervention_request.project_id)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
+
+    await ensure_project_access(current_user, project)
+
+    interventions = await intervention_service.check_interventions(
+        project_id=intervention_request.project_id,
+        user_id=intervention_request.user_id or str(current_user.id),
+        context=intervention_request.context.model_dump(),
+        enabled_rule_set=intervention_request.enabled_rule_set,
+    )
+
+    return [
+        InterventionCheckResult(
+            rule_id=item["rule_id"],
+            rule_name=item["rule_name"],
+            rule_type=item["rule_type"],
+            rule_set_applied=item.get("rule_set_applied"),
+            action_type=item["action_type"],
+            message=item["message"],
+            ai_role_id=item.get("ai_role_id"),
+            trigger_reason=item.get("trigger_reason", "unknown"),
+        )
+        for item in interventions
+    ]

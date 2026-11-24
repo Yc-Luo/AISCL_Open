@@ -1,0 +1,980 @@
+"""Storage API routes for file uploads."""
+
+import hashlib
+import os
+import mimetypes
+import uuid
+from datetime import datetime
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status, BackgroundTasks
+from fastapi.responses import StreamingResponse
+from fastapi.concurrency import run_in_threadpool
+
+from app.api.v1.auth import get_current_user
+from app.core.config import settings
+from app.core.datetime_utils import utc_isoformat
+from app.core.permissions import can_edit_project_content, check_project_member_permission
+from app.core.security import content_disposition_header, sanitize_filename
+from app.repositories.course import Course
+from app.repositories.project import Project
+from app.repositories.resource import Resource
+from app.repositories.system_config import SystemConfig
+from app.repositories.task_submission_artifact import TaskSubmissionArtifact
+from app.repositories.user import User
+from app.services.storage_service import storage_service
+from app.services.resource_preview_service import (
+    PreviewConversionUnavailable,
+    resource_preview_service,
+)
+from app.services.rag_service import rag_service
+from app.services.vector_store_service import vector_store_service
+from app.services.text_extraction_service import text_extraction_service
+from app.services.document_parse_service import document_parse_service
+
+router = APIRouter(prefix="/storage", tags=["storage"])
+
+ALLOWED_UPLOAD_MIME_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/gif",
+    "image/webp",
+    "video/mp4",
+    "video/webm",
+    "video/quicktime",
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/wav",
+    "audio/webm",
+    "application/pdf",
+    "application/x-pdf",
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+    "application/json",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/x-rar-compressed",
+    "application/x-7z-compressed",
+}
+
+INLINE_IMAGE_MIME_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/gif",
+    "image/webp",
+}
+
+
+def _serialize_resource(resource: Resource, *, url: Optional[str] = None) -> dict:
+    """Return a frontend-safe resource payload."""
+    return {
+        "id": str(resource.id),
+        "filename": resource.filename,
+        "url": url if url is not None else resource.url,
+        "size": resource.size,
+        "mime_type": resource.mime_type,
+        "project_id": resource.project_id,
+        "course_id": resource.course_id,
+        "scope": resource.scope,
+        "source_type": resource.source_type,
+        "uploaded_by": resource.uploaded_by,
+        "uploaded_at": utc_isoformat(resource.uploaded_at),
+        "parse_status": getattr(resource, "parse_status", None) or "pending",
+        "parse_provider": getattr(resource, "parse_provider", None),
+        "parse_error": getattr(resource, "parse_error", None),
+        "parsed_at": utc_isoformat(getattr(resource, "parsed_at", None)),
+    }
+
+
+def _normalize_mime_type(mime_type: str) -> str:
+    """Normalize client-provided MIME values before validation."""
+    return (mime_type or "").split(";", 1)[0].strip().lower()
+
+
+def _resolve_upload_mime_type(filename: str, mime_type: Optional[str]) -> str:
+    """Resolve blank browser MIME values from file extension when possible."""
+    normalized = _normalize_mime_type(mime_type or "")
+    if normalized == "application/x-pdf":
+        return "application/pdf"
+    if normalized and normalized != "application/octet-stream":
+        return normalized
+    guessed, _ = mimetypes.guess_type(filename or "")
+    guessed_type = _normalize_mime_type(guessed or "")
+    if guessed_type == "application/x-pdf":
+        return "application/pdf"
+    return guessed_type or normalized
+
+
+def _ensure_allowed_upload_mime(mime_type: str) -> str:
+    """Reject executable or browser-renderable active content uploads."""
+    normalized = _normalize_mime_type(mime_type)
+    if normalized not in ALLOWED_UPLOAD_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported file type",
+        )
+    return normalized
+
+
+def _ensure_project_file_key(project_id: str, file_key: str) -> None:
+    """Ensure a resource record can only bind files under its own project prefix."""
+    expected_prefix = f"projects/{project_id}/files/"
+    if not file_key.startswith(expected_prefix):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid file key for this project",
+        )
+
+
+def _ensure_course_file_key(course_id: str, file_key: str) -> None:
+    """Ensure a resource record can only bind files under its own course prefix."""
+    expected_prefix = f"courses/{course_id}/files/"
+    if not file_key.startswith(expected_prefix):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid file key for this course",
+        )
+
+
+def _has_expected_inline_image_signature(mime_type: str, prefix: bytes) -> bool:
+    """Validate image previews by magic bytes, not by client-provided MIME only."""
+    if mime_type == "image/png":
+        return prefix.startswith(b"\x89PNG\r\n\x1a\n")
+    if mime_type in {"image/jpeg", "image/jpg"}:
+        return prefix.startswith(b"\xff\xd8\xff")
+    if mime_type == "image/gif":
+        return prefix.startswith((b"GIF87a", b"GIF89a"))
+    if mime_type == "image/webp":
+        return prefix.startswith(b"RIFF") and prefix[8:12] == b"WEBP"
+    return False
+
+
+async def ensure_project_access(current_user: User, project: Project, detail: str) -> None:
+    """Ensure current user can access project-scoped storage."""
+    if not await check_project_member_permission(current_user, project):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=detail,
+        )
+
+
+async def ensure_course_access(current_user: User, course: Course, detail: str) -> None:
+    """Ensure current user can view course-scoped resources."""
+    if current_user.role == "admin":
+        return
+    if current_user.role == "teacher" and course.teacher_id == str(current_user.id):
+        return
+    if str(current_user.id) in course.students:
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+
+async def ensure_course_manage_access(current_user: User, course: Course, detail: str) -> None:
+    """Ensure current user can manage course-scoped resources."""
+    if current_user.role == "admin":
+        return
+    if current_user.role == "teacher" and course.teacher_id == str(current_user.id):
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+
+async def _get_storage_quota_bytes() -> int:
+    """Read the per-project/course storage quota from system config."""
+    default_gb = 5.0
+    config = await SystemConfig.find_one(SystemConfig.key == "storage_quota")
+    try:
+        quota_gb = float(config.value) if config and config.value else default_gb
+    except (TypeError, ValueError):
+        quota_gb = default_gb
+    return max(int(quota_gb * 1024 * 1024 * 1024), 0)
+
+
+async def _get_scope_storage_usage_bytes(
+    *,
+    project_id: Optional[str] = None,
+    course_id: Optional[str] = None,
+) -> int:
+    """Calculate current persisted upload usage for one project or course."""
+    resource_query = {"project_id": project_id} if project_id else {"course_id": course_id}
+    artifact_query = {"project_id": project_id} if project_id else {"course_id": course_id}
+
+    resources = await Resource.find(resource_query).to_list()
+    artifacts = await TaskSubmissionArtifact.find(artifact_query).to_list()
+    return sum(int(item.size or 0) for item in resources) + sum(int(item.size or 0) for item in artifacts)
+
+
+async def _ensure_storage_quota_available(
+    *,
+    incoming_size: int,
+    project_id: Optional[str] = None,
+    course_id: Optional[str] = None,
+) -> None:
+    quota_bytes = await _get_storage_quota_bytes()
+    if quota_bytes <= 0:
+        return
+
+    current_usage = await _get_scope_storage_usage_bytes(project_id=project_id, course_id=course_id)
+    if current_usage + incoming_size > quota_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Storage quota exceeded",
+        )
+
+
+@router.post("/presigned-url")
+async def generate_presigned_url(
+    filename: str = Query(...),
+    file_type: str = Query(...),
+    size: int = Query(..., ge=1, le=settings.MAX_FILE_SIZE),
+    project_id: Optional[str] = Query(None),
+    course_id: Optional[str] = Query(None),
+    md5: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Generate presigned URL for file upload."""
+    normalized_file_type = _ensure_allowed_upload_mime(
+        _resolve_upload_mime_type(filename, file_type)
+    )
+
+    if bool(project_id) == bool(course_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Exactly one of project_id or course_id is required",
+        )
+
+    if course_id:
+        course = await Course.get(course_id)
+        if not course:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Course not found",
+            )
+        await ensure_course_manage_access(
+            current_user,
+            course,
+            "You don't have permission to upload files to this course",
+        )
+        file_id = str(uuid.uuid4())
+        file_key = f"courses/{course_id}/files/{file_id}"
+    else:
+        # Check project access
+        project = await Project.get(project_id)
+        if not project:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Project not found",
+            )
+
+        await ensure_project_access(
+            current_user,
+            project,
+            "You don't have permission to upload files to this project",
+        )
+        file_id = str(uuid.uuid4())
+        file_key = f"projects/{project_id}/files/{file_id}"
+
+    await _ensure_storage_quota_available(
+        incoming_size=size,
+        project_id=project_id,
+        course_id=course_id,
+    )
+
+    # Generate presigned URL
+    upload_url = storage_service.generate_presigned_put_url(
+        file_key, expires_in=300
+    )
+
+    return {
+        "upload_url": upload_url,
+        "file_key": file_key,
+        "file_type": normalized_file_type,
+        "expires_in": 300,
+    }
+
+
+class CreateResourceRequest(BaseModel):
+    file_key: str
+    filename: str
+    size: int
+    project_id: Optional[str] = None
+    course_id: Optional[str] = None
+    scope: str = Field(default="project", pattern="^(project|course)$")
+    mime_type: str
+    source_type: str = Field(
+        default="library",
+        pattern="^(library|document_embed|chat_attachment|inquiry_material|ai_knowledge)$",
+    )
+
+
+@router.post("/resources")
+async def create_resource(
+    resource_data: CreateResourceRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Create resource record after file upload."""
+    return await _create_resource_from_uploaded_object(resource_data, background_tasks, current_user)
+
+
+@router.post("/upload-resource")
+async def upload_resource_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    project_id: Optional[str] = Form(None),
+    course_id: Optional[str] = Form(None),
+    scope: str = Form("project", pattern="^(project|course)$"),
+    source_type: str = Form("library", pattern="^(library|document_embed|chat_attachment|inquiry_material|ai_knowledge)$"),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Upload a file through the backend and create its resource record.
+
+    This avoids browser-to-MinIO direct uploads, which are fragile across IP,
+    domain, HTTPS and reverse-proxy deployments.
+    """
+    if bool(project_id) == bool(course_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Exactly one of project_id or course_id is required",
+        )
+
+    filename = sanitize_filename(file.filename or "upload")
+    normalized_mime_type = _ensure_allowed_upload_mime(
+        _resolve_upload_mime_type(filename, file.content_type)
+    )
+    await run_in_threadpool(file.file.seek, 0, os.SEEK_END)
+    file_size = await run_in_threadpool(file.file.tell)
+    await run_in_threadpool(file.file.seek, 0)
+    if file_size <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is empty",
+        )
+    if file_size > settings.MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Uploaded file exceeds the maximum allowed size",
+        )
+
+    if course_id:
+        resource_scope = "course"
+        owner_id = course_id
+        file_key = f"courses/{course_id}/files/{str(uuid.uuid4())}"
+    else:
+        resource_scope = "project"
+        owner_id = project_id
+        file_key = f"projects/{project_id}/files/{str(uuid.uuid4())}"
+
+    await run_in_threadpool(
+        storage_service.upload_file_object,
+        file_key,
+        file.file,
+        file_size,
+        normalized_mime_type,
+    )
+
+    resource_data = CreateResourceRequest(
+        file_key=file_key,
+        filename=filename,
+        size=file_size,
+        project_id=owner_id if not course_id else None,
+        course_id=course_id,
+        scope=resource_scope,
+        mime_type=normalized_mime_type,
+        source_type=source_type,
+    )
+    return await _create_resource_from_uploaded_object(resource_data, background_tasks, current_user)
+
+
+async def _create_resource_from_uploaded_object(
+    resource_data: CreateResourceRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User,
+) -> dict:
+    """Create a resource record for an object that already exists in storage."""
+    normalized_mime_type = _ensure_allowed_upload_mime(
+        _resolve_upload_mime_type(resource_data.filename, resource_data.mime_type)
+    )
+
+    if resource_data.scope == "course":
+        if not resource_data.course_id or resource_data.project_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Course-scoped resources require course_id only",
+            )
+        course = await Course.get(resource_data.course_id)
+        if not course:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Course not found",
+            )
+        await ensure_course_manage_access(
+            current_user,
+            course,
+            "You don't have permission to create resources in this course",
+        )
+        _ensure_course_file_key(resource_data.course_id, resource_data.file_key)
+    else:
+        if not resource_data.project_id or resource_data.course_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Project-scoped resources require project_id only",
+            )
+        # Check project access
+        project = await Project.get(resource_data.project_id)
+        if not project:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Project not found",
+            )
+        await ensure_project_access(
+            current_user,
+            project,
+            "You don't have permission to create resources in this project",
+        )
+        _ensure_project_file_key(resource_data.project_id, resource_data.file_key)
+
+    actual_size = await run_in_threadpool(storage_service.get_file_size, resource_data.file_key)
+    if actual_size is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file not found in object storage",
+        )
+    if actual_size != resource_data.size:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file size does not match the resource metadata",
+        )
+    await _ensure_storage_quota_available(
+        incoming_size=actual_size,
+        project_id=resource_data.project_id,
+        course_id=resource_data.course_id,
+    )
+
+    if normalized_mime_type in INLINE_IMAGE_MIME_TYPES:
+        prefix = await run_in_threadpool(storage_service.get_file_prefix, resource_data.file_key, 16)
+        if not _has_expected_inline_image_signature(normalized_mime_type, prefix):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Image file signature does not match the declared MIME type",
+            )
+
+    # Generate download URL
+    download_url = storage_service.generate_presigned_get_url(resource_data.file_key)
+
+    # Create resource record
+    resource = Resource(
+        project_id=resource_data.project_id,
+        course_id=resource_data.course_id,
+        scope=resource_data.scope,
+        filename=resource_data.filename,
+        file_key=resource_data.file_key,
+        url=download_url,
+        size=resource_data.size,
+        mime_type=normalized_mime_type,
+        source_type=resource_data.source_type,
+        uploaded_by=str(current_user.id),
+    )
+    await resource.insert()
+
+    async def process_resource_task(resource_id: str, file_key: str):
+        """Extract resource text and index it for semantic retrieval."""
+        try:
+            resource = await Resource.get(resource_id)
+            if not resource:
+                return
+            file_bytes = await run_in_threadpool(storage_service.get_file_bytes, file_key)
+            text_content = ""
+            if text_extraction_service.can_extract(normalized_mime_type, resource_data.filename):
+                text_content = text_extraction_service.extract_text(
+                    file_bytes,
+                    normalized_mime_type,
+                    resource_data.filename,
+                )
+            if not text_content:
+                text_content = (
+                    f"资源文件：{resource_data.filename}\n"
+                    f"类型：{normalized_mime_type}\n"
+                    "该文件暂未抽取正文，可作为资源库引用来源。"
+                )
+            if document_parse_service.can_parse_with_mineru(normalized_mime_type, resource_data.filename):
+                await document_parse_service.process_resource(resource_id, fallback_text=text_content)
+            else:
+                indexed = await rag_service.process_resource(resource_id, text_content)
+                resource.parse_status = "indexed" if indexed else "unsupported"
+                resource.parse_provider = "local"
+                resource.parse_error = None if indexed else "No indexable text was produced"
+                resource.parsed_at = datetime.utcnow() if indexed else None
+                await resource.save()
+        except Exception as exc:
+            print(f"Resource RAG indexing skipped: {exc}")
+            resource = await Resource.get(resource_id)
+            if resource:
+                resource.parse_status = "failed"
+                resource.parse_error = str(exc)[:1000]
+                await resource.save()
+
+    if resource.source_type in {"library", "ai_knowledge"}:
+        background_tasks.add_task(process_resource_task, str(resource.id), resource.file_key)
+
+    if resource_data.project_id:
+        # Log project-scoped activity
+        from app.services.activity_service import activity_service
+        await activity_service.log_activity(
+            project_id=resource_data.project_id,
+            user_id=str(current_user.id),
+            module="resources",
+            action="upload",
+            target_id=str(resource.id),
+            metadata={"filename": resource_data.filename}
+        )
+
+
+    return _serialize_resource(resource)
+
+
+@router.get("/resources/{project_id}")
+async def list_resources(
+    project_id: str,
+    source_type: str = Query("library", pattern="^(library|document_embed|chat_attachment|inquiry_material|ai_knowledge|all)$"),
+    include_course_resources: bool = Query(False),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """List project resources."""
+    # Check project access
+    project = await Project.get(project_id)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
+    await ensure_project_access(
+        current_user,
+        project,
+        "You don't have permission to access this project",
+    )
+
+    # Get project resources
+    if source_type == "all":
+        resources = await Resource.find(
+            {
+                "project_id": project_id,
+                "$or": [
+                    {"scope": "project"},
+                    {"scope": {"$exists": False}},
+                    {"scope": None},
+                ],
+            }
+        ).to_list()
+    elif source_type == "library":
+        resources = await Resource.find(
+            {
+                "project_id": project_id,
+                "$and": [
+                    {
+                        "$or": [
+                            {"scope": "project"},
+                            {"scope": {"$exists": False}},
+                            {"scope": None},
+                        ],
+                    },
+                    {
+                        "$or": [
+                            {"source_type": "library"},
+                            {"source_type": {"$exists": False}},
+                            {"source_type": None},
+                        ],
+                    },
+                ],
+            }
+        ).to_list()
+    else:
+        resources = await Resource.find(
+            Resource.project_id == project_id,
+            Resource.scope == "project",
+            Resource.source_type == source_type,
+        ).to_list()
+
+    if include_course_resources and project.course_id and source_type in {"library", "all"}:
+        course_resources = await Resource.find(
+            Resource.course_id == project.course_id,
+            Resource.scope == "course",
+            Resource.source_type == "library",
+        ).to_list()
+        resources.extend(course_resources)
+
+    # Generate fresh presigned URLs
+    resource_list = []
+    for resource in resources:
+        download_url = storage_service.generate_presigned_get_url(
+            resource.file_key
+        )
+        resource_list.append(_serialize_resource(resource, url=download_url))
+
+    return {"resources": resource_list}
+
+
+@router.get("/course-resources/{course_id}")
+async def list_course_resources(
+    course_id: str,
+    source_type: str = Query("library", pattern="^(library|ai_knowledge|all)$"),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """List teacher-provided course resources."""
+    course = await Course.get(course_id)
+    if not course:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Course not found",
+        )
+    await ensure_course_access(
+        current_user,
+        course,
+        "You don't have permission to access this course",
+    )
+
+    if source_type == "all":
+        resources = await Resource.find(
+            Resource.course_id == course_id,
+            Resource.scope == "course",
+        ).to_list()
+    else:
+        resources = await Resource.find(
+            Resource.course_id == course_id,
+            Resource.scope == "course",
+            Resource.source_type == source_type,
+        ).to_list()
+
+    resource_list = []
+    for resource in resources:
+        resource_list.append(
+            _serialize_resource(
+                resource,
+                url=storage_service.generate_presigned_get_url(resource.file_key),
+            )
+        )
+
+    return {"resources": resource_list}
+
+
+@router.delete("/resources/{resource_id}")
+async def delete_resource(
+    resource_id: str,
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Delete a resource."""
+    resource = await Resource.get(resource_id)
+    if not resource:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Resource not found",
+        )
+
+    is_uploader = resource.uploaded_by == str(current_user.id)
+
+    if resource.scope == "course":
+        if not resource.course_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Course not found",
+            )
+        course = await Course.get(resource.course_id)
+        if not course:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Course not found",
+            )
+        if not is_uploader:
+            await ensure_course_manage_access(
+                current_user,
+                course,
+                "You don't have permission to delete this course resource",
+            )
+    else:
+        # Check permission (Editor/Owner only)
+        project = await Project.get(resource.project_id)
+        if not project:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Project not found",
+            )
+
+        if not (is_uploader or await can_edit_project_content(current_user, project)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You don't have permission to delete this resource",
+            )
+
+    # Capture info for logging before deletion
+    filename = resource.filename
+    resource_id_str = str(resource.id)
+    project_id = resource.project_id
+    file_key = resource.file_key
+    parsed_keys = [
+        key
+        for key in [
+            resource.parsed_markdown_key,
+            resource.parsed_content_key,
+            resource.parsed_zip_key,
+            resource_preview_service.preview_pdf_key(resource),
+        ]
+        if key
+    ]
+
+    # Delete from storage first
+    try:
+        storage_service.delete_file(file_key)
+    except Exception as e:
+        print(f"Warning: Failed to delete file from storage: {e}")
+    for parsed_key in parsed_keys:
+        try:
+            storage_service.delete_file(parsed_key)
+        except Exception as e:
+            print(f"Warning: Failed to delete parsed artifact from storage: {e}")
+
+    # Delete from database
+    await resource.delete()
+
+    index_project_id = None
+    if resource.scope == "course" and resource.course_id:
+        index_project_id = rag_service.course_resource_namespace(resource.course_id)
+    elif resource.project_id:
+        index_project_id = resource.project_id
+    if index_project_id:
+        await vector_store_service.delete_source_points(
+            project_id=index_project_id,
+            source_type="resource",
+            source_id=resource_id_str,
+        )
+
+    # Log activity using captured data
+    if project_id:
+        try:
+            from app.services.activity_service import activity_service
+            await activity_service.log_activity(
+                project_id=project_id,
+                user_id=str(current_user.id),
+                module="resources",
+                action="delete",
+                target_id=resource_id_str,
+                metadata={"filename": filename}
+            )
+        except Exception as e:
+            print(f"Warning: Failed to log activity for deletion: {e}")
+
+    return {"message": "Resource deleted successfully"}
+
+
+async def _ensure_resource_download_access(current_user: User, resource: Resource) -> None:
+    """Ensure current user can download a resource."""
+    if resource.scope == "course":
+        if not resource.course_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
+        course = await Course.get(resource.course_id)
+        if not course:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
+        await ensure_course_access(
+            current_user,
+            course,
+            "You don't have permission to download this course resource",
+        )
+        return
+
+    project = await Project.get(resource.project_id)
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
+    await ensure_project_access(
+        current_user,
+        project,
+        "You don't have permission to download this resource",
+    )
+
+
+@router.get("/resources/{resource_id}/view")
+async def view_resource(
+    resource_id: str
+):
+    """View image resources by proxying from storage.
+
+    This endpoint remains unauthenticated because editor image tags cannot attach
+    Bearer headers. To avoid exposing arbitrary active content, only validated
+    image resources are served here. Other resources must use the authenticated
+    download endpoint.
+    """
+    resource = await Resource.get(resource_id)
+    if not resource:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Resource not found",
+        )
+
+    normalized_mime_type = _normalize_mime_type(resource.mime_type)
+    if normalized_mime_type not in INLINE_IMAGE_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Only image previews are available through this endpoint",
+        )
+
+    try:
+        prefix = await run_in_threadpool(storage_service.get_file_prefix, resource.file_key, 16)
+        if not _has_expected_inline_image_signature(normalized_mime_type, prefix):
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="Stored file does not match an allowed image signature",
+            )
+
+        # Get object stream from storage
+        response = storage_service.client.get_object(
+            settings.MINIO_BUCKET_NAME,
+            resource.file_key
+        )
+        
+        # Generator to yield chunks and ensure closing
+        def iter_file():
+            try:
+                yield from response.stream(32 * 1024)
+            finally:
+                response.close()
+                response.release_conn()
+
+        return StreamingResponse(
+            iter_file(),
+            media_type=normalized_mime_type,
+            headers={
+                "Content-Disposition": content_disposition_header(resource.filename, "inline"),
+                "Cache-Control": "private, max-age=300",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error proxying resource: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to stream resource",
+        )
+
+
+@router.get("/resources/{resource_id}/download")
+async def download_resource(
+    resource_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Download resource through the backend after permission checks."""
+    resource = await Resource.get(resource_id)
+    if not resource:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Resource not found",
+        )
+    await _ensure_resource_download_access(current_user, resource)
+
+    try:
+        response = storage_service.client.get_object(
+            settings.MINIO_BUCKET_NAME,
+            resource.file_key,
+        )
+
+        def iter_file():
+            try:
+                yield from response.stream(64 * 1024)
+            finally:
+                response.close()
+                response.release_conn()
+
+        return StreamingResponse(
+            iter_file(),
+            media_type=_normalize_mime_type(resource.mime_type) or "application/octet-stream",
+            headers={
+                "Content-Disposition": content_disposition_header(resource.filename),
+                "Cache-Control": "private, max-age=300",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    except Exception as e:
+        print(f"Error downloading resource: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to stream resource",
+        )
+
+
+@router.get("/resources/{resource_id}/preview-pdf")
+async def preview_resource_pdf(
+    resource_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Return an inline PDF preview for Office resources after permission checks."""
+    resource = await Resource.get(resource_id)
+    if not resource:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Resource not found",
+        )
+    await _ensure_resource_download_access(current_user, resource)
+
+    normalized_mime_type = _normalize_mime_type(resource.mime_type)
+    preview_key = resource.file_key
+    preview_filename = resource.filename
+
+    if normalized_mime_type != "application/pdf":
+        try:
+            preview_key = await run_in_threadpool(
+                resource_preview_service.get_or_create_pdf_preview_key,
+                resource,
+            )
+            preview_filename = f"{sanitize_filename(resource.filename).rsplit('.', 1)[0]}.pdf"
+        except PreviewConversionUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail=str(exc),
+            ) from exc
+        except Exception as exc:
+            print(f"Error converting resource preview: {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to convert resource preview",
+            ) from exc
+
+    try:
+        response = storage_service.client.get_object(
+            settings.MINIO_BUCKET_NAME,
+            preview_key,
+        )
+
+        def iter_file():
+            try:
+                yield from response.stream(64 * 1024)
+            finally:
+                response.close()
+                response.release_conn()
+
+        return StreamingResponse(
+            iter_file(),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": content_disposition_header(preview_filename, "inline"),
+                "Cache-Control": "private, max-age=300",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    except Exception as e:
+        print(f"Error streaming resource preview: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to stream resource preview",
+        )
