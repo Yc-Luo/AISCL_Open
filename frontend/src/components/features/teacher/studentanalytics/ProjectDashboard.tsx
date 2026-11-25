@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { TrendingUp, Download, Users, Clock, Target, FolderOpen, Brain, FlaskConical, Save, ChevronsLeft, ChevronsRight, RefreshCcw, ShieldCheck } from 'lucide-react';
 import { Button, Badge } from '../../../ui';
@@ -186,25 +186,31 @@ export default function ProjectDashboard() {
     }, [selectedProjectId, activeTab]);
 
     useEffect(() => {
+        let active = true;
         const fetchExperimentVersion = async () => {
             if (!selectedProjectId) return;
             try {
                 setFetchingExperiment(true);
+                setExperimentDraft(null);
+                setExperimentVersion(null);
                 setExperimentMessage(null);
                 const data = await projectService.getExperimentVersion(selectedProjectId);
+                if (!active) return;
                 setExperimentVersion(data);
                 setExperimentDraft(data);
             } catch (error) {
+                if (!active) return;
                 console.error('Failed to fetch experiment version:', error);
                 setExperimentVersion(null);
                 setExperimentDraft(null);
-                setExperimentMessage('实验版本读取失败，请稍后重试。');
+                setExperimentMessage('小组配置读取失败，请稍后重试。');
             } finally {
-                setFetchingExperiment(false);
+                if (active) setFetchingExperiment(false);
             }
         };
 
         fetchExperimentVersion();
+        return () => { active = false; };
     }, [selectedProjectId]);
 
     useEffect(() => {
@@ -254,6 +260,9 @@ export default function ProjectDashboard() {
         });
     };
 
+    const activeConfigProject = useRef(selectedProjectId);
+    activeConfigProject.current = selectedProjectId;
+
     const persistExperimentDraft = async (
         draft: ExperimentVersion,
         options?: {
@@ -261,7 +270,7 @@ export default function ProjectDashboard() {
             updateSource?: 'manual_save' | 'quick_advance_stage' | 'quick_rewind_stage'
         }
     ) => {
-        if (!selectedProjectId) return;
+        if (!selectedProjectId || draft.project_id !== selectedProjectId) return;
 
         const normalizedStageSequence = draft.stage_sequence.filter(Boolean);
         const normalizedCurrentStage = normalizedStageSequence.includes(draft.current_stage || '')
@@ -271,14 +280,16 @@ export default function ProjectDashboard() {
         try {
             setSavingExperiment(true);
             setExperimentMessage(null);
-            const payload: Partial<ExperimentVersion> = {
+            const stageOnly = options?.updateSource === 'quick_advance_stage' || options?.updateSource === 'quick_rewind_stage';
+            const payload: Partial<ExperimentVersion> = stageOnly ? { current_stage: normalizedCurrentStage } : {
                 mode: draft.mode,
                 version_name: draft.version_name.trim() || 'default',
                 stage_control_mode: draft.stage_control_mode,
                 process_scaffold_mode: draft.process_scaffold_mode,
                 ai_scaffold_mode: draft.ai_scaffold_mode,
+                collaboration_memory_enabled: draft.collaboration_memory_enabled,
+                auto_prompt_enabled: draft.auto_prompt_enabled,
                 broadcast_stage_updates: draft.broadcast_stage_updates,
-                group_condition: draft.group_condition?.trim() || null,
                 enabled_scaffold_layers: draft.enabled_scaffold_layers,
                 enabled_scaffold_roles: draft.enabled_scaffold_roles,
                 enabled_rule_set: draft.enabled_rule_set?.trim() || null,
@@ -286,6 +297,18 @@ export default function ProjectDashboard() {
                 stage_sequence: normalizedStageSequence,
                 current_stage: normalizedCurrentStage,
             };
+            if (!stageOnly && experimentVersion?.project_id === selectedProjectId) {
+                for (const key of Object.keys(payload) as (keyof ExperimentVersion)[]) {
+                    if (JSON.stringify(payload[key]) === JSON.stringify(experimentVersion[key])) delete payload[key];
+                }
+                if (!payload.stage_sequence && draft.current_stage === experimentVersion.current_stage) {
+                    delete payload.current_stage;
+                }
+            }
+            if (!Object.keys(payload).length) {
+                setExperimentMessage('没有需要保存的修改。');
+                return;
+            }
             const saved = await projectService.updateExperimentVersion(selectedProjectId, payload);
             const previousVersion = experimentVersion;
             const changedFields = [
@@ -293,6 +316,8 @@ export default function ProjectDashboard() {
                 previousVersion?.stage_control_mode !== saved.stage_control_mode ? 'stage_control_mode' : null,
                 previousVersion?.process_scaffold_mode !== saved.process_scaffold_mode ? 'process_scaffold_mode' : null,
                 previousVersion?.ai_scaffold_mode !== saved.ai_scaffold_mode ? 'ai_scaffold_mode' : null,
+                previousVersion?.collaboration_memory_enabled !== saved.collaboration_memory_enabled ? 'collaboration_memory_enabled' : null,
+                previousVersion?.auto_prompt_enabled !== saved.auto_prompt_enabled ? 'auto_prompt_enabled' : null,
                 previousVersion?.broadcast_stage_updates !== saved.broadcast_stage_updates ? 'broadcast_stage_updates' : null,
                 previousVersion?.group_condition !== saved.group_condition ? 'group_condition' : null,
                 JSON.stringify(previousVersion?.enabled_scaffold_layers || []) !== JSON.stringify(saved.enabled_scaffold_layers || []) ? 'enabled_scaffold_layers' : null,
@@ -327,12 +352,18 @@ export default function ProjectDashboard() {
                     update_source: options?.updateSource || 'manual_save',
                 }
             });
-            setExperimentVersion(saved);
-            setExperimentDraft(saved);
-            setExperimentMessage(options?.successMessage || '实验配置已保存。');
+            if (activeConfigProject.current === selectedProjectId) {
+                setExperimentVersion(saved);
+                setExperimentDraft(current => stageOnly && current?.project_id === saved.project_id
+                    ? { ...current, current_stage: saved.current_stage }
+                    : saved);
+                setExperimentMessage(options?.successMessage || '小组配置已保存。');
+            }
         } catch (error) {
             console.error('Failed to update experiment version:', error);
-            setExperimentMessage('实验配置保存失败，请稍后重试。');
+            if (activeConfigProject.current === selectedProjectId) {
+                setExperimentMessage('小组配置保存失败，请稍后重试。');
+            }
         } finally {
             setSavingExperiment(false);
         }
@@ -341,21 +372,21 @@ export default function ProjectDashboard() {
     const handleExperimentSave = async () => {
         if (!experimentDraft) return;
         await persistExperimentDraft(experimentDraft, {
-            successMessage: '实验配置已保存。',
+            successMessage: '小组配置已保存。',
             updateSource: 'manual_save',
         });
     };
 
     const handleAdvanceToNextStage = async () => {
-        if (!experimentDraft) return;
+        if (!experimentVersion) return;
 
-        const stages = experimentDraft.stage_sequence.filter(Boolean);
+        const stages = experimentVersion.stage_sequence.filter(Boolean);
         if (stages.length === 0) {
             setExperimentMessage('当前还没有配置阶段序列，无法推进阶段。');
             return;
         }
 
-        const currentIndex = experimentDraft.current_stage ? stages.indexOf(experimentDraft.current_stage) : -1;
+        const currentIndex = experimentVersion.current_stage ? stages.indexOf(experimentVersion.current_stage) : -1;
         const nextIndex = currentIndex < 0 ? 0 : currentIndex + 1;
 
         if (nextIndex >= stages.length) {
@@ -364,7 +395,7 @@ export default function ProjectDashboard() {
         }
 
         const nextDraft: ExperimentVersion = {
-            ...experimentDraft,
+            ...experimentVersion,
             current_stage: stages[nextIndex],
         };
 
@@ -375,22 +406,22 @@ export default function ProjectDashboard() {
     };
 
     const handleRewindToPreviousStage = async () => {
-        if (!experimentDraft) return;
+        if (!experimentVersion) return;
 
-        const stages = experimentDraft.stage_sequence.filter(Boolean);
+        const stages = experimentVersion.stage_sequence.filter(Boolean);
         if (stages.length === 0) {
             setExperimentMessage('当前还没有配置阶段序列，无法回退阶段。');
             return;
         }
 
-        const currentIndex = experimentDraft.current_stage ? stages.indexOf(experimentDraft.current_stage) : -1;
+        const currentIndex = experimentVersion.current_stage ? stages.indexOf(experimentVersion.current_stage) : -1;
         if (currentIndex <= 0) {
             setExperimentMessage('当前已经处于第一个阶段。');
             return;
         }
 
         const nextDraft: ExperimentVersion = {
-            ...experimentDraft,
+            ...experimentVersion,
             current_stage: stages[currentIndex - 1],
         };
 
@@ -621,6 +652,12 @@ export default function ProjectDashboard() {
     const stageSequenceInput = experimentDraft?.stage_sequence.join(', ') || CANONICAL_STAGES.join(', ');
     const scaffoldLayersInput = experimentDraft?.enabled_scaffold_layers.join(', ') || '';
     const scaffoldRolesInput = experimentDraft?.enabled_scaffold_roles.join(', ') || '';
+    const validDraft = experimentDraft?.project_id === selectedProjectId;
+    const multiAgent = experimentDraft?.ai_scaffold_mode === 'multi_agent';
+    const canUseAutoPrompt = multiAgent && experimentDraft?.process_scaffold_mode === 'on';
+    const legacyAutoPrompt = experimentDraft?.mode === 'research'
+        && (experimentDraft?.enabled_rule_set || '').toLowerCase().split('+')
+            .map(part => part.trim()).filter(Boolean).slice(1).includes('group-chat-live');
 
     return (
         <div className="space-y-6 animate-fadeIn">
@@ -667,10 +704,10 @@ export default function ProjectDashboard() {
                     <div>
                         <div className="flex items-center gap-2">
                             <FlaskConical className="w-5 h-5 text-indigo-600" />
-                            <h2 className="text-lg font-bold text-slate-800">实验控制面板</h2>
+                            <h2 className="text-lg font-bold text-slate-800">小组 AI 与阶段设置</h2>
                         </div>
                         <p className="mt-1 text-sm text-slate-500">
-                            用于快速核对当前小组的实验版本、组别条件、阶段序列与支架开放范围。
+                            此处修改只应用于当前小组。
                         </p>
                         {selectedProject && (
                             <div className="mt-2 text-xs text-slate-400">
@@ -687,17 +724,17 @@ export default function ProjectDashboard() {
                         <Button
                             size="sm"
                             onClick={handleExperimentSave}
-                            disabled={!experimentDraft || savingExperiment}
+                            disabled={!validDraft || savingExperiment}
                             className="gap-2 rounded-lg"
                         >
                             <Save className="w-4 h-4" />
-                            {savingExperiment ? '保存中...' : '保存实验配置'}
+                            {savingExperiment ? '保存中...' : '保存小组配置'}
                         </Button>
                         <Button
                             variant="outline"
                             size="sm"
                             onClick={handleRewindToPreviousStage}
-                            disabled={!experimentDraft || savingExperiment || experimentDraft.stage_sequence.filter(Boolean).length === 0}
+                            disabled={!validDraft || savingExperiment || !experimentVersion?.stage_sequence.some(Boolean)}
                             className="gap-2 rounded-lg"
                         >
                             <ChevronsLeft className="w-4 h-4" />
@@ -707,7 +744,7 @@ export default function ProjectDashboard() {
                             variant="outline"
                             size="sm"
                             onClick={handleAdvanceToNextStage}
-                            disabled={!experimentDraft || savingExperiment || experimentDraft.stage_sequence.filter(Boolean).length === 0}
+                            disabled={!validDraft || savingExperiment || !experimentVersion?.stage_sequence.some(Boolean)}
                             className="gap-2 rounded-lg"
                         >
                             <ChevronsRight className="w-4 h-4" />
@@ -725,27 +762,18 @@ export default function ProjectDashboard() {
                 {fetchingExperiment ? (
                     <div className="mt-6 flex items-center gap-3 text-sm text-slate-500">
                         <div className="h-5 w-5 animate-spin rounded-full border-b-2 border-indigo-600"></div>
-                        正在读取实验版本...
+                        正在读取小组配置...
                     </div>
-                ) : experimentDraft ? (
+                ) : validDraft && experimentDraft ? (
                     <div className="mt-6 grid grid-cols-1 gap-6 xl:grid-cols-2">
                         <div className="space-y-4">
                             <div>
-                                <label className="mb-2 block text-xs font-semibold uppercase tracking-wide text-slate-500">实验版本名称</label>
+                                <label className="mb-2 block text-xs font-semibold uppercase tracking-wide text-slate-500">配置版本名称</label>
                                 <input
                                     value={experimentDraft.version_name}
                                     onChange={(e) => handleDraftChange('version_name', e.target.value)}
                                     className="w-full rounded-xl border border-gray-200 px-3 py-2.5 text-sm focus:ring-2 focus:ring-indigo-500"
-                                    placeholder="例如：research-v1"
-                                />
-                            </div>
-                            <div>
-                                <label className="mb-2 block text-xs font-semibold uppercase tracking-wide text-slate-500">组别条件</label>
-                                <input
-                                    value={experimentDraft.group_condition || ''}
-                                    onChange={(e) => handleDraftChange('group_condition', e.target.value || null)}
-                                    className="w-full rounded-xl border border-gray-200 px-3 py-2.5 text-sm focus:ring-2 focus:ring-indigo-500"
-                                    placeholder="例如：dual-scaffold"
+                                    placeholder="例如：小组协作方案 v1"
                                 />
                             </div>
                             <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
@@ -764,7 +792,17 @@ export default function ProjectDashboard() {
                                     <label className="mb-2 block text-xs font-semibold uppercase tracking-wide text-slate-500">协作过程支架</label>
                                     <select
                                         value={experimentDraft.process_scaffold_mode}
-                                        onChange={(e) => handleDraftChange('process_scaffold_mode', e.target.value as ExperimentVersion['process_scaffold_mode'])}
+                                        onChange={(e) => {
+                                            const mode = e.target.value as ExperimentVersion['process_scaffold_mode'];
+                                            setExperimentDraft({
+                                                ...experimentDraft,
+                                                process_scaffold_mode: mode,
+                                                enabled_scaffold_layers: mode === 'on' && experimentDraft.enabled_scaffold_layers.length
+                                                    ? [...new Set([...experimentDraft.enabled_scaffold_layers, 'process_scaffold'])]
+                                                    : experimentDraft.enabled_scaffold_layers,
+                                                auto_prompt_enabled: mode === 'off' ? false : experimentDraft.auto_prompt_enabled,
+                                            });
+                                        }}
                                         className="w-full rounded-xl border border-gray-200 px-3 py-2.5 text-sm focus:ring-2 focus:ring-indigo-500"
                                     >
                                         <option value="on">开启</option>
@@ -775,7 +813,15 @@ export default function ProjectDashboard() {
                                     <label className="mb-2 block text-xs font-semibold uppercase tracking-wide text-slate-500">AI支架形态</label>
                                     <select
                                         value={experimentDraft.ai_scaffold_mode}
-                                        onChange={(e) => handleDraftChange('ai_scaffold_mode', e.target.value as ExperimentVersion['ai_scaffold_mode'])}
+                                        onChange={(e) => setExperimentDraft({
+                                            ...experimentDraft,
+                                            ai_scaffold_mode: e.target.value as ExperimentVersion['ai_scaffold_mode'],
+                                            enabled_scaffold_layers: e.target.value === 'multi_agent' && experimentDraft.enabled_scaffold_layers.length
+                                                ? [...new Set([...experimentDraft.enabled_scaffold_layers, 'multi_agent_scaffold'])]
+                                                : experimentDraft.enabled_scaffold_layers,
+                                            collaboration_memory_enabled: false,
+                                            auto_prompt_enabled: false,
+                                        })}
                                         className="w-full rounded-xl border border-gray-200 px-3 py-2.5 text-sm focus:ring-2 focus:ring-indigo-500"
                                     >
                                         <option value="multi_agent">多角色 AI 支持</option>
@@ -793,6 +839,20 @@ export default function ProjectDashboard() {
                                         <option value="off">关闭</option>
                                     </select>
                                 </div>
+                            </div>
+                            <div className="flex flex-wrap gap-x-5 gap-y-2 text-sm text-slate-700">
+                                <label className="flex items-center gap-2">
+                                    <input type="checkbox" disabled={!multiAgent}
+                                        checked={multiAgent && (experimentDraft.collaboration_memory_enabled ?? true)}
+                                        onChange={(event) => handleDraftChange('collaboration_memory_enabled', event.target.checked)} />
+                                    协作记忆
+                                </label>
+                                <label className="flex items-center gap-2">
+                                    <input type="checkbox" disabled={!canUseAutoPrompt}
+                                        checked={canUseAutoPrompt && (experimentDraft.auto_prompt_enabled ?? legacyAutoPrompt)}
+                                        onChange={(event) => handleDraftChange('auto_prompt_enabled', event.target.checked)} />
+                                    主动群聊提示
+                                </label>
                             </div>
                             <div>
                                 <label className="mb-2 block text-xs font-semibold uppercase tracking-wide text-slate-500">阶段序列（逗号分隔）</label>
@@ -843,7 +903,7 @@ export default function ProjectDashboard() {
                                     )) : <span className="text-xs text-slate-400">当前未限制支架层。</span>}
                                 </div>
                                 <p className="mt-2 text-xs text-slate-400">
-                                    高层实验配置优先决定是否开放协作过程支架；此处用于更细粒度的研究型控制。
+                                    过程支架开关优先于本项设置。
                                 </p>
                             </div>
                             <div>
@@ -920,7 +980,7 @@ export default function ProjectDashboard() {
                     </div>
                 ) : (
                     <div className="mt-6 rounded-xl border border-dashed border-gray-200 px-4 py-8 text-center text-sm text-slate-400">
-                        请选择小组后加载实验版本配置。
+                        请选择小组后加载配置。
                     </div>
                 )}
             </div>

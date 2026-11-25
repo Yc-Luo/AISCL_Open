@@ -334,7 +334,8 @@ async def _evaluate_shadow_prompt_candidates(
         return
 
     experiment_version = getattr(project, "experiment_version", None) or {}
-    if experiment_version.get("mode") != "research":
+    explicit_auto_prompt = experiment_version.get("auto_prompt_enabled")
+    if experiment_version.get("mode") != "research" and explicit_auto_prompt is not True:
         return
     if experiment_version.get("process_scaffold_mode") != "on":
         return
@@ -370,7 +371,11 @@ async def _evaluate_shadow_prompt_candidates(
     live_prompt_candidate: Optional[Dict[str, Any]] = None
     live_group_prompt_enabled = (
         is_multi_agent_mode
-        and intervention_service.is_group_chat_live_enabled(enabled_rule_set)
+        and (
+            explicit_auto_prompt
+            if explicit_auto_prompt is not None
+            else intervention_service.is_group_chat_live_enabled(enabled_rule_set)
+        )
     )
 
     for intervention in matched_interventions:
@@ -600,6 +605,7 @@ async def _process_ai_reply(
         from app.repositories.chat_log import ChatLog
         from app.services.activity_service import activity_service
         from app.services.group_memory_service import group_memory_service
+        from app.services.learning_object_memory_service import is_experimental_memory_enabled
         from app.services.memory_retrieval_service import memory_retrieval_service
         from app.services.scaffold_round_memory_service import scaffold_round_memory_service
         
@@ -618,6 +624,7 @@ async def _process_ai_reply(
         experiment_version = getattr(project, "experiment_version", None) or {}
         current_stage = experiment_version.get("current_stage")
         ai_scaffold_mode = normalize_ai_scaffold_mode(experiment_version.get("ai_scaffold_mode"))
+        shared_memory_enabled = is_experimental_memory_enabled(experiment_version)
         group_memory: Dict[str, Any] = await _build_recent_group_chat_context(
             project_id=project_id,
             current_message_id=current_message_id,
@@ -626,7 +633,7 @@ async def _process_ai_reply(
         group_state: Dict[str, Any] = {}
         experimental_memory: Dict[str, Any] = {}
         project_task_context = await group_memory_service.get_project_task_context(project)
-        if ai_scaffold_mode == "multi_agent":
+        if shared_memory_enabled:
             experimental_memory = await memory_retrieval_service.build_experimental_memory_context(
                 project=project,
                 project_id=project_id,
@@ -892,7 +899,7 @@ async def _process_ai_reply(
             }
         )
 
-        if ai_scaffold_mode == "multi_agent":
+        if shared_memory_enabled:
             scaffold_round_id = await scaffold_round_memory_service.record_ai_round(
                 project=project,
                 project_id=project_id,
@@ -927,7 +934,7 @@ async def _process_ai_reply(
         if final_response != displayed_response:
             await emit_partial(final_response)
 
-        if ai_scaffold_mode == "multi_agent":
+        if shared_memory_enabled:
             asyncio.create_task(
                 group_memory_service.maybe_refresh_stage_memory(
                     project_id=project_id,

@@ -4,6 +4,7 @@ import { ArrowLeft, BookOpen, ChevronLeft, ChevronRight, LayoutGrid, List, Refre
 import { ROUTES } from '../../config/routes'
 import { courseService, type Course, type Student } from '../../services/api/course'
 import { useAuthStore } from '../../stores/authStore'
+import ClassAISettings from './ClassAISettings'
 
 type Load<T> = { data: T } | { error: string } | null
 const home = ROUTES.TEACHER.OVERVIEW
@@ -162,6 +163,7 @@ function ClassDetail({ course }: { course: Course }) {
           <Users size={16} /> 管理本班小组
         </Link>
       </header>
+      <ClassAISettings courseId={course.id} />
       <section aria-labelledby="class-roster">
         <h2 id="class-roster" className="mb-3 flex items-center gap-2 font-semibold"><Users size={18} /> 学生名单</h2>
         {students.length ? (

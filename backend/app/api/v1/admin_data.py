@@ -311,7 +311,7 @@ def _data_dictionary_rows() -> List[Dict[str, str]]:
         {"file": "02_groups/*/content/document_comments.csv", "field": "comment_text", "meaning": "文档批注、回复和解决状态", "analysis_note": "用于分析同伴反馈、修订协商和观点澄清。"},
         {"file": "02_groups/*/content/document_update_operations.csv", "field": "source_granularity", "meaning": "文档写作事件粒度，包含 yjs_realtime_update 与 save_or_commit_event", "analysis_note": "新数据可分析实时协同编辑密度；旧数据会回填保存/提交级写作轨迹，不能解释为逐字编辑。"},
         {"file": "metadata/users_anonymized.csv", "field": "anonymous_id", "meaning": "匿名学习者/教师编号", "analysis_note": "用于替代真实 user_id。"},
-        {"file": "metadata/group_conditions.csv", "field": "condition_label", "meaning": "小组实验条件标签", "analysis_note": "用于实验组/对照组、AI 支架模式和过程支架模式比较。"},
+        {"file": "metadata/group_conditions.csv", "field": "condition_label", "meaning": "小组配置或研究标签", "analysis_note": "保留已有研究标签，未设置时显示配置名称；不据此推断实验组或对照组。"},
         {"file": "groups/*", "field": "*", "meaning": "按小组拆分后的原始、清洗和分析就绪数据", "analysis_note": "避免研究者从全班混合表手工筛选小组数据。"},
         {"file": "cleaned/heartbeat_sessions.csv", "field": "session_id", "meaning": "由连续心跳合并生成的在线会话", "analysis_note": "默认间隔超过 180 秒切分新会话。"},
         {"file": "cleaned/heartbeat_sessions.csv", "field": "overlap_ready", "meaning": "是否可用于共同在线分析", "analysis_note": "同组成员 session 可进一步计算重叠时长。"},

@@ -44,7 +44,7 @@ type RoleModelAssignments = Record<string, string>
 const MASKED_SECRET_VALUE = '********'
 
 const ROLE_BINDINGS = [
-    { key: 'default_chat', label: '默认聊天模型', hint: '对照组/普通 AI 对话使用' },
+    { key: 'default_chat', label: '默认聊天模型', hint: '通用 AI 回复使用' },
     { key: 'group_multi_agent', label: '小组多智能体默认模型', hint: '小组聊天 @AI 时的默认模型' },
     { key: 'tutor_multi_agent', label: 'AI 导师模型', hint: '学生个人 AI 对话使用' },
     { key: 'langgraph_supervisor', label: 'LangGraph 监督者', hint: '全局路由、监督与复杂决策' },
@@ -61,7 +61,7 @@ const ROLE_BINDINGS = [
 ]
 
 const ROLE_RECOMMENDATIONS: Record<string, string> = {
-    default_chat: '建议使用稳定、成本可控的通用对话模型，保持对照组体验一致。',
+    default_chat: '建议使用稳定、成本可控的通用对话模型。',
     group_multi_agent: '建议先跟随系统默认模型，避免小组可见回答风格过度分裂。',
     tutor_multi_agent: '建议使用稳定通用模型；个人导师不宜比小组支架强太多，以免替学生完成任务。',
     langgraph_supervisor: '建议配置推理能力更强、上下文较长的模型，负责复杂路由和全局判断。',
@@ -720,7 +720,7 @@ export default function SystemConfig() {
             setNotice({
                 isOpen: true,
                 title: '协作优化策略已同步',
-                message: '实验组记忆读取、策略版本、过期规则和支架跟进窗口已保存。对照组仍保持隔离。',
+                message: '协作记忆读取、策略版本、过期规则和支架跟进窗口已保存。',
                 type: 'success'
             })
         } catch (error) {
@@ -1439,7 +1439,7 @@ export default function SystemConfig() {
                     <div className="space-y-4">
                         <div className="rounded-xl border border-fuchsia-100 bg-fuchsia-50/60 p-4 text-xs text-fuchsia-900 space-y-2">
                             <p className="font-bold">作用范围</p>
-                            <p>仅作用于实验组的多智能体支架。对照组仍保持直接 LLM 回复，不读取共同学习对象记忆、支架回合记忆或协作优化提示。</p>
+                            <p>适用于开启协作记忆的多角色 AI 支持；通用回复不读取协作支架记忆。</p>
                             <p>策略版本会写入支架回合和学习对象记忆，便于后续比较不同优化版本的效果。</p>
                         </div>
 

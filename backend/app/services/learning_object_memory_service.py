@@ -33,8 +33,12 @@ SOURCE_QUALITY = {
 
 
 def is_experimental_memory_enabled(experiment_version: Optional[dict]) -> bool:
-    """Return true only for the multi-agent experimental memory condition."""
-    return normalize_ai_scaffold_mode((experiment_version or {}).get("ai_scaffold_mode")) == "multi_agent"
+    """Enable shared memory for multi-agent groups unless the teacher disabled it."""
+    config = experiment_version or {}
+    return (
+        normalize_ai_scaffold_mode(config.get("ai_scaffold_mode")) == "multi_agent"
+        and config.get("collaboration_memory_enabled") is not False
+    )
 
 
 def resolve_condition_type(experiment_version: Optional[dict]) -> str:

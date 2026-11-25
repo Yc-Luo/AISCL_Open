@@ -80,14 +80,12 @@ class RuntimeTests(IsolatedAsyncioTestCase):
             refresh_and_get_group_state_context=AsyncMock(return_value={"content": "group state"}),
         ))
 
-    async def test_stage_only_update_does_not_promote_missing_mode(self):
+    async def test_project_version_read_normalizes_legacy_mode(self):
         for mode in (" MULTI-AI ", None, "unknown", "general-ai"):
             with self.subTest(mode=mode):
                 project = project_with(mode)
                 expected = normalize_ai_scaffold_mode(mode)
                 self.assertEqual((await ProjectService.get_experiment_version(project))["ai_scaffold_mode"], expected)
-                await ProjectService.update_experiment_version(project, {"current_stage": "problem_construction"})
-                self.assertEqual(project.experiment_version["ai_scaffold_mode"], expected)
 
     async def test_tutor_chat_and_context_action(self):
         service = ai.ai_service
@@ -187,12 +185,52 @@ class RuntimeTests(IsolatedAsyncioTestCase):
             await projects.refresh_stage_memory_after_transition("project", "problem_construction")
             refresh.assert_awaited_once()
 
+    async def test_multi_agent_can_keep_answering_without_shared_memory(self):
+        project = project_with("multi_agent")
+        project.experiment_version["collaboration_memory_enabled"] = False
+        self.project_get.return_value = project
+        context = await ai._build_project_ai_context(
+            project=project, chat_data=self.chat_data, base_context=None,
+        )
+        self.assertEqual(context["project_task_context"], "task brief")
+        self.assertIsNone(context["stage_memory_context"])
+        self.assertIsNone(context["group_state_context"])
+        ai.group_memory_service.get_stage_memory_context.assert_not_awaited()
+        ai.group_memory_service.refresh_and_get_group_state_context.assert_not_awaited()
+
+        with patch.object(chat_handler, "_build_recent_group_chat_context", AsyncMock(return_value={})), \
+                patch("app.repositories.chat_log.ChatLog") as log, \
+                patch.object(activity_service, "log_activity", AsyncMock()), \
+                patch.object(ai.agent_service, "chat_stream", Mock(side_effect=reply_stream)) as graph, \
+                patch.object(memory_retrieval_service, "build_experimental_memory_context", AsyncMock()) as retrieve, \
+                patch.object(scaffold_round_memory_service, "record_ai_round", AsyncMock()) as record, \
+                patch.object(ai.group_memory_service, "maybe_refresh_stage_memory", AsyncMock()) as refresh_stage, \
+                patch.object(ai.group_memory_service, "maybe_refresh_group_state_memory", AsyncMock()) as refresh_state:
+            log.return_value = SimpleNamespace(id="reply", insert=AsyncMock())
+            await chat_handler._process_ai_reply(
+                Mock(emit=AsyncMock()), "project:project", "project", "question", "session",
+            )
+            await asyncio.sleep(0)
+            graph.assert_called_once()
+            for operation in (retrieve, record, refresh_stage, refresh_state):
+                operation.assert_not_awaited()
+        self.assertEqual(log.call_args.kwargs["content"], "reply")
+
     async def test_shadow_prompt_only_goes_live_for_multi_agent(self):
         rule = next(iter(chat_handler.RULE_TYPE_TO_SUBAGENT))
-        for mode in (" MULTI-AI ", "general-ai", None):
-            with self.subTest(mode=mode):
+        for mode, config_mode, explicit, process, expected_live in (
+            (" MULTI-AI ", "research", None, "on", True),
+            ("general-ai", "research", None, "on", False),
+            (None, "research", None, "on", False),
+            ("multi_agent", "research", False, "on", False),
+            ("multi_agent", "default", True, "on", True),
+            ("multi_agent", "default", True, "off", False),
+        ):
+            with self.subTest(mode=mode, config_mode=config_mode, explicit=explicit, process=process):
                 project = project_with(mode)
-                project.experiment_version.update(mode="research", process_scaffold_mode="on")
+                project.experiment_version.update(
+                    mode=config_mode, process_scaffold_mode=process, auto_prompt_enabled=explicit,
+                )
                 with patch.multiple(
                     research_event_service,
                     build_intervention_context_from_events=AsyncMock(return_value={}),
@@ -212,7 +250,10 @@ class RuntimeTests(IsolatedAsyncioTestCase):
                         sio=Mock(), project=project, room_id="project:project",
                         current_user_id="user", current_user_role="student",
                     )
-                    event = research_event_service.record_batch_events.await_args.kwargs["events"][0]
-                    expected = chat_handler.RULE_TYPE_TO_SUBAGENT[rule] if mode in MULTI else None
-                    self.assertEqual(event["payload"]["recommended_subagent"], expected)
-                    self.assertEqual(chat_handler._emit_auto_group_prompt.await_count, int(mode in MULTI))
+                    if process == "on":
+                        event = research_event_service.record_batch_events.await_args.kwargs["events"][0]
+                        expected = chat_handler.RULE_TYPE_TO_SUBAGENT[rule] if mode in MULTI else None
+                        self.assertEqual(event["payload"]["recommended_subagent"], expected)
+                    else:
+                        research_event_service.record_batch_events.assert_not_awaited()
+                    self.assertEqual(chat_handler._emit_auto_group_prompt.await_count, int(expected_live))

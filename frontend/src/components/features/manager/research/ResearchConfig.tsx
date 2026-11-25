@@ -124,52 +124,7 @@ interface ResearchReleaseRecord {
     stageDefinitions?: StageDefinition[]
 }
 
-const DEFAULT_TEMPLATES: ExperimentTemplateConfig[] = [
-    {
-        id: 'exp-single-process-v1',
-        label: '模板A：单AI + 过程支架',
-        groupCondition: 'single_agent_process_on',
-        aiMode: 'single_agent',
-        processMode: 'on',
-        ruleSet: 'research-default',
-        stageSequence: ['problem_construction', 'meaning_exploration', 'explanation_integration', 'application_solution'],
-        teacherSummary: '单AI条件下保留过程支架，用于基础实验组。',
-        published: true,
-    },
-    {
-        id: 'exp-multi-process-v1',
-        label: '模板B：多智能体 + 过程支架',
-        groupCondition: 'multi_agent_process_on',
-        aiMode: 'multi_agent',
-        processMode: 'on',
-        ruleSet: 'research-default+group-chat-live',
-        stageSequence: ['problem_construction', 'meaning_exploration', 'explanation_integration', 'application_solution'],
-        teacherSummary: '多智能体与过程支架同时开启，用于核心实验组。',
-        published: true,
-    },
-    {
-        id: 'exp-single-process-off-v1',
-        label: '模板C：单AI + 无过程支架',
-        groupCondition: 'single_agent_process_off',
-        aiMode: 'single_agent',
-        processMode: 'off',
-        ruleSet: 'research-default',
-        stageSequence: ['problem_construction', 'meaning_exploration', 'explanation_integration', 'application_solution'],
-        teacherSummary: '用于较弱支架条件对照，不启用过程支架。',
-        published: false,
-    },
-    {
-        id: 'exp-multi-process-off-v1',
-        label: '模板D：多智能体 + 无过程支架',
-        groupCondition: 'multi_agent_process_off',
-        aiMode: 'multi_agent',
-        processMode: 'off',
-        ruleSet: 'research-default',
-        stageSequence: ['problem_construction', 'meaning_exploration', 'explanation_integration', 'application_solution'],
-        teacherSummary: '用于检验多智能体本身的作用，关闭过程支架以形成完整 2×2 条件。',
-        published: false,
-    },
-]
+const DEFAULT_TEMPLATES: ExperimentTemplateConfig[] = []
 
 const CURRENT_STAGE_SEQUENCE = [
     'problem_construction',
@@ -575,7 +530,7 @@ export default function ResearchConfig() {
             {
                 id: `template-${Date.now()}`,
                 label: `新增模板 ${nextIndex}`,
-                groupCondition: 'custom_condition',
+                groupCondition: '',
                 aiMode: 'single_agent',
                 processMode: 'on',
                 ruleSet: 'research-default',
@@ -863,7 +818,7 @@ export default function ResearchConfig() {
                                 </div>
 
                                 <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
-                                    <Field label="组别条件">
+                                    <Field label="研究标签（可选）">
                                         <Input
                                             value={template.groupCondition}
                                             onChange={(event) => updateTemplate(index, 'groupCondition', event.target.value)}
@@ -1432,7 +1387,6 @@ function collectValidationIssues(
             templateIds.add(template.id.trim())
         }
         if (!template.label.trim()) issues.push(`模板 ${displayIndex} 缺少显示名称。`)
-        if (!template.groupCondition.trim()) issues.push(`模板 ${displayIndex} 缺少组别条件。`)
         if (template.stageSequence.length === 0) issues.push(`模板 ${displayIndex} 至少需要 1 个阶段。`)
         template.stageSequence.forEach((stageId) => {
             if (!stageIds.has(stageId)) {

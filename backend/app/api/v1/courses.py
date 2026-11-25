@@ -1,14 +1,18 @@
 """Course (class) management API routes."""
 
 import secrets
+from datetime import datetime
 from typing import List, Optional
 
+from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.v1.auth import get_current_user
 from app.repositories.course import Course
 from app.repositories.user import User
 from app.core.schemas.course import (
+    CourseAISettings,
+    CourseAISettingsResponse,
     CourseCreateRequest,
     CourseJoinRequest,
     CourseListResponse,
@@ -118,9 +122,6 @@ async def create_course(
     while await Course.find_one(Course.invite_code == invite_code):
         invite_code = generate_invite_code()
 
-    # Create course
-    from datetime import datetime
-
     new_course = Course(
         name=course_data.name,
         teacher_id=str(current_user.id),
@@ -222,8 +223,6 @@ async def update_course(
             detail="Only course owner can update course",
         )
 
-    from datetime import datetime
-
     previous_initial_task_title = course.initial_task_document_title
     previous_initial_task_content = course.initial_task_document_content
     should_sync_initial_task_document = (
@@ -254,7 +253,7 @@ async def update_course(
         course.initial_task_document_content = course_data.initial_task_document_content
     course.updated_at = datetime.utcnow()
 
-    await course.save()
+    await course.save_changes()
 
     if should_sync_initial_task_document:
         await project_service.sync_course_initial_task_documents(
@@ -283,6 +282,43 @@ async def update_course(
         created_at=course.created_at,
         updated_at=course.updated_at,
     )
+
+
+async def _get_course_for_ai_settings(
+    course_id: PydanticObjectId,
+    current_user: User = Depends(get_current_user),
+) -> Course:
+    course = await Course.get(course_id)
+    if not course:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
+    if current_user.role != "admin" and not (
+        current_user.role == "teacher" and course.teacher_id == str(current_user.id)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the owning teacher or an admin can access course AI settings",
+        )
+    return course
+
+
+@router.get("/{course_id}/ai-settings", response_model=CourseAISettingsResponse)
+async def get_course_ai_settings(
+    course: Course = Depends(_get_course_for_ai_settings),
+) -> CourseAISettingsResponse:
+    return CourseAISettingsResponse(settings=course.ai_settings)
+
+
+@router.put("/{course_id}/ai-settings", response_model=CourseAISettingsResponse)
+async def update_course_ai_settings(
+    settings: CourseAISettings,
+    course: Course = Depends(_get_course_for_ai_settings),
+) -> CourseAISettingsResponse:
+    result = await Course.find_one({"_id": course.id}).set(
+        {"ai_settings": settings.model_dump(), "updated_at": datetime.utcnow()},
+    )
+    if not result.matched_count:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
+    return CourseAISettingsResponse(settings=settings)
 
 
 @router.delete("/{course_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -342,7 +378,7 @@ async def join_course(
 
     # Add student to course
     course.students.append(str(current_user.id))
-    await course.save()
+    await course.save_changes()
 
     # The auth dependency returns a lightweight user object, so persist through
     # the repository model instead of mutating the dependency object directly.
@@ -441,7 +477,7 @@ async def add_student_to_course(
 
     # Add student
     course.students.append(student_id)
-    await course.save()
+    await course.save_changes()
     student.class_id = str(course.id)
     await student.save()
 
@@ -595,10 +631,8 @@ async def bulk_import_students_to_course(
             )
 
     if course_changed:
-        from datetime import datetime
-
         course.updated_at = datetime.utcnow()
-        await course.save()
+        await course.save_changes()
 
     return CourseStudentImportResponse(
         created_count=created_count,
@@ -635,7 +669,7 @@ async def remove_student_from_course(
     # Remove student
     if student_id in course.students:
         course.students.remove(student_id)
-        await course.save()
+        await course.save_changes()
         student = await UserModel.get(student_id)
         if student and student.class_id == str(course.id):
             student.class_id = None

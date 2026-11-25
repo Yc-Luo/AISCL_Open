@@ -39,6 +39,7 @@ from app.services.intervention_service import intervention_service
 from app.services.rag_service import rag_service
 from app.services.agents.agent_service import agent_service
 from app.services.group_memory_service import group_memory_service
+from app.services.learning_object_memory_service import is_experimental_memory_enabled
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 logger = logging.getLogger(__name__)
@@ -226,7 +227,7 @@ async def _build_project_ai_context(
     experiment_version = project.experiment_version or {}
     stage_memory = {}
     group_state = {}
-    if _is_multi_agent_mode(experiment_version):
+    if is_experimental_memory_enabled(experiment_version):
         stage_id = chat_data.current_stage or experiment_version.get("current_stage")
         group_id = f"project:{project.id}"
         stage_memory = await group_memory_service.get_stage_memory_context(

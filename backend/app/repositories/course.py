@@ -6,6 +6,8 @@ from typing import List, Optional
 from beanie import Document
 from pydantic import Field
 
+from app.core.schemas.course import CourseAISettings
+
 
 class Course(Document):
     """Course document model."""
@@ -16,6 +18,7 @@ class Course(Document):
     invite_code: str = Field(..., unique=True, index=True)
     students: List[str] = Field(default_factory=list)  # List of student user IDs
     description: Optional[str] = None
+    ai_settings: Optional[CourseAISettings] = None
     experiment_template_key: Optional[str] = None
     experiment_template_label: Optional[str] = None
     experiment_template_release_id: Optional[str] = None
@@ -32,6 +35,8 @@ class Course(Document):
         """Beanie settings."""
 
         name = "courses"
+        use_state_management = True
+        state_management_replace_objects = True
         indexes = [
             [("teacher_id", 1)],
             [("invite_code", 1)],

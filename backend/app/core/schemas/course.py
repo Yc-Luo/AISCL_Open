@@ -1,9 +1,34 @@
 """Course schemas."""
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
+
+
+class CourseAISettings(BaseModel):
+    """Teacher-selected defaults for newly created course groups."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ai_scaffold_mode: Literal["single_agent", "multi_agent"]
+    process_scaffold_mode: Literal["on", "off"]
+    collaboration_memory_enabled: StrictBool
+    auto_prompt_enabled: StrictBool
+
+    @model_validator(mode="after")
+    def validate_mode_dependencies(self) -> Self:
+        if self.ai_scaffold_mode == "single_agent" and (
+            self.collaboration_memory_enabled or self.auto_prompt_enabled
+        ):
+            raise ValueError("Collaboration memory and auto prompt require multi_agent mode")
+        if self.auto_prompt_enabled and self.process_scaffold_mode == "off":
+            raise ValueError("Auto prompt requires process scaffolding to be on")
+        return self
+
+
+class CourseAISettingsResponse(BaseModel):
+    settings: Optional[CourseAISettings]
 
 
 class CourseResponse(BaseModel):

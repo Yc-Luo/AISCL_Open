@@ -1,15 +1,20 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import { courseService } from '../../services/api/course'
+import { courseService, type CourseAISettings } from '../../services/api/course'
+import ClassManagement from '../../components/features/teacher/classmanagement/ClassManagement'
 import TeacherClasses from './TeacherClasses'
 
 vi.mock('../../stores/authStore', () => ({
   useAuthStore: (select: (state: { user: { id: string } }) => unknown) => select({ user: { id: 'me' } }),
 }))
 vi.mock('../../services/api/course', () => ({
-  courseService: { getCourses: vi.fn(), getCourseStudents: vi.fn() },
+  courseService: {
+    getCourses: vi.fn(), getCourseStudents: vi.fn(),
+    getCourseAISettings: vi.fn(), updateCourseAISettings: vi.fn(),
+    createCourse: vi.fn(), updateCourse: vi.fn(), getExperimentTemplates: vi.fn(),
+  },
 }))
 
 function open(path = '') {
@@ -23,6 +28,7 @@ function open(path = '') {
   vi.mocked(courseService.getCourseStudents).mockResolvedValue([
     { id: 's1', username: '学生甲', email: 'student@example.test' },
   ])
+  vi.mocked(courseService.getCourseAISettings).mockResolvedValue(null)
   render(<MemoryRouter initialEntries={[`/teacher/overview${path}`]}>
     <Routes><Route path="/teacher/overview/:courseId?" element={<TeacherClasses />} /></Routes>
   </MemoryRouter>)
@@ -57,6 +63,7 @@ it('does not fetch the roster for a direct link to an unowned class', async () =
   open('/other')
   await screen.findByText('找不到该班级，或该班级不属于当前账号。')
   expect(courseService.getCourseStudents).not.toHaveBeenCalled()
+  expect(courseService.getCourseAISettings).not.toHaveBeenCalled()
 })
 
 it('pages the roster, clamps jumps and resets the page when the page size changes', async () => {
@@ -103,4 +110,92 @@ it('does not show pagination while the roster is loading or empty', async () => 
   expect(screen.queryByLabelText('每页条数')).toBeNull()
   expect(screen.queryByLabelText('跳转页码')).toBeNull()
   expect(screen.queryByRole('button', { name: '下一页' })).toBeNull()
+})
+
+it('validates class AI settings and loads saved values without affecting other classes', async () => {
+  open('/spring')
+  const saved = new Map<string, CourseAISettings>()
+  vi.mocked(courseService.getCourseAISettings).mockImplementation(async id => saved.get(id) ?? null)
+  vi.mocked(courseService.updateCourseAISettings).mockImplementation(async (id, settings) => {
+    saved.set(id, settings)
+    return settings
+  })
+
+  const mode = await screen.findByLabelText<HTMLSelectElement>('AI 回答模式')
+  const process = screen.getByLabelText<HTMLInputElement>('过程支架')
+  const memory = screen.getByLabelText<HTMLInputElement>('共享记忆')
+  const prompt = screen.getByLabelText<HTMLInputElement>('小组主动提示')
+  const submit = () => fireEvent.click(screen.getByRole('button', { name: '保存 AI 支持设置' }))
+
+  expect(screen.getByText(/尚未配置/)).toBeTruthy()
+  expect(mode.value).toBe('single_agent')
+  expect(process.checked).toBe(true)
+  expect(memory.checked).toBe(false)
+  expect(prompt.checked).toBe(false)
+  expect(courseService.updateCourseAISettings).not.toHaveBeenCalled()
+
+  fireEvent.click(memory)
+  submit()
+  expect(screen.getByRole('alert').textContent).toMatch(/仅在多智能体/)
+  expect(courseService.updateCourseAISettings).not.toHaveBeenCalled()
+  fireEvent.click(memory)
+  fireEvent.click(prompt)
+  submit()
+  expect(screen.getByRole('alert').textContent).toMatch(/仅在多智能体/)
+  expect(courseService.updateCourseAISettings).not.toHaveBeenCalled()
+
+  fireEvent.change(mode, { target: { value: 'multi_agent' } })
+  fireEvent.click(process)
+  submit()
+  expect(screen.getByRole('alert').textContent).toMatch(/需要开启过程支架/)
+  expect(courseService.updateCourseAISettings).not.toHaveBeenCalled()
+
+  fireEvent.click(prompt)
+  fireEvent.click(memory)
+  submit()
+  await screen.findByText('班级 AI 支持设置已保存。')
+  expect(courseService.updateCourseAISettings).toHaveBeenCalledTimes(1)
+  expect(courseService.updateCourseAISettings).toHaveBeenCalledWith('spring', {
+    ai_scaffold_mode: 'multi_agent',
+    process_scaffold_mode: 'off',
+    collaboration_memory_enabled: true,
+    auto_prompt_enabled: false,
+  })
+
+  fireEvent.click(screen.getByRole('link', { name: '返回我的班级' }))
+  fireEvent.click(screen.getByRole('link', { name: /秋季班/ }))
+  expect((await screen.findByLabelText<HTMLSelectElement>('AI 回答模式')).value).toBe('single_agent')
+  expect(screen.getByLabelText<HTMLInputElement>('共享记忆').checked).toBe(false)
+  expect(screen.getByText(/尚未配置/)).toBeTruthy()
+  fireEvent.click(screen.getByRole('link', { name: '返回我的班级' }))
+  fireEvent.click(screen.getByRole('link', { name: /春季班/ }))
+  expect((await screen.findByLabelText<HTMLSelectElement>('AI 回答模式')).value).toBe('multi_agent')
+  expect(screen.getByLabelText<HTMLInputElement>('过程支架').checked).toBe(false)
+  expect(screen.getByLabelText<HTMLInputElement>('共享记忆').checked).toBe(true)
+  expect(screen.queryByText(/尚未配置/)).toBeNull()
+})
+
+it('creates and edits classes without selecting or submitting templates', async () => {
+  vi.mocked(courseService.getCourses).mockResolvedValue([{
+    id: 'legacy', name: '旧班级', teacher_id: 'me', semester: '2026 春季',
+    invite_code: 'OLD', students: [], created_at: '2026-01-01', experiment_template_key: 'legacy-template',
+  }])
+  render(<MemoryRouter><ClassManagement /></MemoryRouter>)
+  fireEvent.click(await screen.findByRole('button', { name: '创建新班级' }))
+  const create = within(screen.getByRole('dialog', { name: '创建新班级' }))
+  expect(create.queryByText(/模板/)).toBeNull()
+  fireEvent.change(create.getByLabelText('班级名称'), { target: { value: '新班级' } })
+  fireEvent.click(create.getByRole('button', { name: '确认创建' }))
+  expect(courseService.createCourse).toHaveBeenCalledWith(expect.objectContaining({ name: '新班级' }))
+  expect(vi.mocked(courseService.createCourse).mock.calls[0][0]).not.toHaveProperty('experiment_template_key')
+  await screen.findByText(/班级已创建/)
+
+  fireEvent.click(screen.getByRole('button', { name: '编辑班级 旧班级' }))
+  const edit = within(screen.getByRole('dialog', { name: '修改班级信息' }))
+  expect(edit.queryByText(/模板/)).toBeNull()
+  fireEvent.click(edit.getByRole('button', { name: '确认修改' }))
+  expect(courseService.updateCourse).toHaveBeenCalledWith('legacy', expect.objectContaining({ name: '旧班级' }))
+  expect(vi.mocked(courseService.updateCourse).mock.calls[0][1]).not.toHaveProperty('experiment_template_key')
+  expect(courseService.getExperimentTemplates).not.toHaveBeenCalled()
+  await screen.findByText(/班级设置已更新/)
 })

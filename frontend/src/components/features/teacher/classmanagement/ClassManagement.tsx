@@ -26,22 +26,6 @@ import {
 } from '../../../ui';
 import { courseService, Course } from '../../../../services/api/course';
 
-type TemplateSelectOption = {
-    value: string;
-    label: string;
-    source?: string;
-};
-
-const EMPTY_TEMPLATE_OPTION: TemplateSelectOption = { value: '', label: '不预设模板（仅建班）' };
-
-const FALLBACK_EXPERIMENT_TEMPLATE_OPTIONS: TemplateSelectOption[] = [
-    { value: '', label: '不预设模板（仅建班）' },
-    { value: 'exp-single-process-v1', label: '单AI + 过程支架' },
-    { value: 'exp-multi-process-v1', label: '多智能体 + 过程支架' },
-    { value: 'exp-single-process-off-v1', label: '单AI + 无过程支架' },
-    { value: 'exp-multi-process-off-v1', label: '多智能体 + 无过程支架' },
-];
-
 const DEFAULT_TASK_TITLE = '项目说明';
 
 const DEFAULT_TASK_CONTENT = '请在这里填写本次活动或项目的完整说明，包括活动背景、目标任务、协作方式、成果要求、提交方式或其他需要学生提前了解的内容。';
@@ -58,13 +42,11 @@ export default function ClassManagement() {
     const [isEditOpen, setIsEditOpen] = useState(false);
     const [selectedCourse, setSelectedCourse] = useState<Course | null>(null);
     const [copiedId, setCopiedId] = useState<string | null>(null);
-    const [experimentTemplateOptions, setExperimentTemplateOptions] = useState<TemplateSelectOption[]>(FALLBACK_EXPERIMENT_TEMPLATE_OPTIONS);
 
     // Form states
     const [name, setName] = useState('');
     const [semester, setSemester] = useState(currentSemester);
     const [description, setDescription] = useState('');
-    const [experimentTemplateKey, setExperimentTemplateKey] = useState('');
     const [initialTaskTitle, setInitialTaskTitle] = useState(DEFAULT_TASK_TITLE);
     const [initialTaskContent, setInitialTaskContent] = useState(DEFAULT_TASK_CONTENT);
     const [submitting, setSubmitting] = useState(false);
@@ -94,41 +76,6 @@ export default function ClassManagement() {
         fetchCourses();
     }, []);
 
-    useEffect(() => {
-        let cancelled = false;
-        const fetchExperimentTemplates = async () => {
-            try {
-                const templates = await courseService.getExperimentTemplates();
-                if (cancelled) return;
-
-                if (templates.length === 0) {
-                    setExperimentTemplateOptions(FALLBACK_EXPERIMENT_TEMPLATE_OPTIONS);
-                    return;
-                }
-
-                const dynamicOptions = templates.map((template) => ({
-                    value: template.key,
-                    label: template.label || template.key,
-                    source: template.source,
-                }));
-                setExperimentTemplateOptions([
-                    EMPTY_TEMPLATE_OPTION,
-                    ...dynamicOptions,
-                ]);
-            } catch (error) {
-                console.error('Failed to fetch experiment templates:', error);
-                if (!cancelled) {
-                    setExperimentTemplateOptions(FALLBACK_EXPERIMENT_TEMPLATE_OPTIONS);
-                }
-            }
-        };
-
-        void fetchExperimentTemplates();
-        return () => {
-            cancelled = true;
-        };
-    }, []);
-
     const handleCopyCode = (code: string, id: string) => {
         navigator.clipboard.writeText(code);
         setCopiedId(id);
@@ -143,7 +90,6 @@ export default function ClassManagement() {
                 name,
                 semester,
                 description,
-                experiment_template_key: experimentTemplateKey || undefined,
                 initial_task_document_title: initialTaskTitle || undefined,
                 initial_task_document_content: initialTaskContent,
             });
@@ -168,7 +114,6 @@ export default function ClassManagement() {
                 name,
                 semester: semester === selectedCourse.semester ? undefined : semester,
                 description,
-                experiment_template_key: experimentTemplateKey || undefined,
                 initial_task_document_title: initialTaskTitle || undefined,
                 initial_task_document_content: initialTaskContent,
             });
@@ -204,7 +149,6 @@ export default function ClassManagement() {
         setName('');
         setSemester(currentSemester);
         setDescription('');
-        setExperimentTemplateKey('');
         setInitialTaskTitle(DEFAULT_TASK_TITLE);
         setInitialTaskContent(DEFAULT_TASK_CONTENT);
         setSelectedCourse(null);
@@ -215,7 +159,6 @@ export default function ClassManagement() {
         setName(course.name);
         setSemester(course.semester);
         setDescription(course.description || '');
-        setExperimentTemplateKey(course.experiment_template_key || '');
         setInitialTaskTitle(course.initial_task_document_title || DEFAULT_TASK_TITLE);
         setInitialTaskContent(course.initial_task_document_content || DEFAULT_TASK_CONTENT);
         setIsEditOpen(true);
@@ -225,14 +168,6 @@ export default function ClassManagement() {
         course.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
         course.semester.toLowerCase().includes(searchQuery.toLowerCase())
     );
-
-    const selectableTemplateOptions = experimentTemplateKey
-        && !experimentTemplateOptions.some((option) => option.value === experimentTemplateKey)
-        ? [
-            ...experimentTemplateOptions,
-            { value: experimentTemplateKey, label: `${experimentTemplateKey}（当前已绑定）` },
-        ]
-        : experimentTemplateOptions;
 
     if (loading && courses.length === 0) {
         return <div className="flex items-center justify-center h-64">
@@ -462,19 +397,6 @@ export default function ClassManagement() {
                             />
                         </div>
                         <div className="space-y-2">
-                            <label htmlFor="create-course-template" className="text-sm font-bold text-slate-800">班级默认实验模板</label>
-                            <select
-                                id="create-course-template"
-                                value={experimentTemplateKey}
-                                onChange={e => setExperimentTemplateKey(e.target.value)}
-                                className="w-full px-3 py-2 bg-slate-50 border-none rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
-                            >
-                                {selectableTemplateOptions.map((option) => (
-                                    <option key={option.value} value={option.value}>{option.label}</option>
-                                ))}
-                            </select>
-                        </div>
-                        <div className="space-y-2">
                             <label htmlFor="create-task-title" className="text-sm font-bold text-slate-800">项目说明标题</label>
                             <Input
                                 id="create-task-title"
@@ -511,7 +433,7 @@ export default function ClassManagement() {
                         <DialogHeader>
                             <DialogTitle className="text-2xl font-bold">修改班级信息</DialogTitle>
                             <DialogDescription className="text-slate-500 mt-2">
-                            更新班级名称、学期、实验模板以及项目说明内容。项目说明会同步到学生端小组文档，作为任务理解与问题构建的起点。
+                            更新班级名称、学期和项目说明。项目说明会同步到学生端小组文档，作为任务理解与问题构建的起点。
                             </DialogDescription>
                         </DialogHeader>
                     <form onSubmit={handleUpdate} className="space-y-6 mt-6">
@@ -544,19 +466,6 @@ export default function ClassManagement() {
                                 onChange={e => setDescription(e.target.value)}
                                 className="w-full px-3 py-2 bg-slate-50 border-none rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none h-24"
                             />
-                        </div>
-                        <div className="space-y-2">
-                            <label htmlFor="edit-course-template" className="text-sm font-bold text-slate-800">班级默认实验模板</label>
-                            <select
-                                id="edit-course-template"
-                                value={experimentTemplateKey}
-                                onChange={e => setExperimentTemplateKey(e.target.value)}
-                                className="w-full px-3 py-2 bg-slate-50 border-none rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
-                            >
-                                {selectableTemplateOptions.map((option) => (
-                                    <option key={option.value} value={option.value}>{option.label}</option>
-                                ))}
-                            </select>
                         </div>
                         <div className="space-y-2">
                             <label htmlFor="edit-task-title" className="text-sm font-bold text-slate-800">项目说明标题</label>

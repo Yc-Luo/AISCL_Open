@@ -33,6 +33,13 @@ export interface ExperimentTemplateOption {
     teacher_summary?: string
 }
 
+export interface CourseAISettings {
+    ai_scaffold_mode: 'single_agent' | 'multi_agent'
+    process_scaffold_mode: 'on' | 'off'
+    collaboration_memory_enabled: boolean
+    auto_prompt_enabled: boolean
+}
+
 export interface Student {
     id: string
     username: string
@@ -79,7 +86,7 @@ export const courseService = {
         return response.data.templates || []
     },
 
-    createCourse: async (data: { name: string; semester: string; description?: string; experiment_template_key?: string; initial_task_document_title?: string; initial_task_document_content?: string }) => {
+    createCourse: async (data: { name: string; semester: string; description?: string; initial_task_document_title?: string; initial_task_document_content?: string }) => {
         const response = await api.post('/courses', data)
         return response.data
     },
@@ -88,9 +95,24 @@ export const courseService = {
         await api.delete(`/courses/${courseId}`)
     },
 
-    updateCourse: async (courseId: string, data: { name?: string; semester?: string; description?: string; experiment_template_key?: string; initial_task_document_title?: string; initial_task_document_content?: string }) => {
+    updateCourse: async (courseId: string, data: { name?: string; semester?: string; description?: string; initial_task_document_title?: string; initial_task_document_content?: string }) => {
         const response = await api.put(`/courses/${courseId}`, data)
         return response.data
+    },
+
+    getCourseAISettings: async (courseId: string): Promise<CourseAISettings | null> => {
+        const response = await api.get<{ settings: CourseAISettings | null }>(`/courses/${encodeURIComponent(courseId)}/ai-settings`)
+        return response.data.settings
+    },
+
+    updateCourseAISettings: async (courseId: string, settings: CourseAISettings): Promise<CourseAISettings | null> => {
+        const response = await api.put<{ settings: CourseAISettings | null }>(`/courses/${encodeURIComponent(courseId)}/ai-settings`, {
+            ai_scaffold_mode: settings.ai_scaffold_mode,
+            process_scaffold_mode: settings.process_scaffold_mode,
+            collaboration_memory_enabled: settings.collaboration_memory_enabled,
+            auto_prompt_enabled: settings.auto_prompt_enabled,
+        })
+        return response.data.settings
     },
 
     getCourseStudents: async (courseId: string): Promise<Student[]> => {

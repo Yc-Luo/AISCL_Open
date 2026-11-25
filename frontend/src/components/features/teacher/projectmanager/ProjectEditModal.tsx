@@ -413,7 +413,7 @@ export default function ProjectEditModal({
                                             onChange={(e) => setFormData({ ...formData, inherit_course_template: e.target.checked })}
                                         />
                                         <span>
-                                            创建小组时继承班级实验模板与初始任务文档
+                                            继承班级 AI 支持设置（未配置时沿用已绑定的旧版配置）
                                         </span>
                                     </label>
                                 )}

@@ -3,6 +3,8 @@
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+from pymongo import ReturnDocument
+
 from app.core.ai_scaffold_mode import normalize_ai_scaffold_mode
 from app.repositories.collaboration_snapshot import CollaborationSnapshot
 from app.repositories.course import Course
@@ -72,22 +74,30 @@ class ProjectService:
         return payload
 
     @staticmethod
-    async def update_experiment_version(project: Project, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Persist experiment-version payload on project."""
-        experiment_version = ProjectService.build_default_experiment_version(str(project.id))
-        if project.experiment_version:
-            experiment_version.update(dict(project.experiment_version))
-        experiment_version.update(dict(data))
-        experiment_version["ai_scaffold_mode"] = normalize_ai_scaffold_mode(
-            experiment_version.get("ai_scaffold_mode")
+    async def update_experiment_version(project: Project, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Merge a configuration patch with the stored version, not a stale project snapshot."""
+        project_id = str(project.id)
+        now = datetime.utcnow()
+        updates = {**data, "project_id": project_id, "updated_at": now}
+        if "ai_scaffold_mode" in updates:
+            updates["ai_scaffold_mode"] = normalize_ai_scaffold_mode(updates["ai_scaffold_mode"])
+        stored = await Project.get_motor_collection().find_one_and_update(
+            {"_id": project.id},
+            [{"$set": {
+                "updated_at": now,
+                "experiment_version": {"$mergeObjects": [
+                    {"$literal": ProjectService.build_default_experiment_version(project_id)},
+                    "$experiment_version",
+                    {"$literal": updates},
+                ]},
+            }}],
+            projection={"experiment_version": 1},
+            return_document=ReturnDocument.AFTER,
         )
-        experiment_version["project_id"] = str(project.id)
-        experiment_version["updated_at"] = datetime.utcnow()
-        project.experiment_version = experiment_version
-        project.updated_at = datetime.utcnow()
-        await project.save()
-        experiment_version["project_id"] = str(project.id)
-        return experiment_version
+        if stored is None:
+            return None
+        project.experiment_version = stored["experiment_version"]
+        return await ProjectService.get_experiment_version(project)
 
     @staticmethod
     async def initialize_project_from_course(
@@ -96,10 +106,26 @@ class ProjectService:
         owner_id: str,
         inherit_course_template: bool,
     ) -> None:
-        """Apply course template and seed initial task document for a new group space."""
+        """Apply course defaults and seed the task document for a new group."""
         project.course_id = str(course.id)
 
-        if inherit_course_template and course.experiment_template_key:
+        if inherit_course_template and course.ai_settings is not None:
+            settings = course.ai_settings
+            multi_agent = settings.ai_scaffold_mode == "multi_agent"
+            stages = list(research_config_service.CURRENT_STAGE_SEQUENCE)
+            layers = ["multi_agent_scaffold"] if multi_agent else []
+            if settings.process_scaffold_mode == "on":
+                layers.append("process_scaffold")
+            project.experiment_version = {
+                **ProjectService.build_default_experiment_version(str(project.id)),
+                **settings.model_dump(),
+                "source_course_id": str(course.id),
+                "stage_sequence": stages,
+                "current_stage": stages[0],
+                "enabled_scaffold_layers": layers,
+                "enabled_scaffold_roles": list(research_config_service.ALL_SCAFFOLD_ROLES) if multi_agent else [],
+            }
+        elif inherit_course_template and course.experiment_template_key:
             if course.experiment_template_snapshot:
                 project.experiment_version = research_config_service.materialize_project_experiment_version(
                     str(project.id),

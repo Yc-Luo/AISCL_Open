@@ -53,6 +53,8 @@ export interface ExperimentVersion {
     stage_control_mode: 'soft_guidance' | 'hard_constraint'
     process_scaffold_mode: 'on' | 'off'
     ai_scaffold_mode: 'single_agent' | 'multi_agent'
+    collaboration_memory_enabled?: boolean | null
+    auto_prompt_enabled?: boolean | null
     broadcast_stage_updates: boolean
     group_condition?: string | null
     enabled_scaffold_layers: string[]

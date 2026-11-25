@@ -7,6 +7,7 @@ from typing import List, Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 
 from app.api.v1.auth import get_current_user
+from app.core.ai_scaffold_mode import normalize_ai_scaffold_mode
 from app.core.config import settings
 from app.core.permissions import check_project_member_permission, is_teacher_project_scope
 from app.core.schemas.experiment_version import (
@@ -579,16 +580,30 @@ async def update_experiment_version(
                 detail="Current stage must be one of the configured stage sequence values",
             )
     else:
+        if current_user.role not in {"teacher", "admin"}:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only teachers and admins can change group configuration",
+            )
         await ensure_project_staff_access(
             current_user,
             project,
-            "Only project owner or scoped teacher can update experiment version",
+            "Only authorized staff can change group configuration",
         )
+        previous = project.experiment_version or {}
+        ai_mode = normalize_ai_scaffold_mode(update_payload.get("ai_scaffold_mode", previous.get("ai_scaffold_mode")))
+        process_mode = update_payload.get("process_scaffold_mode", previous.get("process_scaffold_mode", "on"))
+        if update_payload.get("collaboration_memory_enabled") is True and ai_mode != "multi_agent":
+            raise HTTPException(status_code=422, detail="Shared memory requires multi-agent AI")
+        if update_payload.get("auto_prompt_enabled") is True and (ai_mode != "multi_agent" or process_mode != "on"):
+            raise HTTPException(status_code=422, detail="Proactive prompts require multi-agent AI and process guidance")
 
     previous_stage = (project.experiment_version or {}).get("current_stage")
     payload = await project_service.update_experiment_version(
         project, update_payload
     )
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Project not found")
     next_stage = payload.get("current_stage")
     if is_stage_only_update and previous_stage and previous_stage != next_stage:
         background_tasks.add_task(

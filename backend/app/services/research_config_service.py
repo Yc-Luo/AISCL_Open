@@ -151,9 +151,6 @@ class ResearchConfigService:
             if template.get("published"):
                 add_template(template, source="admin_working_copy")
 
-        for template_key, template in cls.LEGACY_PRESETS.items():
-            add_template({"id": template_key, **template}, source="legacy_builtin")
-
         return config_permission_service.filter_templates(current_user, options)
 
     @classmethod
