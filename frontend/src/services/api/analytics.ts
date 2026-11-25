@@ -168,59 +168,35 @@ export interface ClassFourCBaseline {
   last_updated?: string | null
 }
 
-export type ProcessStageStatus = 'completed' | 'in_progress' | 'needs_more' | 'pending'
+export type LearningOverviewTarget = { kind: 'chat' | 'wiki' } | { kind: 'document'; documentId?: string }
 
-export interface StudentProcessDashboard {
-  dashboardTitle: string
-  subtitle: string
+export interface LearningOverviewSuggestion {
+  basis: string
+  action: string
+  target: LearningOverviewTarget
+}
+
+export interface StudentLearningOverview {
   updatedAt: string
-  algorithmVersion?: string
-  currentStage: string
-  stages: Array<{
-    key: string
-    name: string
-    description: string
-    status: ProcessStageStatus
-  }>
-  stageTip: {
-    title: string
-    content: string
+  periodDays: 7 | 30
+  personal: {
+    messagesSent: number
+    mentionsReceived: number
+    sharedDocumentSaves: number
+    knowledgeEntriesAdded: number
+  } | null
+  group: {
+    messagesSent: number
+    activeDiscussants: number
+    sharedDocumentsUpdated: number
+    evidenceEntries: number
+    openIssues: number
+    recentDocuments: Array<{ id: string; title: string; updatedAt: string }>
   }
-  criticalThinkingGoals: Array<{
-    key: string
-    name: string
-    level: '良好' | '发展中' | '需加强' | '待开始'
-    score: number
-    description: string
-  }>
-  knowledgeStructure: {
-    coreQuestion: { label: string; content: string; status: string }
-    mainViewpoints: { label: string; content: string[]; status: string }
-    evidence: {
-      label: string
-      content: {
-        supportingEvidence: number
-        counterEvidence: number
-        uncheckedEvidence: number
-      }
-      status: string
-    }
-    currentExplanation: { label: string; content: string; status: string }
-    transferApplication: { label: string; content: string; status: string }
+  suggestions: {
+    personal: LearningOverviewSuggestion | null
+    group: LearningOverviewSuggestion | null
   }
-  nextSuggestion: {
-    regulationType: '目标调节' | '过程监控' | '策略协同' | '情绪协调'
-    currentObservation: string
-    suggestedAction: string
-    basis: string[]
-  }
-  collaborationTemperature: {
-    score: number
-    level: string
-    indicators: Array<{ name: string; value: string }>
-    tip: string
-  }
-  metadata?: Record<string, any>
 }
 
 export const analyticsService = {
@@ -270,9 +246,10 @@ export const analyticsService = {
     return response.data
   },
 
-  async getStudentProcessDashboard(projectId: string): Promise<StudentProcessDashboard> {
-    const response = await api.get(
-      API_ENDPOINTS.ANALYTICS.STUDENT_PROCESS_DASHBOARD(projectId)
+  async getStudentProcessDashboard(projectId: string, days: 7 | 30, signal?: AbortSignal): Promise<StudentLearningOverview> {
+    const response = await api.get<StudentLearningOverview>(
+      API_ENDPOINTS.ANALYTICS.STUDENT_PROCESS_DASHBOARD(projectId),
+      { params: { days }, signal },
     )
     return response.data
   },

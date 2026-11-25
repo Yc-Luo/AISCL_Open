@@ -14,6 +14,7 @@ import AITutor from '../../components/features/student/ai/AITutor'
 import ContextualAIAssistant from '../../components/features/student/ai/ContextualAIAssistant'
 import { projectService } from '../../services/api/project'
 import { documentService } from '../../services/api/document'
+import type { LearningOverviewTarget } from '../../services/api/analytics'
 import { ExperimentVersion, Project } from '../../types'
 import { useAuthStore } from '../../stores/authStore'
 import { useSyncStore } from '../../stores/syncStore'
@@ -747,6 +748,16 @@ function Workspace({ projectId }: { projectId: string }) {
   const disabledTabs = showProcessGuidance && stageControlMode === 'hard_constraint'
     ? ALL_NAV_TABS.filter((tabId) => tabId !== 'dashboard' && !filteredRecommendedTabs.includes(tabId) && !hiddenTabs.includes(tabId))
     : []
+  const canOpenOverviewTarget = (target: LearningOverviewTarget) => !disabledTabs.includes(target.kind)
+  const openOverviewTarget = (target: LearningOverviewTarget) => {
+    if (!canOpenOverviewTarget(target)) return
+    if (target.kind === 'chat') {
+      openRightPanel('chat')
+      return
+    }
+    if (target.kind === 'document' && target.documentId) setCurrentDocumentId(target.documentId)
+    setActiveTab(target.kind)
+  }
   const isOnRecommendedTool = showProcessGuidance && filteredRecommendedTabs.includes(activeTab)
   // Some adjacent stages share the same primary tool. Include stage in keys so panes
   // reload stage-scoped state without requiring a full page refresh.
@@ -1172,13 +1183,20 @@ function Workspace({ projectId }: { projectId: string }) {
                     <AITutor key={`ai:${stageRenderKey}`} projectId={currentProjectId} experimentVersion={experimentVersion} />
                   </div>
                 )}
+                {activeTab === 'dashboard' && (
+                  <LearningDashboard
+                    key={`${currentProjectId}:${user?.id ?? ''}`}
+                    projectId={currentProjectId}
+                    onOpen={openOverviewTarget}
+                    canOpen={canOpenOverviewTarget}
+                  />
+                )}
               </div>
             ) : (
               <div className="flex-1 rounded-2xl border border-slate-100 bg-white shadow-sm flex items-center justify-center p-8 text-center text-sm text-slate-400">
                 当前账号暂无可进入的小组项目。
               </div>
             )}
-            {!workspaceLoading && !workspaceError && activeTab === 'dashboard' && <LearningDashboard />}
           </div>
         </div>
 

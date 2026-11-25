@@ -2,7 +2,7 @@
 
 import logging
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 
@@ -563,10 +563,11 @@ async def get_dashboard_data(
 @router.get("/projects/{project_id}/student-process-dashboard")
 async def get_student_process_dashboard(
     project_id: str,
+    days: Literal["7", "30"] = "7",
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    """Get formative student-facing process analytics for one collaboration group."""
-    from app.services.analytics_service import analytics_service
+    """Get saved learning activity for the current student and accessible group."""
+    from app.services.student_learning_overview import build_student_learning_overview
 
     project = await Project.get(project_id)
     if not project:
@@ -576,9 +577,10 @@ async def get_student_process_dashboard(
         )
 
     await ensure_project_access(current_user, project)
-    return await analytics_service.get_student_process_dashboard(
-        project_id,
-        user_id=str(current_user.id),
+    return await build_student_learning_overview(
+        project,
+        student_id=str(current_user.id) if current_user.role == "student" else None,
+        days=int(days),
     )
 
 
