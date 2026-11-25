@@ -1,3 +1,5 @@
+import type { CanonicalStageId } from '../../lib/stageModel'
+
 export interface Project {
     id: string
     name: string
@@ -63,6 +65,8 @@ export interface ExperimentVersion {
     export_profile?: string | null
     stage_sequence: string[]
     current_stage?: string | null
+    stage_guidance?: Array<{ id: CanonicalStageId; name: string; activity_guidance: string }>
+    learning_design_revision?: string | null
     template_key?: string | null
     template_label?: string | null
     template_release_id?: string | null

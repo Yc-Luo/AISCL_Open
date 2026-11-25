@@ -5,6 +5,8 @@ from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.core.schemas.learning_design import StageItem
+
 
 class ExperimentVersionUpdateRequest(BaseModel):
     """Update request for project experiment version."""
@@ -73,6 +75,8 @@ class ExperimentVersionResponse(BaseModel):
     export_profile: Optional[str] = None
     stage_sequence: List[str] = Field(default_factory=list)
     current_stage: Optional[str] = None
+    stage_guidance: List[StageItem] = Field(default_factory=list)
+    learning_design_revision: Optional[str] = None
     template_key: Optional[str] = None
     template_label: Optional[str] = None
     template_release_id: Optional[str] = None

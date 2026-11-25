@@ -376,6 +376,7 @@ class AIService:
         system_message_override: Optional[str] = None,
         category: str = "chat",
         message_metadata: Optional[dict] = None,
+        graph_context: Optional[dict] = None,
     ) -> dict:
         """Non-streaming chat with AI.
 
@@ -432,30 +433,46 @@ class AIService:
             conversation.title = new_title
             await conversation.save()
 
-        # Build messages
-        sys_prompt = system_message_override if system_message_override else role.system_prompt
-        messages = [SystemMessage(content=sys_prompt)]
-        for msg in history:
-            if msg.role == "user":
-                messages.append(HumanMessage(content=msg.content))
-            else:
-                messages.append(AIMessage(content=msg.content))
-        messages.append(HumanMessage(content=message))
+        citations = (context or {}).get("citations", [])
+        if graph_context:
+            from app.services.agents.agent_service import agent_service
 
-        # Add context if provided
-        if context:
-            context_text = "\n\nContext:\n" + AIService.format_context_for_prompt(context)
-            messages[-1] = HumanMessage(content=message + context_text)
-        messages = AIService.truncate_context(messages, AIService.MAX_CONTEXT_TOKENS)
-
-        # Get LLM
-        llm = await get_llm_for_role(role.name, role.temperature)
-
-        # Generate response
-        response = await guarded_ainvoke(llm, messages)
-        response_text = AIService.sanitize_model_output(
-            response.content if hasattr(response, "content") else str(response)
-        )
+            chunks = []
+            final = {}
+            async for event in agent_service.chat_stream(
+                persona_key=conversation.persona_id,
+                message=message,
+                session_id=str(conversation.id),
+                context={**(context or {}), **graph_context},
+            ):
+                if isinstance(event, str):
+                    chunks.append(event)
+                elif event.get("type") == "output":
+                    chunks.append(event.get("content", ""))
+                elif event.get("type") == "done":
+                    final = event
+            response_text = AIService.sanitize_model_output(final.get("final_content") or "".join(chunks))
+            citations = final.get("citations") or citations
+            if final.get("ai_meta"):
+                message_metadata = {**(message_metadata or {}), "ai_meta": final["ai_meta"]}
+        else:
+            sys_prompt = system_message_override or role.system_prompt
+            messages = [SystemMessage(content=sys_prompt)]
+            for msg in history:
+                if msg.role == "user":
+                    messages.append(HumanMessage(content=msg.content))
+                else:
+                    messages.append(AIMessage(content=msg.content))
+            messages.append(HumanMessage(content=message))
+            if context:
+                context_text = "\n\nContext:\n" + AIService.format_context_for_prompt(context)
+                messages[-1] = HumanMessage(content=message + context_text)
+            messages = AIService.truncate_context(messages, AIService.MAX_CONTEXT_TOKENS)
+            llm = await get_llm_for_role(role.name, role.temperature)
+            response = await guarded_ainvoke(llm, messages)
+            response_text = AIService.sanitize_model_output(
+                response.content if hasattr(response, "content") else str(response)
+            )
 
         # Save messages
         user_message = AIMessageModel(
@@ -469,18 +486,18 @@ class AIService:
             conversation_id=str(conversation.id),
             role="assistant",
             content=response_text,
-            citations=context.get("citations", []) if context else [],
+            citations=citations,
             metadata=message_metadata,
         )
         await ai_message.insert()
 
         # Generate dynamic suggestions
-        suggestions = await AIService.generate_followup_suggestions(response_text)
+        suggestions = [] if graph_context else await AIService.generate_followup_suggestions(response_text)
 
         return {
             "conversation_id": str(conversation.id),
             "message": response_text,
-            "citations": context.get("citations", []) if context else [],
+            "citations": citations,
             "suggestions": suggestions,
             "ai_meta": (message_metadata or {}).get("ai_meta") if message_metadata else None,
         }

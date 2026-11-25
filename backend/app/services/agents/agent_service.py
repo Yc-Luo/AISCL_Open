@@ -411,8 +411,11 @@ class AgentService:
             )
 
     def _is_stage_aware_graph(self, context: Optional[Dict[str, Any]]) -> bool:
-        graph_version = str((context or {}).get("graph_version") or "").strip()
-        ai_scaffold_mode = normalize_ai_scaffold_mode((context or {}).get("ai_scaffold_mode"))
+        context = context or {}
+        graph_version = str(context.get("graph_version") or "").strip()
+        ai_scaffold_mode = normalize_ai_scaffold_mode(context.get("ai_scaffold_mode"))
+        if ai_scaffold_mode == "multi_agent" and context.get("learning_design_revision"):
+            return True
         if graph_version == "research-graph-v3-stage-aware":
             return True
         # Older local/cloud projects often have multi_agent enabled before graph_version existed.
@@ -438,6 +441,7 @@ class AgentService:
             preferred_subagent=context.get("preferred_subagent"),
             enabled_subagents=context.get("enabled_subagents"),
             enabled_scaffold_roles=context.get("enabled_scaffold_roles"),
+            teacher_orchestration_mode=context.get("teacher_orchestration_mode"),
         )
         active_agents = [agent for agent in plan["active_agents"] if agent in subagents]
         if not active_agents:
@@ -448,6 +452,8 @@ class AgentService:
             plan = {**plan, "active_agents": active_agents}
 
         rag_plan = self._resolve_stage_aware_rag_plan(plan=plan, context=context)
+        if context.get("use_rag") is False:
+            rag_plan = {**rag_plan, "should_retrieve": False, "retrieval_mode": "role_aware_skip"}
         yield {
             "type": "process_start",
             "message": "正在判断当前问题需要哪类学习支持。",
@@ -581,6 +587,7 @@ class AgentService:
             "ai_meta": ai_meta,
             "routing_decision": plan,
             "citation_count": len(rag_results.get("citations", [])),
+            "citations": rag_results.get("citations", []),
         }
 
         await self._record_graph_routing_event(
@@ -848,6 +855,8 @@ class AgentService:
 小组态势记忆：
 {self._clip_context(context.get("group_state_context"), 900)}
 
+教师本阶段活动建议：{self._clip_context(context.get("teacher_stage_guidance"), 1600)}
+
 阶段记忆：
 {self._clip_context(context.get("stage_memory_context"), 900)}
 
@@ -982,7 +991,7 @@ class AgentService:
         visible_output_seen = False
         thinking_buffer = ""
         prompt = ChatPromptTemplate.from_messages([
-            ("system", self._build_stage_aware_agent_prompt(
+            SystemMessage(content=self._build_stage_aware_agent_prompt(
                 agent_def=agent_def,
                 instruction=instruction,
                 context=context,
@@ -1070,7 +1079,17 @@ class AgentService:
             for agent, output in previous_outputs.items()
             if output
         )
+        teacher_prompt = (context.get("teacher_role_prompts") or {}).get(agent_def["name"])
+        teacher_context = "\n".join(
+            f"{label}：{self._clip_context(value, limit)}" for label, value, limit in (
+                ("教师为本角色设置的教学要求", teacher_prompt, 2500),
+                ("教师设置的阶段名称", context.get("teacher_stage_name"), 48),
+                ("教师本阶段活动建议", context.get("teacher_stage_guidance"), 1600),
+            ) if value
+        )
         return f"""{agent_def["system_prompt"]}
+
+{teacher_context}
 
 本轮编排模式：{mode}
 本轮角色指令：{instruction}
@@ -1301,6 +1320,7 @@ class AgentService:
                         **plan,
                         "retrieval_mode": retrieval_mode,
                         "graph_runtime": graph_runtime,
+                        "learning_design_revision": context.get("learning_design_revision"),
                         "session_id": session_id,
                         "message_length": len(message or ""),
                         "scaffold_episode": {

@@ -2,7 +2,8 @@
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import { courseService, type CourseAISettings } from '../../services/api/course'
+import { courseService, type CourseAISettings, type DesignSnapshot } from '../../services/api/course'
+import { projectService } from '../../services/api/project'
 import ClassManagement from '../../components/features/teacher/classmanagement/ClassManagement'
 import TeacherClasses from './TeacherClasses'
 
@@ -13,9 +14,11 @@ vi.mock('../../services/api/course', () => ({
   courseService: {
     getCourses: vi.fn(), getCourseStudents: vi.fn(),
     getCourseAISettings: vi.fn(), updateCourseAISettings: vi.fn(),
+    getLearningDesign: vi.fn(), saveLearningDesign: vi.fn(), applyLearningDesign: vi.fn(),
     createCourse: vi.fn(), updateCourse: vi.fn(), getExperimentTemplates: vi.fn(),
   },
 }))
+vi.mock('../../services/api/project', () => ({ projectService: { getProjects: vi.fn() } }))
 
 function open(path = '') {
   const course = { teacher_id: 'me', students: ['s1'], invite_code: '', created_at: '' }
@@ -29,6 +32,7 @@ function open(path = '') {
     { id: 's1', username: '学生甲', email: 'student@example.test' },
   ])
   vi.mocked(courseService.getCourseAISettings).mockResolvedValue(null)
+  vi.mocked(courseService.getLearningDesign).mockResolvedValue(null)
   render(<MemoryRouter initialEntries={[`/teacher/overview${path}`]}>
     <Routes><Route path="/teacher/overview/:courseId?" element={<TeacherClasses />} /></Routes>
   </MemoryRouter>)
@@ -64,6 +68,7 @@ it('does not fetch the roster for a direct link to an unowned class', async () =
   await screen.findByText('找不到该班级，或该班级不属于当前账号。')
   expect(courseService.getCourseStudents).not.toHaveBeenCalled()
   expect(courseService.getCourseAISettings).not.toHaveBeenCalled()
+  expect(courseService.getLearningDesign).not.toHaveBeenCalled()
 })
 
 it('pages the roster, clamps jumps and resets the page when the page size changes', async () => {
@@ -198,4 +203,119 @@ it('creates and edits classes without selecting or submitting templates', async 
   expect(vi.mocked(courseService.updateCourse).mock.calls[0][1]).not.toHaveProperty('experiment_template_key')
   expect(courseService.getExperimentTemplates).not.toHaveBeenCalled()
   await screen.findByText(/班级设置已更新/)
+})
+
+const existingDesign: DesignSnapshot = {
+  revision: 'r1', orchestration_mode: 'debate',
+  roles: [{ id: 'evidence_researcher', enabled: false, prompt: '教师自定义提示词' }],
+  stages: [{ id: 'meaning_exploration', name: '证据比较', activity_guidance: '记录证据来源。' }],
+}
+
+it('opens the learning design on demand, edits sparse snapshots and restores a role without saving example text', async () => {
+  open('/spring')
+  vi.mocked(courseService.getLearningDesign).mockResolvedValue(existingDesign)
+  vi.mocked(courseService.saveLearningDesign).mockImplementation(async (_, design) => ({ ...design, revision: 'r2' }))
+
+  const section = await screen.findByRole('button', { name: '班级学习设计' })
+  expect(section.getAttribute('aria-expanded')).toBe('false')
+  expect(courseService.getLearningDesign).not.toHaveBeenCalled()
+  fireEvent.click(section)
+  const prompt = await screen.findByRole<HTMLTextAreaElement>('textbox', { name: '资料研究员提示词' })
+  const missingPrompt = screen.getByRole<HTMLTextAreaElement>('textbox', { name: '观点挑战者提示词' })
+  const apply = screen.getByRole<HTMLButtonElement>('button', { name: '应用到小组' })
+  expect(prompt.value).toBe('教师自定义提示词')
+  expect(missingPrompt.value).toBe('')
+  expect(missingPrompt.placeholder).toMatch(/^示例/)
+  expect(missingPrompt.maxLength).toBe(2500)
+  expect(screen.getByRole<HTMLInputElement>('checkbox', { name: '资料研究员' }).checked).toBe(false)
+  expect(screen.getByRole<HTMLInputElement>('checkbox', { name: '观点挑战者' }).checked).toBe(true)
+  expect(screen.getByRole<HTMLInputElement>('radio', { name: '多角色辩论' }).checked).toBe(true)
+  expect(screen.getByRole('group', { name: '角色编排方式' }).querySelectorAll('input')).toHaveLength(5)
+  expect(screen.getByRole<HTMLInputElement>('textbox', { name: /意义探索.*阶段名称/ }).value).toBe('证据比较')
+  expect(apply.disabled).toBe(false)
+
+  fireEvent.click(screen.getByRole('button', { name: '恢复资料研究员默认设置' }))
+  expect(prompt.value).toBe('')
+  expect(screen.getByRole<HTMLInputElement>('checkbox', { name: '资料研究员' }).checked).toBe(true)
+  fireEvent.click(section)
+  fireEvent.click(section)
+  expect(prompt.value).toBe('')
+  expect(courseService.getLearningDesign).toHaveBeenCalledTimes(1)
+
+  fireEvent.click(screen.getByRole('radio', { name: '多角色接力' }))
+  const name = screen.getByRole<HTMLInputElement>('textbox', { name: /问题构建.*阶段名称/ })
+  const guidance = screen.getByRole<HTMLTextAreaElement>('textbox', { name: '问题构建活动指导' })
+  expect(name.placeholder).toBe('问题构建')
+  expect(name.maxLength).toBe(48)
+  expect(guidance.maxLength).toBe(1600)
+  fireEvent.change(guidance, { target: { value: '提交小组问题。' } })
+  expect(apply.disabled).toBe(true)
+  fireEvent.click(apply)
+  expect(projectService.getProjects).not.toHaveBeenCalled()
+
+  fireEvent.click(screen.getByRole('button', { name: '保存学习设计' }))
+  await screen.findByText('班级学习设计已保存，现有小组未更改。')
+  expect(courseService.saveLearningDesign).toHaveBeenCalledWith('spring', {
+    roles: ['evidence_researcher', 'viewpoint_challenger', 'feedback_prompter', 'problem_progressor']
+      .map(id => ({ id, enabled: true, prompt: '' })),
+    orchestration_mode: 'pipeline',
+    stages: [
+      { id: 'problem_construction', name: '', activity_guidance: '提交小组问题。' },
+      existingDesign.stages[0],
+    ],
+  })
+  expect(apply.disabled).toBe(false)
+  expect(projectService.getProjects).not.toHaveBeenCalled()
+  expect(courseService.applyLearningDesign).not.toHaveBeenCalled()
+  expect(courseService.updateCourseAISettings).not.toHaveBeenCalled()
+})
+
+it('requires a confirmed save and explicit confirmation before applying to one eligible group on a later page', async () => {
+  open('/spring')
+  vi.mocked(courseService.saveLearningDesign).mockRejectedValueOnce(new Error('save failed'))
+    .mockImplementation(async (_, design) => ({ ...design, revision: 'r2' }))
+  vi.mocked(courseService.applyLearningDesign).mockRejectedValueOnce(new Error('apply failed'))
+    .mockResolvedValueOnce({ project_id: 'target', revision: 'r2' })
+  type Group = Awaited<ReturnType<typeof projectService.getProjects>>['projects'][number]
+  const group = (id: string, overrides: Partial<Group> = {}): Group => ({
+    id, name: id, owner_id: 'me', members: [], progress: 0, course_id: 'spring',
+    is_template: false, is_archived: false, created_at: '', updated_at: '', ...overrides,
+  })
+  vi.mocked(projectService.getProjects).mockImplementation(async (_, skip) => ({
+    projects: skip ? [group('target', { name: '本班活动小组' })] : [
+      group('other', { course_id: 'fall' }), group('archived', { is_archived: true }), group('template', { is_template: true }),
+    ],
+    total: 4,
+  }))
+
+  fireEvent.click(await screen.findByRole('button', { name: '班级学习设计' }))
+  const save = await screen.findByRole<HTMLButtonElement>('button', { name: '保存学习设计' })
+  const apply = screen.getByRole<HTMLButtonElement>('button', { name: '应用到小组' })
+  expect(apply.disabled).toBe(true)
+  fireEvent.click(save)
+  await screen.findByText('未能确认保存学习设计，请重试。')
+  expect(apply.disabled).toBe(true)
+  fireEvent.click(save)
+  await screen.findByText('班级学习设计已保存，现有小组未更改。')
+  fireEvent.click(apply)
+
+  const dialog = within(await screen.findByRole('dialog', { name: '应用学习设计到小组' }))
+  const loadMore = await dialog.findByRole('button', { name: '加载更多小组' })
+  expect(dialog.getAllByRole('option').map(option => option.textContent)).toEqual(['请选择小组'])
+  fireEvent.click(loadMore)
+  await dialog.findByRole('option', { name: '本班活动小组' })
+  expect(projectService.getProjects).toHaveBeenNthCalledWith(1, false, 0)
+  expect(projectService.getProjects).toHaveBeenNthCalledWith(2, false, 3)
+  const confirm = dialog.getByRole<HTMLButtonElement>('button', { name: '确认应用' })
+  expect(confirm.disabled).toBe(true)
+  fireEvent.change(dialog.getByLabelText('本班小组'), { target: { value: 'target' } })
+  expect(courseService.applyLearningDesign).not.toHaveBeenCalled()
+  fireEvent.click(confirm)
+  await dialog.findByText(/未能确认应用学习设计/)
+  fireEvent.click(confirm)
+  await screen.findByText('已将学习设计应用到「本班活动小组」（版本：r2）。')
+  expect(screen.queryByRole('dialog')).toBeNull()
+  expect(courseService.applyLearningDesign).toHaveBeenCalledTimes(2)
+  expect(courseService.applyLearningDesign).toHaveBeenCalledWith('spring', 'target')
+  expect(courseService.saveLearningDesign).toHaveBeenCalledTimes(2)
 })

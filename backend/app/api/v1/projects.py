@@ -14,6 +14,7 @@ from app.core.schemas.experiment_version import (
     ExperimentVersionResponse,
     ExperimentVersionUpdateRequest,
 )
+from app.core.schemas.learning_design import DesignSnapshot
 from app.repositories.project import Project
 from app.repositories.user import User
 from app.core.schemas.project import (
@@ -25,6 +26,7 @@ from app.core.schemas.project import (
     ProjectUpdateRequest,
 )
 from app.repositories.course import Course
+from app.services.agents.multi_agent_roles import ROLE_TO_SUBAGENT
 from app.services.project_service import project_service
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -526,6 +528,24 @@ async def delete_project(
     await project.delete()
 
 
+def _public_experiment_version(payload: dict) -> ExperimentVersionResponse:
+    version = dict(payload)
+    snapshot = version.pop("learning_design", None)
+    version["stage_guidance"] = []
+    version["learning_design_revision"] = None
+    if snapshot:
+        design = DesignSnapshot.model_validate(snapshot)
+        version["stage_guidance"] = design.stages
+        version["learning_design_revision"] = design.revision
+        if version.get("ai_scaffold_mode") == "multi_agent":
+            disabled = {role.id for role in design.roles if not role.enabled}
+            version["enabled_scaffold_roles"] = [
+                scaffold_role for scaffold_role, subagent in ROLE_TO_SUBAGENT.items()
+                if subagent not in disabled
+            ]
+    return ExperimentVersionResponse(**version)
+
+
 @router.get("/{project_id}/experiment-version", response_model=ExperimentVersionResponse)
 async def get_experiment_version(
     project_id: str,
@@ -543,7 +563,7 @@ async def get_experiment_version(
     await ensure_project_access(current_user, project)
     payload = await project_service.get_experiment_version(project)
     response.headers["Cache-Control"] = "no-store"
-    return ExperimentVersionResponse(**payload)
+    return _public_experiment_version(payload)
 
 
 @router.put("/{project_id}/experiment-version", response_model=ExperimentVersionResponse)
@@ -611,7 +631,7 @@ async def update_experiment_version(
             project_id,
             previous_stage,
         )
-    return ExperimentVersionResponse(**payload)
+    return _public_experiment_version(payload)
 
 
 @router.post("/{project_id}/members", status_code=status.HTTP_201_CREATED)

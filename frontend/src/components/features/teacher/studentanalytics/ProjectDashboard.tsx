@@ -907,9 +907,12 @@ export default function ProjectDashboard() {
                                 </p>
                             </div>
                             <div>
-                                <label className="mb-2 block text-xs font-semibold uppercase tracking-wide text-slate-500">开放支架角色（逗号分隔）</label>
+                                <label className="mb-2 block text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                    {experimentDraft.learning_design_revision ? '开放支架角色（由班级学习设计指定）' : '开放支架角色（逗号分隔）'}
+                                </label>
                                 <input
                                     value={scaffoldRolesInput}
+                                    disabled={Boolean(experimentDraft.learning_design_revision)}
                                     onChange={(e) => handleDraftChange('enabled_scaffold_roles', parseCsvList(e.target.value))}
                                     className="w-full rounded-xl border border-gray-200 px-3 py-2.5 text-sm focus:ring-2 focus:ring-indigo-500"
                                     placeholder="资料与认知支持, 观点挑战支持, 反馈追问支持, 问题推进支持"

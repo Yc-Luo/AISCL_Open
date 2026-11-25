@@ -22,6 +22,12 @@ from app.core.schemas.course import (
     CourseStudentImportRowResult,
     CourseUpdateRequest,
 )
+from app.core.schemas.learning_design import (
+    ApplyLearningDesignResponse,
+    DesignSnapshot,
+    LearningDesign,
+    LearningDesignResponse,
+)
 from app.services.auth_service import get_password_hash
 from app.services.project_service import project_service
 from app.services.research_config_service import research_config_service
@@ -284,7 +290,7 @@ async def update_course(
     )
 
 
-async def _get_course_for_ai_settings(
+async def _get_course_for_ai_configuration(
     course_id: PydanticObjectId,
     current_user: User = Depends(get_current_user),
 ) -> Course:
@@ -296,14 +302,14 @@ async def _get_course_for_ai_settings(
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the owning teacher or an admin can access course AI settings",
+            detail="Only the owning teacher or an admin can access course AI configuration",
         )
     return course
 
 
 @router.get("/{course_id}/ai-settings", response_model=CourseAISettingsResponse)
 async def get_course_ai_settings(
-    course: Course = Depends(_get_course_for_ai_settings),
+    course: Course = Depends(_get_course_for_ai_configuration),
 ) -> CourseAISettingsResponse:
     return CourseAISettingsResponse(settings=course.ai_settings)
 
@@ -311,7 +317,7 @@ async def get_course_ai_settings(
 @router.put("/{course_id}/ai-settings", response_model=CourseAISettingsResponse)
 async def update_course_ai_settings(
     settings: CourseAISettings,
-    course: Course = Depends(_get_course_for_ai_settings),
+    course: Course = Depends(_get_course_for_ai_configuration),
 ) -> CourseAISettingsResponse:
     result = await Course.find_one({"_id": course.id}).set(
         {"ai_settings": settings.model_dump(), "updated_at": datetime.utcnow()},
@@ -319,6 +325,43 @@ async def update_course_ai_settings(
     if not result.matched_count:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
     return CourseAISettingsResponse(settings=settings)
+
+
+@router.get("/{course_id}/learning-design", response_model=LearningDesignResponse)
+async def get_course_learning_design(
+    course: Course = Depends(_get_course_for_ai_configuration),
+) -> LearningDesignResponse:
+    return LearningDesignResponse(design=course.learning_design)
+
+
+@router.put("/{course_id}/learning-design", response_model=LearningDesignResponse)
+async def update_course_learning_design(
+    design: LearningDesign,
+    course: Course = Depends(_get_course_for_ai_configuration),
+) -> LearningDesignResponse:
+    snapshot = DesignSnapshot.from_design(design)
+    result = await Course.find_one({"_id": course.id}).set(
+        {"learning_design": snapshot.model_dump(), "updated_at": datetime.utcnow()},
+    )
+    if not result.matched_count:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
+    return LearningDesignResponse(design=snapshot)
+
+
+@router.post(
+    "/{course_id}/learning-design/projects/{project_id}",
+    response_model=ApplyLearningDesignResponse,
+)
+async def apply_course_learning_design(
+    project_id: PydanticObjectId,
+    course: Course = Depends(_get_course_for_ai_configuration),
+) -> ApplyLearningDesignResponse:
+    snapshot = course.learning_design
+    if snapshot is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No saved learning design")
+    if not await project_service.apply_course_learning_design(course, project_id, snapshot):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active course group not found")
+    return ApplyLearningDesignResponse(project_id=str(project_id), revision=snapshot.revision)
 
 
 @router.delete("/{course_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -9,6 +9,7 @@ import uuid
 from typing import Any, Dict, Optional
 
 from app.core.ai_scaffold_mode import normalize_ai_scaffold_mode
+from app.services.agents.course_learning_design import resolve_course_learning_design
 
 from app.services.agents.auto_prompt_policy import (
     AUTO_GROUP_PROMPT_RULE_TYPES,
@@ -343,6 +344,7 @@ async def _evaluate_shadow_prompt_candidates(
     current_stage = experiment_version.get("current_stage")
     enabled_rule_set = experiment_version.get("enabled_rule_set")
     is_multi_agent_mode = normalize_ai_scaffold_mode(experiment_version.get("ai_scaffold_mode")) == "multi_agent"
+    enabled_design_roles = resolve_course_learning_design(experiment_version, current_stage).get("enabled_subagents")
     experiment_version_id = (
         experiment_version.get("version_name")
         or experiment_version.get("name")
@@ -402,6 +404,8 @@ async def _evaluate_shadow_prompt_candidates(
         )
 
         recommended_subagent = RULE_TYPE_TO_SUBAGENT.get(rule_type) if is_multi_agent_mode else None
+        if enabled_design_roles is not None and recommended_subagent not in enabled_design_roles:
+            recommended_subagent = None
         shadow_events.append(
             {
                 "project_id": str(project.id),
@@ -444,7 +448,6 @@ async def _evaluate_shadow_prompt_candidates(
             and eligible_for_live_prompt
             and live_prompt_candidate is None
         ):
-            recommended_subagent = RULE_TYPE_TO_SUBAGENT.get(rule_type) if is_multi_agent_mode else None
             live_prompt_candidate = {
                 "project_id": str(project.id),
                 "experiment_version_id": experiment_version_id,
@@ -651,6 +654,7 @@ async def _process_ai_reply(
             "room_id": room_id,
             "group_id": room_id,
             "source_actor_type": "ai_assistant",
+            "current_stage": current_stage,
             "project_task_context": project_task_context,
             "stage_memory_context": stage_memory.get("content"),
             "stage_memory_updated_at": stage_memory.get("updated_at"),
@@ -677,6 +681,7 @@ async def _process_ai_reply(
             "ai_scaffold_mode": ai_scaffold_mode,
             "process_scaffold_mode": experiment_version.get("process_scaffold_mode"),
             "runtime_model_id": _group_multi_agent_model_id(experiment_version),
+            **(resolve_course_learning_design(experiment_version, current_stage) if ai_scaffold_mode == "multi_agent" else {}),
         }
         ai_user_id = "ai_assistant"
         message_id = str(uuid.uuid4())

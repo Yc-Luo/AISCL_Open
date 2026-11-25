@@ -40,6 +40,28 @@ export interface CourseAISettings {
     auto_prompt_enabled: boolean
 }
 
+export interface LearningDesignRole {
+    id: 'evidence_researcher' | 'viewpoint_challenger' | 'feedback_prompter' | 'problem_progressor'
+    enabled: boolean
+    prompt: string
+}
+
+export interface StageItem {
+    id: 'problem_construction' | 'meaning_exploration' | 'explanation_integration' | 'application_solution'
+    name: string
+    activity_guidance: string
+}
+
+export interface LearningDesign {
+    roles: LearningDesignRole[]
+    orchestration_mode: 'adaptive' | 'single' | 'parallel' | 'debate' | 'pipeline'
+    stages: StageItem[]
+}
+
+export interface DesignSnapshot extends LearningDesign {
+    revision: string
+}
+
 export interface Student {
     id: string
     username: string
@@ -118,6 +140,21 @@ export const courseService = {
     getCourseStudents: async (courseId: string): Promise<Student[]> => {
         const response = await api.get(`/courses/${courseId}/students`)
         return response.data.students
+    },
+
+    getLearningDesign: async (courseId: string): Promise<DesignSnapshot | null> => {
+        const response = await api.get<{ design: DesignSnapshot | null }>(`/courses/${encodeURIComponent(courseId)}/learning-design`)
+        return response.data.design
+    },
+
+    saveLearningDesign: async (courseId: string, design: LearningDesign): Promise<DesignSnapshot | null> => {
+        const response = await api.put<{ design: DesignSnapshot | null }>(`/courses/${encodeURIComponent(courseId)}/learning-design`, design)
+        return response.data.design
+    },
+
+    applyLearningDesign: async (courseId: string, projectId: string): Promise<{ project_id: string; revision: string }> => {
+        const response = await api.post<{ project_id: string; revision: string }>(`/courses/${encodeURIComponent(courseId)}/learning-design/projects/${encodeURIComponent(projectId)}`)
+        return response.data
     },
 
     removeStudent: async (courseId: string, studentId: string) => {

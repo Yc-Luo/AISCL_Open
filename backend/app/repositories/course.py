@@ -7,6 +7,7 @@ from beanie import Document
 from pydantic import Field
 
 from app.core.schemas.course import CourseAISettings
+from app.core.schemas.learning_design import DesignSnapshot
 
 
 class Course(Document):
@@ -19,6 +20,7 @@ class Course(Document):
     students: List[str] = Field(default_factory=list)  # List of student user IDs
     description: Optional[str] = None
     ai_settings: Optional[CourseAISettings] = None
+    learning_design: Optional[DesignSnapshot] = None
     experiment_template_key: Optional[str] = None
     experiment_template_label: Optional[str] = None
     experiment_template_release_id: Optional[str] = None

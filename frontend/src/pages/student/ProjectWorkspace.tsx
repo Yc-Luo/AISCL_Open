@@ -52,6 +52,8 @@ const getExperimentVersionSignature = (version: ExperimentVersion | null) => {
     export_profile: version.export_profile,
     stage_sequence: version.stage_sequence,
     current_stage: version.current_stage,
+    stage_guidance: version.stage_guidance,
+    learning_design_revision: version.learning_design_revision,
     updated_at: version.updated_at,
   })
 }
@@ -299,6 +301,7 @@ function Workspace({ projectId }: { projectId: string }) {
     if (!currentProjectId || !currentStage) return
 
     const previousStage = previousStageRef.current
+    if (previousStage === currentStage) return
     const eventType = previousStage ? 'learning_stage_transition' : 'learning_stage_enter'
 
     trackingService.trackResearchEvent({
@@ -730,6 +733,11 @@ function Workspace({ projectId }: { projectId: string }) {
   const hasConfiguredStages = (experimentVersion?.stage_sequence?.length || 0) > 0
   const visibleStageSteps = getVisibleStageSteps(experimentVersion?.stage_sequence)
   const currentCanonicalStage = normalizeStageId(currentStage)
+  const getTeacherStageGuidance = (stageId: CanonicalStageId | null) =>
+    experimentVersion?.stage_guidance?.find((stage) => stage.id === stageId)
+  const getStageLabel = (stageId: string | null) =>
+    getTeacherStageGuidance(normalizeStageId(stageId))?.name.trim() || formatStageLabel(stageId)
+  const currentActivityGuidance = getTeacherStageGuidance(currentCanonicalStage)?.activity_guidance.trim()
   const showProcessGuidance = Boolean(hasConfiguredStages && currentStage && isProcessScaffoldActive(experimentVersion))
   const tutorTabEnabled = isTutorTabEnabled(experimentVersion)
   const hiddenTabs = tutorTabEnabled ? [] : ['ai']
@@ -915,11 +923,11 @@ function Workspace({ projectId }: { projectId: string }) {
           {stageUpdateNotice && (
             <div className="border-b border-amber-200 bg-amber-50 px-4 py-3">
               <div className="flex items-center justify-between gap-4">
-                <div>
+                <div className="min-w-0">
                   <div className="text-xs font-semibold uppercase tracking-wide text-amber-700">阶段调整提示</div>
                   <div className="mt-1 text-sm text-amber-900">
                     教师已将当前任务阶段调整为
-                    <span className="mx-1 font-semibold">{formatStageLabel(stageUpdateNotice.stageId)}</span>
+                    <span className="mx-1 break-words font-semibold">{getStageLabel(stageUpdateNotice.stageId)}</span>
                     {stageUpdateNotice.versionName ? (
                       <span className="text-amber-700">（版本：{stageUpdateNotice.versionName}）</span>
                     ) : null}
@@ -929,7 +937,7 @@ function Workspace({ projectId }: { projectId: string }) {
                 <button
                   type="button"
                   onClick={() => setStageUpdateNotice(null)}
-                  className="rounded-lg border border-amber-200 bg-white px-3 py-1.5 text-xs font-medium text-amber-700 transition-colors hover:bg-amber-100"
+                  className="shrink-0 rounded-lg border border-amber-200 bg-white px-3 py-1.5 text-xs font-medium text-amber-700 transition-colors hover:bg-amber-100"
                 >
                   知道了
                 </button>
@@ -943,8 +951,8 @@ function Workspace({ projectId }: { projectId: string }) {
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="text-xs font-semibold uppercase tracking-wide text-indigo-500">任务阶段</span>
                     {currentStage && (
-                      <span className="rounded-full bg-indigo-600 px-2.5 py-0.5 text-xs font-semibold text-white shadow-sm">
-                        {formatStageLabel(currentStage)}
+                      <span className="min-w-0 max-w-full break-words rounded-full bg-indigo-600 px-2.5 py-0.5 text-xs font-semibold text-white shadow-sm">
+                        {getStageLabel(currentStage)}
                       </span>
                     )}
                   </div>
@@ -972,7 +980,7 @@ function Workspace({ projectId }: { projectId: string }) {
                     >
                       {showStageDetails ? '收起阶段详情' : '展开阶段详情'}
                     </button>
-                  ) : (
+                  ) : !currentActivityGuidance && (
                     <span className="rounded-full bg-slate-50 px-2.5 py-0.5 text-[11px] font-medium text-slate-500 ring-1 ring-slate-200">
                       仅显示任务进度
                     </span>
@@ -990,7 +998,7 @@ function Workspace({ projectId }: { projectId: string }) {
                       type="button"
                       onClick={() => handleStageSelect(stageId)}
                       disabled={isStageButtonDisabled}
-                      className={`whitespace-nowrap rounded-full border px-2.5 py-1 text-xs font-medium transition-all ${isActive
+                      className={`max-w-[min(16rem,100%)] shrink-0 break-words rounded-full border px-2.5 py-1 text-xs font-medium transition-all ${isActive
                           ? 'border-indigo-500 bg-indigo-600 text-white shadow-sm'
                           : isStageButtonDisabled
                             ? 'border-slate-200 bg-slate-50 text-slate-400'
@@ -998,7 +1006,7 @@ function Workspace({ projectId }: { projectId: string }) {
                         }`}
                       title={!isGroupLeader ? '当前任务阶段由小组组长推进。' : undefined}
                     >
-                      {index + 1}. {formatStageLabel(canonicalStage)}
+                      {index + 1}. {getStageLabel(canonicalStage)}
                     </button>
                   )
                 })}
@@ -1010,13 +1018,24 @@ function Workspace({ projectId }: { projectId: string }) {
                 </div>
               )}
 
+              {currentActivityGuidance && (
+                <section aria-label="当前阶段活动指引" className="mt-2 rounded-lg border border-indigo-100 bg-white/85 px-3 py-2">
+                  <h2 className="text-xs font-semibold text-indigo-700">当前阶段活动指引</h2>
+                  <div className="mt-1 max-h-24 overflow-y-auto whitespace-pre-wrap break-words text-sm leading-5 text-slate-700" tabIndex={0}>
+                    {currentActivityGuidance}
+                  </div>
+                </section>
+              )}
+
               {showStageDetails && showProcessGuidance && (
                 <div className="mt-2 rounded-2xl border border-indigo-100 bg-white/85 px-4 py-3">
-                  <div className="text-xs text-slate-600">
-                    {stageToolGuidance.guidance}
-                  </div>
+                  {!currentActivityGuidance && (
+                    <div className="text-xs text-slate-600">
+                      {stageToolGuidance.guidance}
+                    </div>
+                  )}
                   {filteredRecommendedTabs.length > 0 && (
-                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <div className={`flex flex-wrap items-center gap-2 ${currentActivityGuidance ? '' : 'mt-3'}`}>
                       <span className="text-xs font-semibold uppercase tracking-wide text-indigo-500">推荐工具</span>
                       {filteredRecommendedTabs.map((tabId) => (
                         <button
@@ -1318,8 +1337,9 @@ function Workspace({ projectId }: { projectId: string }) {
       <ConfirmDialog
         open={Boolean(stageConfirmTarget)}
         title="确认切换任务阶段"
-        description={`确定要将小组任务阶段从「${formatStageLabel(currentStage)}」切换到「${formatStageLabel(stageConfirmTarget)}」吗？切换后全组成员都会按新阶段继续协作。`}
+        description={`确定要将小组任务阶段从「${getStageLabel(currentStage)}」切换到「${getStageLabel(stageConfirmTarget)}」吗？切换后全组成员都会按新阶段继续协作。`}
         confirmLabel="确认切换"
+        contentClassName="break-words"
         loading={stageChanging}
         onOpenChange={(open) => {
           if (!open) setStageConfirmTarget(null)

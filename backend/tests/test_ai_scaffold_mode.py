@@ -68,6 +68,8 @@ class ModeTests(TestCase):
 class RuntimeTests(IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.user = SimpleNamespace(id="user")
+        self.conversation = SimpleNamespace(id="conversation", project_id="project", user_id="user", save=AsyncMock())
+        self.enterContext(patch.object(ai.AIConversation, "get", AsyncMock(return_value=self.conversation)))
         self.chat_data = ai.AIChatRequest(
             project_id="project", message="question", use_rag=False, conversation_id="conversation"
         )
@@ -113,7 +115,7 @@ class RuntimeTests(IsolatedAsyncioTestCase):
         for mode in ("general-ai", " MULTI-AI "):
             with self.subTest(mode=mode):
                 self.project_get.return_value = project_with(mode)
-                conversation = SimpleNamespace(id="conversation", save=AsyncMock())
+                conversation = self.conversation
                 with patch.object(ai.AIConversation, "get", AsyncMock(return_value=conversation)), \
                         patch.object(ai, "AIMessage") as message, \
                         patch.object(ai.ai_service, "raw_chat_stream", Mock(side_effect=reply_stream)) as raw, \

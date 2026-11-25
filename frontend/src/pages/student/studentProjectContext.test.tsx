@@ -3,13 +3,16 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { create } from 'zustand'
+import { getStageToolGuidance } from '../../lib/stageModel'
 import { useAuthStore } from '../../stores/authStore'
 import { useContextStore } from '../../stores/contextStore'
+import type { ExperimentVersion } from '../../types'
 import ProjectList from './ProjectList'
 import ProjectWorkspace from './ProjectWorkspace'
 
 const mocks = vi.hoisted(() => ({
   getProjects: vi.fn(), getProject: vi.fn(), getExperimentVersion: vi.fn(),
+  updateExperimentVersion: vi.fn(), trackResearchEvent: vi.fn(),
   getCourses: vi.fn(), getDocuments: vi.fn(), createDocument: vi.fn(),
   joinRoom: vi.fn(), leaveRoom: vi.fn(),
 }))
@@ -27,7 +30,7 @@ vi.mock('../../services/sync/SyncService', () => ({
 vi.mock('../../hooks/common/useActivityTracking', () => ({ useActivityTracking: () => {} }))
 vi.mock('../../hooks/common/useBehaviorTracking', () => ({ useBehaviorTracking: () => {} }))
 vi.mock('../../services/tracking/TrackingService', () => ({
-  trackingService: { trackResearchEvent: () => {} },
+  trackingService: { trackResearchEvent: mocks.trackResearchEvent },
 }))
 vi.mock('../../components/layout/Sidebar', () => ({ default: () => null }))
 vi.mock('../../components/layout/RightSidebar', () => ({ default: () => null }))
@@ -40,7 +43,10 @@ vi.mock('../../modules/inquiry/components/InquirySpace', () => ({ InquirySpace: 
 vi.mock('../../components/features/student/ai/AITutor', () => ({ default: () => null }))
 vi.mock('../../components/features/student/ai/ContextualAIAssistant', () => ({ default: () => null }))
 vi.mock('../../components/features/student/settings/Settings', () => ({ default: () => null }))
-vi.mock('../../components/ui', () => ({ ConfirmDialog: () => null, useToast: () => ({}) }))
+vi.mock('../../components/ui', async () => ({
+  ConfirmDialog: (await import('../../components/ui/confirm-dialog')).default,
+  useToast: () => ({}),
+}))
 
 const account = (id: string) => ({ id, role: 'student' as const, username: id, email: id + '@example.test' })
 const project = (id: string, is_archived = false) => ({ id, name: id, members: [], is_archived })
@@ -141,5 +147,100 @@ describe('student project context', () => {
     expect(useContextStore.getState().projectId).toBeNull()
     expect(mocks.leaveRoom).toHaveBeenCalledWith('project:group-b', 'chat')
     expect(mocks.joinRoom).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('student stage guidance', () => {
+  const version: ExperimentVersion = {
+    project_id: 'group-a',
+    mode: 'research',
+    version_name: 'test',
+    stage_control_mode: 'soft_guidance',
+    process_scaffold_mode: 'off',
+    ai_scaffold_mode: 'single_agent',
+    broadcast_stage_updates: true,
+    enabled_scaffold_layers: [],
+    enabled_scaffold_roles: [],
+    stage_sequence: ['problem_construction', 'meaning_exploration'],
+    current_stage: 'problem_construction',
+  }
+  const firstStage = { id: 'problem_construction', name: '明确调研问题', activity_guidance: '用两句话写出小组的调研问题。' } as const
+  const nextStage = { id: 'meaning_exploration', name: '比较调研资料', activity_guidance: '列出两份来源，并比较它们的证据。' } as const
+
+  beforeEach(() => {
+    mocks.getProject.mockResolvedValue({ ...project('group-a'), leader_id: 'student-a' })
+  })
+
+  it('shows only the active instructions with process scaffolding off and switches by canonical ID', async () => {
+    const initialVersion = { ...version, stage_guidance: [firstStage, nextStage] }
+    mocks.getExperimentVersion.mockResolvedValue(initialVersion)
+    mocks.updateExperimentVersion.mockResolvedValue({ ...initialVersion, current_stage: nextStage.id })
+    open('/project/group-a')
+
+    expect(await screen.findByText(firstStage.activity_guidance)).toBeTruthy()
+    expect(screen.getByText(firstStage.name)).toBeTruthy()
+    expect(screen.queryByText(nextStage.activity_guidance)).toBeNull()
+    expect(screen.queryByRole('button', { name: '展开阶段详情' })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: `2. ${nextStage.name}` }))
+    expect(await screen.findByText(new RegExp(`「${firstStage.name}」切换到「${nextStage.name}」`))).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '确认切换' }))
+
+    expect(await screen.findByText(nextStage.activity_guidance)).toBeTruthy()
+    expect(screen.getByText(nextStage.name)).toBeTruthy()
+    expect(screen.queryByText(firstStage.activity_guidance)).toBeNull()
+    expect(mocks.updateExperimentVersion).toHaveBeenCalledWith('group-a', { current_stage: nextStage.id })
+    expect(mocks.trackResearchEvent).toHaveBeenCalledWith(expect.objectContaining({
+      event_type: 'group_leader_stage_change',
+      stage_id: nextStage.id,
+      payload: expect.objectContaining({ from: firstStage.id, to: nextStage.id }),
+    }))
+  })
+
+  it.each([
+    { scenario: 'absent', stage_guidance: undefined },
+    { scenario: 'blank', stage_guidance: [{ ...firstStage, name: ' ', activity_guidance: ' ' }] },
+  ])(
+    'keeps the built-in label and guidance when teacher overrides are $scenario', async ({ stage_guidance }) => {
+      mocks.getExperimentVersion.mockResolvedValue({ ...version, process_scaffold_mode: 'on', stage_guidance })
+      open('/project/group-a')
+
+      expect(await screen.findByText('问题构建')).toBeTruthy()
+      expect(screen.queryByRole('region', { name: '当前阶段活动指引' })).toBeNull()
+      fireEvent.click(screen.getByRole('button', { name: '展开阶段详情' }))
+      expect(screen.getByText(getStageToolGuidance(firstStage.id).guidance)).toBeTruthy()
+      expect(screen.getByText('推荐工具')).toBeTruthy()
+    },
+  )
+
+  it('matches legacy stages and refreshes teacher instructions without recording a stage transition', async () => {
+    const initialVersion = {
+      ...version,
+      process_scaffold_mode: 'on',
+      stage_sequence: ['planning', nextStage.id],
+      current_stage: 'planning',
+      stage_guidance: [firstStage],
+    }
+    mocks.getExperimentVersion.mockResolvedValue(initialVersion)
+    open('/project/group-a')
+
+    expect(await screen.findByRole('button', { name: `1. ${firstStage.name}` })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '展开阶段详情' }))
+    expect(screen.getAllByText(firstStage.activity_guidance)).toHaveLength(1)
+    expect(screen.queryByText(getStageToolGuidance(firstStage.id).guidance)).toBeNull()
+    expect(screen.getByText('推荐工具')).toBeTruthy()
+
+    const revisedGuidance = '先比较两个可调查的问题，再选定一个。'
+    mocks.getExperimentVersion.mockResolvedValue({
+      ...initialVersion,
+      stage_guidance: [{ ...firstStage, activity_guidance: revisedGuidance }],
+    })
+    fireEvent(window, new Event('focus'))
+
+    expect(await screen.findByText(revisedGuidance)).toBeTruthy()
+    expect(screen.queryByText(firstStage.activity_guidance)).toBeNull()
+    expect(mocks.trackResearchEvent).not.toHaveBeenCalledWith(expect.objectContaining({
+      event_type: 'learning_stage_transition',
+    }))
   })
 })

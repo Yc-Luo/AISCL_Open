@@ -157,6 +157,7 @@ class OrchestrationPlanner:
         preferred_subagent: Optional[str] = None,
         enabled_subagents: Optional[List[str]] = None,
         enabled_scaffold_roles: Optional[List[str]] = None,
+        teacher_orchestration_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         stage = cls.normalize_stage(current_stage)
         available = cls.resolve_enabled_subagents(
@@ -178,6 +179,15 @@ class OrchestrationPlanner:
             mode, agents = cls.MATRIX.get(matrix_key, cls.STAGE_DEFAULTS.get(stage, cls.STAGE_DEFAULTS["problem_construction"]))
 
         agents = cls._restrict_agents(agents, available)
+        if teacher_orchestration_mode in {"single", "parallel", "debate", "pipeline"} and decision_source != "preferred_subagent":
+            mode = teacher_orchestration_mode
+            if mode == "single":
+                agents = agents[:1]
+            elif len(agents) < 2:
+                agents = (agents + [agent for agent in available if agent not in agents])[:2]
+            if mode == "debate":
+                agents = agents[:3]
+            decision_source = "teacher_orchestration"
         if mode in {"parallel", "debate"} and len(agents) == 1:
             mode = "single"
         if mode == "pipeline" and len(agents) < 2:
@@ -217,7 +227,7 @@ class OrchestrationPlanner:
             "enabled_subagents": available,
             "preferred_subagent": preferred_subagent or None,
             "rule_type": rule_type or None,
-            "constrained": decision_source in {"rule_trigger", "preferred_subagent"},
+            "constrained": decision_source in {"rule_trigger", "preferred_subagent", "teacher_orchestration"},
             "fallback_applied": False,
         }
 

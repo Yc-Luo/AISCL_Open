@@ -3,9 +3,11 @@
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+from beanie import PydanticObjectId
 from pymongo import ReturnDocument
 
 from app.core.ai_scaffold_mode import normalize_ai_scaffold_mode
+from app.core.schemas.learning_design import DesignSnapshot
 from app.repositories.collaboration_snapshot import CollaborationSnapshot
 from app.repositories.course import Course
 from app.repositories.document import Document
@@ -100,6 +102,44 @@ class ProjectService:
         return await ProjectService.get_experiment_version(project)
 
     @staticmethod
+    async def apply_course_learning_design(
+        course: Course, project_id: PydanticObjectId, snapshot: DesignSnapshot,
+    ) -> bool:
+        """Apply only the saved design, without rewriting the group's policies or progress."""
+        now = datetime.utcnow()
+        updates: list[dict[str, Any] | str] = [
+            "$experiment_version",
+            {"$literal": {"learning_design": snapshot.model_dump(), "updated_at": now}},
+        ]
+        if snapshot.has_stage_overrides():
+            stages = list(research_config_service.CURRENT_STAGE_SEQUENCE)
+            updates.append({"$cond": [
+                {"$eq": [{"$ifNull": ["$experiment_version.stage_sequence", []]}, []]},
+                {"$mergeObjects": [
+                    {"$literal": {"stage_sequence": stages}},
+                    {"$cond": [
+                        {"$eq": [{"$ifNull": ["$experiment_version.current_stage", None]}, None]},
+                        {"$literal": {"current_stage": stages[0]}},
+                        {},
+                    ]},
+                ]},
+                {},
+            ]})
+        result = await Project.get_motor_collection().update_one(
+            {
+                "_id": project_id,
+                "course_id": str(course.id),
+                "is_archived": {"$ne": True},
+                "is_template": {"$ne": True},
+            },
+            [{"$set": {
+                "updated_at": now,
+                "experiment_version": {"$mergeObjects": updates},
+            }}],
+        )
+        return bool(result.matched_count)
+
+    @staticmethod
     async def initialize_project_from_course(
         project: Project,
         course: Course,
@@ -150,6 +190,17 @@ class ProjectService:
             project.inherited_template_label = course.experiment_template_label
             project.inherited_template_release_id = course.experiment_template_release_id
             project.inherited_template_source = course.experiment_template_source
+
+        if inherit_course_template and course.learning_design is not None:
+            snapshot = course.learning_design
+            version = project.experiment_version or ProjectService.build_default_experiment_version(str(project.id))
+            version["learning_design"] = snapshot.model_dump()
+            if snapshot.has_stage_overrides() and not version.get("stage_sequence"):
+                stages = list(research_config_service.CURRENT_STAGE_SEQUENCE)
+                version["stage_sequence"] = stages
+                if version.get("current_stage") is None:
+                    version["current_stage"] = stages[0]
+            project.experiment_version = version
 
         seeded_document = await ProjectService._create_initial_task_document(
             project=project,

@@ -38,6 +38,7 @@ from app.services.ai_service import ai_service
 from app.services.intervention_service import intervention_service
 from app.services.rag_service import rag_service
 from app.services.agents.agent_service import agent_service
+from app.services.agents.course_learning_design import resolve_course_learning_design
 from app.services.group_memory_service import group_memory_service
 from app.services.learning_object_memory_service import is_experimental_memory_enabled
 
@@ -228,7 +229,10 @@ async def _build_project_ai_context(
     stage_memory = {}
     group_state = {}
     if is_experimental_memory_enabled(experiment_version):
-        stage_id = chat_data.current_stage or experiment_version.get("current_stage")
+        stage_id = (
+            experiment_version.get("current_stage") if experiment_version.get("learning_design")
+            else chat_data.current_stage or experiment_version.get("current_stage")
+        )
         group_id = f"project:{project.id}"
         stage_memory = await group_memory_service.get_stage_memory_context(
             project_id=str(project.id),
@@ -273,6 +277,34 @@ async def _build_project_ai_context(
         "group_state_memory_version": group_state.get("version"),
         "group_state_source_counts": group_state.get("source_counts"),
     }
+
+
+def _configured_tutor_context(project: Project, chat_data: AIChatRequest, user_id: str) -> dict:
+    version = project.experiment_version or {}
+    stage = version.get("current_stage")
+    design = resolve_course_learning_design(version, stage)
+    if not design or not _is_multi_agent_mode(version):
+        return {}
+    return {
+        "project_id": str(project.id),
+        "group_id": f"project:{project.id}",
+        "user_id": user_id,
+        "source_actor_type": "ai_tutor",
+        "experiment_version_id": version.get("version_name"),
+        "current_stage": stage,
+        "ai_scaffold_mode": "multi_agent",
+        "preferred_subagent": None,
+        "use_rag": chat_data.use_rag,
+        "runtime_model_id": _tutor_multi_agent_model_id(version),
+        **design,
+    }
+
+
+async def _get_chat_conversation(conversation_id: str, project_id: str, user_id: str) -> AIConversation:
+    conversation = await AIConversation.get(conversation_id)
+    if not conversation or conversation.project_id != project_id or str(conversation.user_id) != user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    return conversation
 
 
 async def _build_direct_ai_context(
@@ -334,6 +366,8 @@ async def chat(
         )
 
     await ensure_project_access(current_user, project)
+    if chat_data.conversation_id:
+        await _get_chat_conversation(chat_data.conversation_id, chat_data.project_id, str(current_user.id))
 
     experiment_version = (
         project.experiment_version or {}
@@ -360,8 +394,9 @@ async def chat(
 
     # Retrieve context using RAG if enabled. Only multi-agent experimental
     # conditions use platform context and support metadata.
+    course_graph = _configured_tutor_context(project, chat_data, str(current_user.id))
     context = None
-    if chat_data.use_rag:
+    if chat_data.use_rag and not course_graph:
         try:
             context = await rag_service.retrieve_context(
                 chat_data.project_id,
@@ -393,6 +428,7 @@ async def chat(
         role_id=chat_data.role_id,
         conversation_id=chat_data.conversation_id,
         context=context,
+        **({"graph_context": course_graph} if course_graph else {}),
         message_metadata=(
             {"ai_meta": _build_tutor_ai_meta(chat_data, use_role_view=use_role_view)}
             if chat_data.role_id == "default-tutor"
@@ -500,12 +536,9 @@ async def chat_stream(
 
     conversation: Optional[AIConversation] = None
     if chat_data.conversation_id:
-        conversation = await AIConversation.get(chat_data.conversation_id)
-        if not conversation:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Conversation not found",
-            )
+        conversation = await _get_chat_conversation(
+            chat_data.conversation_id, chat_data.project_id, str(current_user.id),
+        )
     else:
         fallback_key = "default-tutor" if chat_data.role_id == "default-tutor" else "default"
         role = await ai_service.get_role(chat_data.role_id) if chat_data.role_id else await ai_service.get_default_role()
@@ -537,6 +570,7 @@ async def chat_stream(
             else {}
         )
         graph_version = experiment_version.get("graph_version")
+        course_graph = _configured_tutor_context(project, chat_data, str(current_user.id))
         full_response = ""
 
         if not _is_multi_agent_mode(experiment_version):
@@ -583,7 +617,7 @@ async def chat_stream(
         # Retrieve context inside the SSE generator so the client receives
         # progress feedback during potentially slow RAG calls.
         context = None
-        if chat_data.use_rag and graph_version != "research-graph-v3-stage-aware":
+        if chat_data.use_rag and not course_graph and graph_version != "research-graph-v3-stage-aware":
             yield _sse_event(
                 "status",
                 {
@@ -677,6 +711,7 @@ async def chat_stream(
                 "group_state_memory_version": context.get("group_state_memory_version") if context else None,
                 "group_state_source_counts": context.get("group_state_source_counts") if context else None,
                 "runtime_model_id": _tutor_multi_agent_model_id(experiment_version),
+                **course_graph,
             }
 
             user_message = AIMessage(
@@ -696,7 +731,7 @@ async def chat_stream(
             final_event_meta = {}
             stream_message = (
                 chat_data.message
-                if graph_version == "research-graph-v3-stage-aware"
+                if course_graph or graph_version == "research-graph-v3-stage-aware"
                 else final_message
             )
             async for event in agent_service.chat_stream(
@@ -774,7 +809,7 @@ async def chat_stream(
                 conversation_id=str(conversation.id),
                 role="assistant",
                 content=assistant_content,
-                citations=context.get("citations", []) if context else [],
+                citations=final_event_meta.get("citations") or (context or {}).get("citations", []),
                 metadata=(
                     {"ai_meta": tutor_meta}
                     if chat_data.role_id == "default-tutor"
@@ -795,17 +830,14 @@ async def chat_stream(
                     "ai_meta": tutor_meta,
                 },
             )
-        except Exception as e:
-            # Fallback for debugging, yield nothing or error
-            print(f"Agent Service Error: {e}")
+        except Exception:
+            logger.exception("Tutor generation failed for project %s", chat_data.project_id)
             yield _sse_event(
                 "error",
                 {
                     "message": "AI 服务处理失败，请稍后重试。",
-                    "detail": str(e),
                 },
             )
-            yield _sse_event("delta", f"[System Error]: {str(e)}")
 
     return StreamingResponse(
         generate(),
