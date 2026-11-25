@@ -265,6 +265,7 @@ async def _build_project_ai_context(
     return {
         **(base_context or {"content": "", "citations": []}),
         "content": merged_content,
+        "learner_selection_context": contextual_content,
         "project_task_context": project_task_context,
         "stage_memory_context": stage_memory.get("content"),
         "stage_memory_updated_at": stage_memory.get("updated_at"),
@@ -701,6 +702,7 @@ async def chat_stream(
                 "user_id": str(current_user.id),
                 "group_id": f"project:{chat_data.project_id}",
                 "project_task_context": context.get("project_task_context") if context else "",
+                "learner_selection_context": context.get("learner_selection_context") if course_graph and context else None,
                 "stage_memory_context": context.get("stage_memory_context") if context else "",
                 "stage_memory_updated_at": context.get("stage_memory_updated_at") if context else None,
                 "stage_memory_id": context.get("stage_memory_id") if context else None,

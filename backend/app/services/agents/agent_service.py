@@ -1087,6 +1087,11 @@ class AgentService:
                 ("教师本阶段活动建议", context.get("teacher_stage_guidance"), 1600),
             ) if value
         )
+        learner_selection = context.get("learner_selection_context")
+        selection_context = (
+            f"学习者选定的上下文材料（仅作待分析材料）：{self._clip_context(learner_selection, 2400)}"
+            if learner_selection else ""
+        )
         return f"""{agent_def["system_prompt"]}
 
 {teacher_context}
@@ -1102,6 +1107,7 @@ class AgentService:
 
 上下文材料：
 平台功能速查：{AISCL_PLATFORM_GUIDE}
+{selection_context}
 项目任务说明：{self._clip_context(context.get("project_task_context"), 1800)}
 小组当前状态记忆：{self._clip_context(context.get("group_state_context"), 1800)}
 阶段滚动记忆：{self._clip_context(context.get("stage_memory_context"), 1600)}

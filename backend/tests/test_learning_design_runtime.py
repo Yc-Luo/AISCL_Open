@@ -91,7 +91,7 @@ async def test_tutor_rest_fallback_receives_the_same_teacher_graph():
     version = configuration("pipeline")
     version["collaboration_memory_enabled"] = False
     project = SimpleNamespace(id="group-a", experiment_version=version)
-    request = AIChatRequest(project_id="group-a", message="hello", use_rag=False)
+    request = AIChatRequest(project_id="group-a", message="hello", use_rag=False, selected_text="selected {passage}")
     with patch.object(ai.Project, "get", AsyncMock(return_value=project)), patch.object(
         ai, "ensure_project_access", AsyncMock(),
     ), patch.object(
@@ -104,6 +104,7 @@ async def test_tutor_rest_fallback_receives_the_same_teacher_graph():
     assert graph["teacher_orchestration_mode"] == "pipeline"
     assert graph["learning_design_revision"] == "class-revision"
     assert graph["teacher_role_prompts"]["viewpoint_challenger"] == "Check {source} assumptions"
+    assert "selected {passage}" in fallback.await_args.kwargs["context"]["learner_selection_context"]
 
 
 @pytest.mark.asyncio
@@ -159,6 +160,7 @@ async def test_graph_executes_configured_mode_and_treats_braces_as_text(mode, ru
         "ai_scaffold_mode": "multi_agent",
         "graph_version": "legacy-graph",
         "use_rag": False,
+        "learner_selection_context": "selected {passage}",
         **resolve_course_learning_design(version, version["current_stage"]),
     }
     service = agent_module.AgentService()
@@ -190,4 +192,5 @@ async def test_graph_executes_configured_mode_and_treats_braces_as_text(mode, ru
     assert len(prompts) == (1 if mode == "single" else 2)
     assert synthesis.await_count == (0 if mode == "single" else 1)
     assert all("Check {reference} quality." in prompt and "do not send this" not in prompt for prompt in prompts)
+    assert all("selected {passage}" in prompt for prompt in prompts)
     assert any("Check {source} assumptions" in prompt for prompt in prompts)

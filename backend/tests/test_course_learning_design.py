@@ -224,6 +224,19 @@ async def test_snapshot_lifecycle_and_public_projection(mongo_db):
         assert (await Project.get(target.id)).experiment_version["learning_design"] == snapshot
         assert (await client.get(f"{root}/ai-settings")).json() == {"settings": AI_SETTINGS}
 
+        other_design = await client.put(
+            f"/api/v1/courses/{other.id}/learning-design",
+            json={"roles": [], "orchestration_mode": "adaptive", "stages": []},
+        )
+        assert other_design.status_code == 200, other_design.text
+        defaults_only = await client.post(
+            "/api/v1/projects", json={"name": "Defaults-only group", "course_id": str(other.id)},
+        )
+        assert defaults_only.status_code == 201, defaults_only.text
+        default_version = (await Project.get(defaults_only.json()["id"])).experiment_version
+        assert default_version["learning_design"] == other_design.json()["design"]
+        assert default_version["stage_sequence"] == [] and default_version["current_stage"] is None
+
 
 @pytest.mark.parametrize(
     "previous,sequence,current",
