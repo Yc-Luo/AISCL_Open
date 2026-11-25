@@ -7,6 +7,7 @@ from copy import deepcopy
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from app.core.ai_scaffold_mode import normalize_ai_scaffold_mode
 from app.repositories.course import Course
 from app.repositories.system_config import SystemConfig
 from app.repositories.user import User
@@ -126,7 +127,7 @@ class ResearchConfigService:
                     "release_id": release_id,
                     "release_note": release_note,
                     "group_condition": group_condition,
-                    "ai_mode": ai_mode,
+                    "ai_mode": normalize_ai_scaffold_mode(ai_mode),
                     "process_mode": process_mode,
                     "rule_set": rule_set,
                     "stage_sequence": cls.normalize_stage_sequence(stage_sequence),
@@ -303,7 +304,7 @@ class ResearchConfigService:
         """Derive a full experiment-version payload from a compact admin template config."""
         template_key = str(template.get("id") or template.get("version_name") or "default").strip()
         template_label = str(template.get("label") or template.get("teacherSummary") or template_key).strip()
-        ai_mode = str(template.get("aiMode") or template.get("ai_scaffold_mode") or "multi_agent").strip() or "multi_agent"
+        ai_mode = normalize_ai_scaffold_mode(template.get("aiMode") or template.get("ai_scaffold_mode"))
         process_mode = str(template.get("processMode") or template.get("process_scaffold_mode") or "on").strip() or "on"
         group_condition = template.get("groupCondition") or template.get("group_condition")
         rule_set = template.get("ruleSet") or template.get("enabled_rule_set")
@@ -397,7 +398,8 @@ class ResearchConfigService:
         else:
             payload["project_id"] = payload.get("project_id")
 
-        ai_mode = str(payload.get("ai_scaffold_mode") or "multi_agent").strip() or "multi_agent"
+        ai_mode = normalize_ai_scaffold_mode(payload.get("ai_scaffold_mode"))
+        payload["ai_scaffold_mode"] = ai_mode
         process_mode = str(payload.get("process_scaffold_mode") or "on").strip() or "on"
         payload["enabled_scaffold_layers"] = cls._normalize_scaffold_layers(
             payload.get("enabled_scaffold_layers"),
@@ -456,7 +458,7 @@ class ResearchConfigService:
             "version_name": "default",
             "stage_control_mode": "soft_guidance",
             "process_scaffold_mode": "on",
-            "ai_scaffold_mode": "multi_agent",
+            "ai_scaffold_mode": "single_agent",
             "broadcast_stage_updates": True,
             "group_condition": None,
             "enabled_scaffold_layers": [],

@@ -24,7 +24,7 @@ export interface Project {
 export interface ProjectMember {
     user_id: string
     role: 'owner' | 'editor' | 'viewer'
-    joined_at: string
+    joined_at: string | null
 }
 
 export interface CreateProjectData {

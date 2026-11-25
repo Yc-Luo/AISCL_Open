@@ -7,8 +7,8 @@ import { HelpCircle } from 'lucide-react'
 const tabs = [
   { id: 'document' },
   { id: 'inquiry' },
-  { id: 'resources' },
   { id: 'wiki' },
+  { id: 'resources' },
   { id: 'ai' },
   { id: 'dashboard' },
 ]
@@ -66,9 +66,8 @@ export default function TabNavigation({
 
   return (
     <div className="border-b border-gray-200 bg-white">
-      <div className="grid grid-cols-[1fr_auto_1fr] items-center px-3">
-        <div aria-hidden="true" />
-        <nav className="flex min-w-0 items-center justify-center gap-4 overflow-x-auto px-2" aria-label="Tabs">
+      <div className="flex min-w-0 items-center gap-2 px-3">
+        <nav className="flex min-w-0 flex-1 items-center gap-4 overflow-x-auto px-2 lg:justify-center" aria-label="工作区">
           {tabs.filter((tab) => !hiddenTabs.includes(tab.id)).map((tab) => {
             const isRecommended = recommendedTabs.includes(tab.id)
             const isDisabled = disabledTabs.includes(tab.id)

@@ -48,6 +48,7 @@ class CourseUpdateRequest(BaseModel):
     """Course update request schema."""
 
     name: Optional[str] = Field(None, min_length=1, max_length=100)
+    semester: Optional[str] = Field(None, min_length=1)
     description: Optional[str] = None
     experiment_template_key: Optional[str] = None
     initial_task_document_title: Optional[str] = None

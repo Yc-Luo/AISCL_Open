@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import {
     BarChart3,
     BookOpen,
@@ -740,10 +740,12 @@ export default function ProjectMonitor() {
                                         <Button
                                             variant="outline"
                                             className="gap-2"
-                                            onClick={() => navigate(`/project/${selectedProject.id}`)}
+                                            asChild
                                         >
-                                            <Eye className="h-4 w-4" />
-                                            进入观察
+                                            <Link to={`/project/${selectedProject.id}?observe=monitor`} target="_blank" rel="noopener">
+                                                <Eye className="h-4 w-4" />
+                                                新标签页观察
+                                            </Link>
                                         </Button>
                                         <Button
                                             variant="outline"

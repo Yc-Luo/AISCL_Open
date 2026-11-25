@@ -11,7 +11,7 @@ class ProjectMemberResponse(BaseModel):
 
     user_id: str
     role: str
-    joined_at: datetime
+    joined_at: Optional[datetime] = None
 
 
 class ProjectResponse(BaseModel):

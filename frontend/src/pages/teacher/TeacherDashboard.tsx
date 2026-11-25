@@ -82,7 +82,7 @@ export default function TeacherDashboard() {
               </button>
             </div>
             <nav className="flex-1 space-y-2 overflow-y-auto px-4 py-5">
-              <SidebarLink to={ROUTES.TEACHER.OVERVIEW} icon={LayoutDashboard} label="概览" active={isActive(ROUTES.TEACHER.OVERVIEW)} isCollapsed={false} onClick={() => setIsMobileMenuOpen(false)} />
+              <SidebarLink to={ROUTES.TEACHER.OVERVIEW} icon={LayoutDashboard} label="我的班级" active={isActive(ROUTES.TEACHER.OVERVIEW)} isCollapsed={false} onClick={() => setIsMobileMenuOpen(false)} />
               <SidebarLink to={ROUTES.TEACHER.PROJECT_MONITOR} icon={Monitor} label="小组监控" active={isActive(ROUTES.TEACHER.PROJECT_MONITOR)} isCollapsed={false} onClick={() => setIsMobileMenuOpen(false)} />
               <SidebarLink to={ROUTES.TEACHER.PROJECT_MANAGER} icon={Briefcase} label="小组管理" active={isActive(ROUTES.TEACHER.PROJECT_MANAGER)} isCollapsed={false} onClick={() => setIsMobileMenuOpen(false)} />
               <SidebarLink to={ROUTES.TEACHER.CLASS_MANAGEMENT} icon={Users} label="班级管理" active={isActive(ROUTES.TEACHER.CLASS_MANAGEMENT)} isCollapsed={false} onClick={() => setIsMobileMenuOpen(false)} />
@@ -133,7 +133,7 @@ export default function TeacherDashboard() {
           <SidebarLink
             to={ROUTES.TEACHER.OVERVIEW}
             icon={LayoutDashboard}
-            label="概览"
+            label="我的班级"
             active={isActive(ROUTES.TEACHER.OVERVIEW)}
             isCollapsed={isCollapsed}
           />

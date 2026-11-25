@@ -88,7 +88,7 @@ export const courseService = {
         await api.delete(`/courses/${courseId}`)
     },
 
-    updateCourse: async (courseId: string, data: { name?: string; description?: string; experiment_template_key?: string; initial_task_document_title?: string; initial_task_document_content?: string }) => {
+    updateCourse: async (courseId: string, data: { name?: string; semester?: string; description?: string; experiment_template_key?: string; initial_task_document_title?: string; initial_task_document_content?: string }) => {
         const response = await api.put(`/courses/${courseId}`, data)
         return response.data
     },

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import re
 from typing import Any, Dict, List, Optional
 
+from app.core.ai_scaffold_mode import normalize_ai_scaffold_mode
 from app.repositories.learning_object_memory import LearningObjectMemory
 from app.repositories.project import Project
 
@@ -33,8 +34,7 @@ SOURCE_QUALITY = {
 
 def is_experimental_memory_enabled(experiment_version: Optional[dict]) -> bool:
     """Return true only for the multi-agent experimental memory condition."""
-    mode = str((experiment_version or {}).get("ai_scaffold_mode") or "").strip().lower()
-    return mode in {"multi_agent", "multi", "multiagent", "multi_ai"}
+    return normalize_ai_scaffold_mode((experiment_version or {}).get("ai_scaffold_mode")) == "multi_agent"
 
 
 def resolve_condition_type(experiment_version: Optional[dict]) -> str:

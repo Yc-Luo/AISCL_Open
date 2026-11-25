@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   SendHorizontal,
   Bot,
@@ -38,21 +38,47 @@ interface ChatPanelProps {
 }
 
 const getMessageKey = (message: ChatMessage): string => message.client_message_id || message.id
+const rememberMessage = (keys: Set<string>, message: ChatMessage) => {
+  keys.add(message.id)
+  keys.add(getMessageKey(message))
+}
 const AI_TYPING_LABEL = 'AISCL智能助手'
 const AI_TYPING_ALIASES = ['AISCL智能助手', '智能助手', 'AI智能助手']
 const AI_ASSISTANT_NAME = 'AISCL智能助手'
 const MAX_CHAT_IMAGE_BYTES = 10 * 1024 * 1024
-const compareChatMessages = (currentUserId?: string) => (a: ChatMessage, b: ChatMessage) => {
+const compareChatMessages = (a: ChatMessage, b: ChatMessage) => {
   const timeDiff = getChatTimestampMs(a.timestamp) - getChatTimestampMs(b.timestamp)
   if (timeDiff !== 0) return timeDiff
-  const rank = (message: ChatMessage) => {
-    if (message.user_id === currentUserId) return 1
-    if (message.user_id === 'ai_assistant') return 2
-    return 0
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+}
+
+const mergeHistoryAndLive = (history: ChatMessage[], live: ChatMessage[]) => {
+  const merged = new Map(history.map(message => [getMessageKey(message), message]))
+  const keysById = new Map(history.map(message => [message.id, getMessageKey(message)]))
+  const keysByClientId = new Map(history.map(message => [getMessageKey(message), getMessageKey(message)]))
+  for (const message of live) {
+    const clientKey = getMessageKey(message)
+    const key = keysById.get(message.id) ?? keysByClientId.get(clientKey) ?? clientKey
+    keysById.set(message.id, key)
+    keysByClientId.set(clientKey, key)
+    const saved = merged.get(key)
+    if (!saved) {
+      merged.set(key, message)
+    } else if ((!message.isPending && !message.send_failed) || message.is_recalled) {
+      merged.set(key, {
+        ...saved,
+        ...message,
+        id: saved.id,
+        client_message_id: saved.client_message_id || message.client_message_id,
+        timestamp: saved.timestamp,
+        ai_meta: message.ai_meta ?? saved.ai_meta,
+        teacher_support: message.teacher_support ?? saved.teacher_support,
+        teacher_help_request: message.teacher_help_request ?? saved.teacher_help_request,
+        file_info: message.file_info ?? saved.file_info,
+      })
+    }
   }
-  const rankDiff = rank(a) - rank(b)
-  if (rankDiff !== 0) return rankDiff
-  return getMessageKey(a).localeCompare(getMessageKey(b))
+  return Array.from(merged.values()).sort(compareChatMessages)
 }
 
 interface ProjectMemberRef {
@@ -77,6 +103,23 @@ interface ChatHistoryMessageResponse {
 
 interface ChatHistoryResponse {
   messages: ChatHistoryMessageResponse[]
+  next_cursor?: string | null
+}
+
+const fetchChatHistory = async (projectId: string, cursor: string, signal: AbortSignal) => {
+  const { data } = await api.get<ChatHistoryResponse>(`/chat/projects/${projectId}/messages`, {
+    params: { limit: 50, cursor },
+    signal,
+  })
+  return {
+    nextCursor: data.next_cursor ?? null,
+    messages: data.messages.map(({ created_at, ...message }): ChatMessage => ({
+      ...message,
+      mentions: message.mentions || [],
+      timestamp: normalizeChatTimestamp(created_at),
+      isPending: false,
+    })),
+  }
 }
 
 interface TypingEventPayload {
@@ -85,7 +128,12 @@ interface TypingEventPayload {
   username?: string
 }
 
-export default function ChatPanel({ projectId, isActive = true, onUnreadChange, onMentionNotification }: ChatPanelProps) {
+export default function ChatPanel(props: ChatPanelProps) {
+  // The sync hook owns room-local cache and adapter callbacks.
+  return <ProjectChatPanel key={props.projectId} {...props} />
+}
+
+function ProjectChatPanel({ projectId, isActive = true, onUnreadChange, onMentionNotification }: ChatPanelProps) {
   const [inputValue, setInputValue] = useState('')
   const [showMentionMenu, setShowMentionMenu] = useState(false)
   const [showEmojiPicker, setShowEmojiPicker] = useState(false)
@@ -101,7 +149,15 @@ export default function ChatPanel({ projectId, isActive = true, onUnreadChange, 
   const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null)
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null)
 
-  const messagesEndRef = useRef<HTMLDivElement>(null)
+  const [{ history, nextCursor }, setHistoryPage] = useState<{
+    history: ChatMessage[]
+    nextCursor?: string | null
+  }>({ history: [] })
+  const [headRetry, setHeadRetry] = useState(0)
+  const [historyError, setHistoryError] = useState<'head' | 'older' | null>(null)
+  const [loadingOlder, setLoadingOlder] = useState(false)
+  const olderRequestRef = useRef<AbortController | null>(null)
+  const prependAnchorRef = useRef<{ key?: string; offset: number; height: number; top: number } | null>(null)
   const messageListRef = useRef<HTMLDivElement>(null)
   const contextMenuRef = useRef<HTMLDivElement>(null)
   const autoScrollRef = useRef(true)
@@ -115,21 +171,14 @@ export default function ChatPanel({ projectId, isActive = true, onUnreadChange, 
   const experimentVersionId = useContextStore((state) => state.experimentVersionId)
 
   // Use new Chat Sync Hook
-  const { messages, setMessages, sendMessage, connected } = useChatSync({
+  const { messages, sendMessage, connected } = useChatSync({
     projectId,
   })
-  const displayedMessages = [...messages].sort(compareChatMessages(user?.id))
+  const displayedMessages = useMemo(() => mergeHistoryAndLive(history, messages), [history, messages])
 
   useEffect(() => {
-    knownMessageKeysRef.current = null
-    unreadRef.current = { chatUnread: 0, chatMentions: 0 }
     onUnreadChange?.({ chatUnread: 0, chatMentions: 0 })
-    setLightboxImage(null)
-    setReplyingTo(null)
-    setContextMenu(null)
-    // Only reset transient chat UI when switching projects. Parent callbacks may
-    // be recreated during normal renders; depending on them here closes the image
-    // preview immediately after it opens.
+    // The keyed room instance resets unread state without reacting to callback identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId])
 
@@ -142,23 +191,26 @@ export default function ChatPanel({ projectId, isActive = true, onUnreadChange, 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
     if (!autoScrollRef.current) return
     window.requestAnimationFrame(() => {
-      messagesEndRef.current?.scrollIntoView({ behavior, block: 'end' })
+      const list = messageListRef.current
+      if (list && autoScrollRef.current) list.scrollTo({ top: list.scrollHeight, behavior })
     })
   }, [])
 
   useEffect(() => {
-    const currentKeys = new Set(displayedMessages.map(getMessageKey))
     if (!knownMessageKeysRef.current) {
-      knownMessageKeysRef.current = currentKeys
+      const knownKeys = new Set<string>()
+      messages.forEach(message => rememberMessage(knownKeys, message))
+      knownMessageKeysRef.current = knownKeys
       return
     }
 
+    const knownKeys = knownMessageKeysRef.current
     let unreadDelta = 0
     let mentionDelta = 0
-    displayedMessages.forEach((message) => {
-      const key = getMessageKey(message)
-      if (knownMessageKeysRef.current?.has(key)) return
-      knownMessageKeysRef.current?.add(key)
+    messages.forEach((message) => {
+      const alreadyKnown = knownKeys.has(message.id) || knownKeys.has(getMessageKey(message))
+      rememberMessage(knownKeys, message)
+      if (alreadyKnown) return
 
       const fromSelf = message.user_id === user?.id
       const isSystem = message.message_type === 'system'
@@ -184,13 +236,7 @@ export default function ChatPanel({ projectId, isActive = true, onUnreadChange, 
       }
       onUnreadChange?.(unreadRef.current)
     }
-  }, [displayedMessages, isActive, onMentionNotification, onUnreadChange, user?.id, user?.username])
-
-  const handleMessageListScroll = () => {
-    const el = messageListRef.current
-    if (!el) return
-    autoScrollRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 96
-  }
+  }, [messages, isActive, onMentionNotification, onUnreadChange, user?.id, user?.username])
 
   // Fetch project members for mention list
   useEffect(() => {
@@ -212,72 +258,98 @@ export default function ChatPanel({ projectId, isActive = true, onUnreadChange, 
     }
   }, [projectId])
 
-  // Removed direct socket event listeners (user_joined, user_left) for now
-  // These should be handled by observing Room Store or via SyncService events in the future
-
-  // Fetch historical messages from API
+  // An overlapping refresh keeps the older boundary. A disjoint head must
+  // restart traversal at its own boundary so the gap remains reachable.
   useEffect(() => {
-    let isMounted = true;
     if (!projectId) return
-
-    const fetchMessages = async () => {
-      try {
-        const response = await api.get<ChatHistoryResponse>(`/chat/projects/${projectId}/messages?limit=50`)
-        if (response.data && response.data.messages && isMounted) {
-          // Convert API response to ChatMessage format
-          const history: ChatMessage[] = response.data.messages.map((m) => ({
-            id: m.id,
-            client_message_id: m.client_message_id,
-            user_id: m.user_id,
-            username: m.username,
-            avatar_url: m.avatar_url,
-            content: m.content,
-            message_type: m.message_type,
-            mentions: m.mentions || [],
-            timestamp: normalizeChatTimestamp(m.created_at), // Map created_at to timestamp
-            ai_meta: m.ai_meta,
-            teacher_support: m.teacher_support,
-            teacher_help_request: m.teacher_help_request,
-            file_info: m.file_info,
-            isPending: false
-          })).reverse() // API returns newest first
-
-          setMessages(currentMessages => {
-            // Deduplicate using Map
-            const msgMap = new Map<string, ChatMessage>();
-
-            // 1. Add history first
-            history.forEach((m: ChatMessage) => msgMap.set(getMessageKey(m), m));
-
-            // 2. Add current messages, but do not overwrite persisted history with pending optimistic copies
-            currentMessages.forEach((m: ChatMessage) => {
-              const key = getMessageKey(m)
-              const existing = msgMap.get(key)
-              if (existing && !existing.isPending && m.isPending) {
-                return
-              }
-              msgMap.set(key, existing ? { ...existing, ...m } : m)
-            })
-
-            // 3. Convert back to array and sort by timestamp
-            return Array.from(msgMap.values()).sort((a, b) =>
-              getChatTimestampMs(a.timestamp) - getChatTimestampMs(b.timestamp)
-            );
-          })
+    const request = new AbortController()
+    fetchChatHistory(projectId, '', request.signal).then((page) => {
+      if (request.signal.aborted) return
+      const knownKeys = knownMessageKeysRef.current
+      if (knownKeys) page.messages.forEach(message => rememberMessage(knownKeys, message))
+      setHistoryPage(current => {
+        const previousIds = new Set(current.history.map(message => message.id))
+        const disjointHead = page.nextCursor && !page.messages.some(message => previousIds.has(message.id))
+        return {
+          history: mergeHistoryAndLive(page.messages, current.history),
+          nextCursor: current.nextCursor === undefined || disjointHead ? page.nextCursor : current.nextCursor,
         }
-      } catch (error) {
-        console.error('Failed to fetch chat history:', error)
+      })
+      setHistoryError(current => current === 'head' ? null : current)
+    }).catch((error) => {
+      if (request.signal.aborted) return
+      console.error('Failed to fetch chat history:', error)
+      setHistoryError('head')
+    })
+    return () => request.abort()
+  }, [connected, headRetry, projectId])
+
+  useEffect(() => () => olderRequestRef.current?.abort(), [])
+
+  const loadOlder = async () => {
+    if (!nextCursor || olderRequestRef.current) return
+    const request = new AbortController()
+    olderRequestRef.current = request
+    setLoadingOlder(true)
+    try {
+      const page = await fetchChatHistory(projectId, nextCursor, request.signal)
+      if (request.signal.aborted) return
+      const list = messageListRef.current
+      if (list) {
+        const viewportTop = list.getBoundingClientRect().top
+        const visible = Array.from(list.querySelectorAll<HTMLElement>('[data-chat-message-key]'))
+          .find(row => row.getBoundingClientRect().bottom > viewportTop)
+        prependAnchorRef.current = {
+          key: visible?.dataset.chatMessageKey,
+          offset: visible ? visible.getBoundingClientRect().top - viewportTop : 0,
+          height: list.scrollHeight,
+          top: list.scrollTop,
+        }
+        // Suppress native anchoring only for the manual prepend adjustment.
+        list.style.overflowAnchor = 'none'
       }
+      const knownKeys = knownMessageKeysRef.current
+      if (knownKeys) page.messages.forEach(message => rememberMessage(knownKeys, message))
+      setHistoryPage(current => ({
+        history: mergeHistoryAndLive(current.history, page.messages),
+        nextCursor: current.nextCursor === nextCursor ? page.nextCursor : current.nextCursor,
+      }))
+      setHistoryError(current => current === 'older' ? null : current)
+    } catch (error) {
+      if (request.signal.aborted) return
+      console.error('Failed to fetch older chat history:', error)
+      setHistoryError('older')
+    } finally {
+      if (!request.signal.aborted) setLoadingOlder(false)
     }
+  }
 
-    fetchMessages()
+  const handleMessageListScroll = () => {
+    const list = messageListRef.current
+    if (!list) return
+    autoScrollRef.current = list.scrollHeight - list.scrollTop - list.clientHeight < 96
+    if (!autoScrollRef.current && list.scrollTop <= 48 && !historyError) void loadOlder()
+  }
 
-    return () => { isMounted = false; }
-  }, [connected, projectId, setMessages])
+  useLayoutEffect(() => {
+    if (!loadingOlder) olderRequestRef.current = null
+  }, [loadingOlder, nextCursor, historyError])
 
-  useEffect(() => {
-    scrollToBottom('smooth')
-  }, [messages, scrollToBottom, typingUsers.size])
+  useLayoutEffect(() => {
+    const list = messageListRef.current
+    const anchor = prependAnchorRef.current
+    prependAnchorRef.current = null
+    if (list && anchor) {
+      const row = Array.from(list.querySelectorAll<HTMLElement>('[data-chat-message-key]'))
+        .find(element => element.dataset.chatMessageKey === anchor.key)
+      list.scrollTop = row
+        ? list.scrollTop + row.getBoundingClientRect().top - list.getBoundingClientRect().top - anchor.offset
+        : anchor.top + list.scrollHeight - anchor.height
+      list.style.overflowAnchor = ''
+      return
+    }
+    if (list && autoScrollRef.current) list.scrollTop = list.scrollHeight
+  }, [displayedMessages, typingUsers.size])
 
   useEffect(() => {
     if (!messages.some((msg) => msg.user_id === 'ai_assistant' && msg.content.trim())) return
@@ -342,7 +414,7 @@ export default function ChatPanel({ projectId, isActive = true, onUnreadChange, 
     if (msg.user_id !== user?.id) return
     // Optimistically update or just trigger sync
     try {
-      await sendMessage(msg.id, [], undefined, undefined, true) // Pass msg.id as content for recall
+      await sendMessage(getMessageKey(msg), [], undefined, undefined, true)
       setContextMenu(null)
     } catch (err) {
       console.error('Failed to recall:', err)
@@ -539,7 +611,7 @@ export default function ChatPanel({ projectId, isActive = true, onUnreadChange, 
     setShowEmojiPicker(false)
 
     try {
-      await sendMessage(sendContent, mentions, undefined, previousReplyingTo?.id)
+      await sendMessage(sendContent, mentions, undefined, previousReplyingTo ? getMessageKey(previousReplyingTo) : undefined)
     } catch (error) {
       console.error('Failed to send chat message:', error)
       setInputValue(sendContent)
@@ -693,6 +765,16 @@ export default function ChatPanel({ projectId, isActive = true, onUnreadChange, 
       )}
 
       <div ref={messageListRef} onScroll={handleMessageListScroll} className="flex-1 overflow-y-auto p-4 space-y-2">
+        {(nextCursor || historyError) && (
+          <button
+            type="button"
+            disabled={loadingOlder}
+            onClick={() => historyError === 'head' ? setHeadRetry(value => value + 1) : void loadOlder()}
+            className="mx-auto block h-8 px-3 text-xs text-slate-600 hover:text-indigo-600 disabled:text-slate-400"
+          >
+            {loadingOlder ? '正在加载…' : historyError ? '重试加载历史消息' : '加载较早消息'}
+          </button>
+        )}
         {!connected && (
           <div className="mb-3 rounded-xl border border-amber-100 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800">
             聊天连接暂时中断，恢复后再发送消息。
@@ -720,7 +802,9 @@ export default function ChatPanel({ projectId, isActive = true, onUnreadChange, 
           const isRecent = prevMsg && (getChatTimestampMs(msg.timestamp) - getChatTimestampMs(prevMsg.timestamp) < 300000)
           const shouldShowHeader = !isSameUser || !isRecent || msg.message_type === 'system'
           const showAvatar = msg.message_type !== 'system' && !isOwnMessage && shouldShowHeader
-          const replyMessage = msg.reply_to ? displayedMessages.find(m => m.id === msg.reply_to) : null
+          const replyMessage = msg.reply_to
+            ? displayedMessages.find(m => m.id === msg.reply_to || getMessageKey(m) === msg.reply_to)
+            : null
 
           return (
             <div
@@ -895,7 +979,6 @@ export default function ChatPanel({ projectId, isActive = true, onUnreadChange, 
           </div>
         )}
 
-        <div ref={messagesEndRef} />
       </div>
 
       <div className="p-4 border-t border-gray-100 bg-white relative">

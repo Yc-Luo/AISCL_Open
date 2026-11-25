@@ -8,6 +8,8 @@ import time
 import uuid
 from typing import Any, Dict, Optional
 
+from app.core.ai_scaffold_mode import normalize_ai_scaffold_mode
+
 from app.services.agents.auto_prompt_policy import (
     AUTO_GROUP_PROMPT_RULE_TYPES,
     RULE_TYPE_TO_SUBAGENT,
@@ -45,16 +47,6 @@ MAX_CHAT_FILENAME_CHARS = 255
 GROUP_AI_PEER_MEMORY_LIMIT = 24
 GROUP_AI_INTERACTION_MEMORY_LINE_LIMIT = 16
 GROUP_AI_MEMORY_MESSAGE_CHARS = 420
-
-
-def _normalize_ai_scaffold_mode(value: Optional[str]) -> str:
-    """Normalize experiment AI mode; legacy/null projects use generic AI."""
-    normalized = str(value or "").strip().lower().replace("-", "_")
-    if normalized in {"multi_agent", "multi", "multiagent", "multi_ai"}:
-        return "multi_agent"
-    if normalized in {"single_agent", "single", "singleai", "single_ai", "general_ai"}:
-        return "single_agent"
-    return "single_agent"
 
 
 def _default_chat_model_id(experiment_version: Optional[dict]) -> str:
@@ -139,7 +131,7 @@ def _build_group_ai_meta(selected_subagent: Optional[str], routing_decision: dic
 
 def _extract_routing_context(project: object, content: str) -> dict:
     experiment_version = getattr(project, "experiment_version", None) or {}
-    ai_scaffold_mode = _normalize_ai_scaffold_mode(experiment_version.get("ai_scaffold_mode"))
+    ai_scaffold_mode = normalize_ai_scaffold_mode(experiment_version.get("ai_scaffold_mode"))
     enabled_roles = experiment_version.get("enabled_scaffold_roles") or []
     enabled_subagents = []
     preferred_subagent = None
@@ -349,7 +341,7 @@ async def _evaluate_shadow_prompt_candidates(
 
     current_stage = experiment_version.get("current_stage")
     enabled_rule_set = experiment_version.get("enabled_rule_set")
-    is_multi_agent_mode = experiment_version.get("ai_scaffold_mode") == "multi_agent"
+    is_multi_agent_mode = normalize_ai_scaffold_mode(experiment_version.get("ai_scaffold_mode")) == "multi_agent"
     experiment_version_id = (
         experiment_version.get("version_name")
         or experiment_version.get("name")
@@ -625,9 +617,7 @@ async def _process_ai_reply(
         project = await Project.get(project_id)
         experiment_version = getattr(project, "experiment_version", None) or {}
         current_stage = experiment_version.get("current_stage")
-        ai_scaffold_mode = _normalize_ai_scaffold_mode(
-            experiment_version.get("ai_scaffold_mode") or (routing_context or {}).get("ai_scaffold_mode")
-        )
+        ai_scaffold_mode = normalize_ai_scaffold_mode(experiment_version.get("ai_scaffold_mode"))
         group_memory: Dict[str, Any] = await _build_recent_group_chat_context(
             project_id=project_id,
             current_message_id=current_message_id,
@@ -1262,7 +1252,7 @@ async def handle_chat_op(sio, sid, data, user_id):
                                 **peer_scaffold_signals,
                                 "preferred_subagent": (
                                     _detect_preferred_subagent(content)
-                                    if experiment_version.get("ai_scaffold_mode") == "multi_agent"
+                                    if normalize_ai_scaffold_mode(experiment_version.get("ai_scaffold_mode")) == "multi_agent"
                                     else None
                                 ),
                             },

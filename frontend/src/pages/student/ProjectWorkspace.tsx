@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
-import { useParams } from 'react-router-dom'
+import { Link, Navigate, useParams, useSearchParams } from 'react-router-dom'
+import { ROUTES } from '../../config/routes'
 import Sidebar from '../../components/layout/Sidebar'
 import RightSidebar, { type RightPanel, type RightSidebarBadges } from '../../components/layout/RightSidebar'
 import TabNavigation from '../../components/layout/TabNavigation'
@@ -34,7 +35,7 @@ import {
   type CanonicalStageId,
 } from '../../lib/stageModel'
 import { ConfirmDialog, useToast } from '../../components/ui'
-import { ClipboardList, MessagesSquare, PanelLeftOpen } from 'lucide-react'
+import { ArrowLeft, ClipboardList, MessagesSquare, PanelLeftOpen, X } from 'lucide-react'
 
 const getExperimentVersionSignature = (version: ExperimentVersion | null) => {
   if (!version) return 'null'
@@ -55,7 +56,7 @@ const getExperimentVersionSignature = (version: ExperimentVersion | null) => {
   })
 }
 
-const ALL_NAV_TABS = ['document', 'inquiry', 'resources', 'wiki', 'ai', 'dashboard']
+const ALL_NAV_TABS = ['document', 'inquiry', 'wiki', 'resources', 'ai', 'dashboard']
 
 const STUDENT_ONBOARDING_STEPS = [
   {
@@ -130,7 +131,12 @@ const getVisibleStageSteps = (stageSequence?: string[]) => {
 
 export default function Main() {
   const { projectId } = useParams<{ projectId?: string }>()
-  const [currentProjectId, setCurrentProjectId] = useState<string | undefined>(projectId)
+  const user = useAuthStore((state) => state.user)
+  if (!user || !projectId) return <Navigate to={ROUTES.STUDENT.PROJECT_LIST} replace />
+  return <Workspace key={JSON.stringify([user.id, user.role, projectId])} projectId={projectId} />
+}
+
+function Workspace({ projectId }: { projectId: string }) {
   const [activeTab, setActiveTab] = useState('document')
   const [currentStage, setCurrentStage] = useState<string | null>(null)
   const [isDesktopLayout, setIsDesktopLayout] = useState(() => window.matchMedia('(min-width: 1024px)').matches)
@@ -148,6 +154,7 @@ export default function Main() {
   })
   const [rightSidebarResizing, setRightSidebarResizing] = useState(false)
   const [_project, setProject] = useState<Project | null>(null)
+  const currentProjectId = _project?.id
   const [experimentVersion, setExperimentVersion] = useState<ExperimentVersion | null>(null)
   const [currentDocumentId, setCurrentDocumentId] = useState<string | undefined>(undefined)
   const [documentListOpenOnEntry, setDocumentListOpenOnEntry] = useState(true)
@@ -212,6 +219,10 @@ export default function Main() {
 
   const { connectionStatus } = useSyncStore()
   const { user } = useAuthStore()
+  const [searchParams] = useSearchParams()
+  const observationSource = searchParams.get('observe')
+  const isTeacherView = user?.role === 'teacher' || user?.role === 'admin'
+  const fromProjectManager = observationSource === 'manager'
   const setContextProjectId = useContextStore(state => state.setProjectId)
   const setContextActiveTab = useContextStore(state => state.setActiveTab)
   const setContextCurrentStage = useContextStore(state => state.setCurrentStage)
@@ -238,20 +249,32 @@ export default function Main() {
 
   // Update Context Store
   useEffect(() => {
-    setContextProjectId(currentProjectId || null)
+    if (!currentProjectId) return
+    setContextProjectId(currentProjectId)
+    return () => {
+      useContextStore.setState({
+        projectId: null,
+        activeTab: null,
+        currentStage: null,
+        experimentVersionId: null,
+        documentId: null,
+        documentContent: null,
+        whiteboardSummary: null,
+      })
+    }
   }, [currentProjectId, setContextProjectId])
 
   useEffect(() => {
-    setContextActiveTab(activeTab)
-  }, [activeTab, setContextActiveTab])
+    if (currentProjectId) setContextActiveTab(activeTab)
+  }, [currentProjectId, activeTab, setContextActiveTab])
 
   useEffect(() => {
-    setContextCurrentStage(currentStage)
-  }, [currentStage, setContextCurrentStage])
+    if (currentProjectId) setContextCurrentStage(currentStage)
+  }, [currentProjectId, currentStage, setContextCurrentStage])
 
   useEffect(() => {
-    setContextExperimentVersionId(experimentVersion?.version_name || null)
-  }, [experimentVersion, setContextExperimentVersionId])
+    if (currentProjectId) setContextExperimentVersionId(experimentVersion?.version_name || null)
+  }, [currentProjectId, experimentVersion, setContextExperimentVersionId])
 
   useEffect(() => {
     const configuredStages = experimentVersion?.stage_sequence || []
@@ -372,8 +395,8 @@ export default function Main() {
   }, [activeTab, currentProjectId, currentStage, experimentVersion])
 
   useEffect(() => {
-    setContextDocumentId(currentDocumentId || null)
-  }, [currentDocumentId, setContextDocumentId])
+    if (currentProjectId) setContextDocumentId(currentDocumentId || null)
+  }, [currentProjectId, currentDocumentId, setContextDocumentId])
 
   useEffect(() => {
     if (activeTab === 'document') {
@@ -393,10 +416,9 @@ export default function Main() {
   useBehaviorTracking(currentProjectId || null, activeTab)
   useActivityTracking(currentProjectId || null, activeTab)
 
-  // Initialize SyncService
   useEffect(() => {
-    syncService.init().catch(console.error)
-  }, [])
+    if (currentProjectId) syncService.init().catch(console.error)
+  }, [currentProjectId])
 
   // Handle room joining/leaving at project level
   useEffect(() => {
@@ -586,6 +608,14 @@ export default function Main() {
           return nextVersion
         })
       } catch (error) {
+        if (cancelled) return
+        const status = (error as { response?: { status?: number } })?.response?.status
+        if (status === 401 || status === 403 || status === 404) {
+          setProject(null)
+          setExperimentVersion(null)
+          setWorkspaceError('该小组不存在，或当前账号无权访问。')
+          return
+        }
         console.error('Failed to refresh experiment version:', error)
       }
     }
@@ -612,6 +642,7 @@ export default function Main() {
 
   // Get document ID when switching to document tab
   useEffect(() => {
+    let cancelled = false
     const getDocumentId = async () => {
       if (activeTab !== 'document' || !currentProjectId || currentDocumentId || workspaceLoading || workspaceError) {
         return
@@ -625,27 +656,21 @@ export default function Main() {
           return
         }
         const docsResponse = await documentService.getDocuments(currentProjectId, 0, 1)
+        if (cancelled) return
         if (docsResponse.documents && docsResponse.documents.length > 0) {
           setCurrentDocumentId(docsResponse.documents[0].id)
-        } else {
-          // Create a default document only after project metadata has finished loading.
-          const defaultDoc = await documentService.createDocument(
-            currentProjectId,
-            '小组文档',
-            '',
-            'shared'
-          )
-          setCurrentDocumentId(defaultDoc.id)
         }
       } catch (error) {
+        if (cancelled) return
         console.error('Failed to get/create document:', error)
         setDocumentResolveError('小组文档加载失败，请稍后重试或刷新页面。')
       } finally {
-        setDocumentResolving(false)
+        if (!cancelled) setDocumentResolving(false)
       }
     }
 
     getDocumentId()
+    return () => { cancelled = true }
   }, [activeTab, currentProjectId, currentDocumentId, _project, workspaceError, workspaceLoading, documentRetryToken])
 
   const handleCreateDocumentFromWorkspace = async () => {
@@ -671,51 +696,21 @@ export default function Main() {
       setWorkspaceError(null)
 
       try {
-        let targetProjectId = currentProjectId
-        let targetProject: Project | null = null
-
-        if (!targetProjectId) {
-          const activeProjects = await projectService.getProjects(false)
-          targetProject = activeProjects.projects[0] || null
-
-          if (!targetProject) {
-            const archivedProjects = await projectService.getProjects(true)
-            targetProject = archivedProjects.projects[0] || null
-          }
-
-          if (!targetProject) {
-            throw new Error('当前账号暂无可进入的小组项目。')
-          }
-
-          targetProjectId = targetProject.id
-        }
-
-        const [projectResult, versionResult] = await Promise.allSettled([
-          targetProject ? Promise.resolve(targetProject) : projectService.getProject(targetProjectId),
-          projectService.getExperimentVersion(targetProjectId),
-        ])
-
+        const project = await projectService.getProject(projectId)
         if (cancelled) return
-
-        if (projectResult.status === 'rejected') {
-          throw projectResult.reason
-        }
-
-        setCurrentProjectId(targetProjectId)
-        setProject(projectResult.value)
-
-        if (versionResult.status === 'fulfilled') {
-          setExperimentVersion(versionResult.value)
-        } else {
-          console.error('Failed to get experiment version:', versionResult.reason)
-          setExperimentVersion(null)
-        }
+        const version = await projectService.getExperimentVersion(projectId)
+        if (cancelled) return
+        setProject(project)
+        setExperimentVersion(version)
       } catch (error) {
         if (cancelled) return
         console.error('Failed to load student workspace:', error)
         setProject(null)
         setExperimentVersion(null)
-        setWorkspaceError(error instanceof Error ? error.message : '学生工作台加载失败，请刷新后重试。')
+        const status = (error as { response?: { status?: number } })?.response?.status
+        setWorkspaceError(status === 403 || status === 404
+          ? '该小组不存在，或当前账号无权访问。'
+          : '小组工作台加载失败，请刷新后重试。')
       } finally {
         if (!cancelled) {
           setWorkspaceLoading(false)
@@ -728,7 +723,7 @@ export default function Main() {
     return () => {
       cancelled = true
     }
-  }, [currentProjectId, workspaceReloadToken])
+  }, [projectId, workspaceReloadToken])
 
   const stageToolGuidance = getStageToolGuidance(currentStage)
   const stageControlMode = experimentVersion?.stage_control_mode || 'soft_guidance'
@@ -824,6 +819,30 @@ export default function Main() {
 
   return (
     <div className="relative h-[100dvh] min-h-0 flex flex-col bg-gray-100">
+      {isTeacherView && (
+        <nav aria-label="教师观察导航" className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b border-slate-200 bg-white px-4 py-2 text-sm">
+          {(observationSource === 'monitor' || fromProjectManager) && (
+            <button type="button" onClick={() => window.close()} className="inline-flex items-center gap-1.5 font-semibold text-indigo-700 hover:underline">
+              <X className="h-4 w-4" />
+              关闭观察页，返回原标签页
+            </button>
+          )}
+          <Link
+            reloadDocument
+            to={fromProjectManager ? ROUTES.TEACHER.PROJECT_MANAGER : ROUTES.TEACHER.PROJECT_MONITOR}
+            className="inline-flex items-center gap-1.5 text-slate-700 hover:underline"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            {fromProjectManager ? '返回小组管理' : '返回小组观察'}
+          </Link>
+        </nav>
+      )}
+      {!isTeacherView && (
+        <Link to={ROUTES.STUDENT.PROJECT_LIST} className="flex shrink-0 items-center gap-1.5 border-b bg-white px-4 py-2 text-sm font-semibold text-indigo-700 hover:underline">
+          <ArrowLeft className="h-4 w-4" />
+          返回我的小组
+        </Link>
+      )}
       {/* Connection Status Banner */}
       <ConnectionStatusBanner
         yjsConnected={connectionStatus === 'connected'}
@@ -834,7 +853,7 @@ export default function Main() {
 
       {/* Main Content Area */}
       <div className="relative flex-1 flex min-h-0 overflow-hidden">
-        <div className="pointer-events-none absolute left-2 right-2 top-2 z-20 flex justify-between lg:hidden">
+        {currentProjectId && <div className="pointer-events-none absolute left-2 right-2 top-2 z-20 flex justify-between lg:hidden">
           <button
             type="button"
             onClick={() => setLeftSidebarOpen(true)}
@@ -851,8 +870,8 @@ export default function Main() {
             <MessagesSquare className="h-3.5 w-3.5" />
             聊天/支持
           </button>
-        </div>
-        {leftSidebarOpen && (
+        </div>}
+        {currentProjectId && leftSidebarOpen && (
           <button
             type="button"
             aria-label="关闭左侧栏"
@@ -860,7 +879,7 @@ export default function Main() {
             className="absolute inset-0 z-30 bg-slate-900/20 backdrop-blur-[1px] lg:hidden"
           />
         )}
-        {rightSidebarOpen && (
+        {currentProjectId && rightSidebarOpen && (
           <button
             type="button"
             aria-label="关闭右侧栏"
@@ -869,7 +888,7 @@ export default function Main() {
           />
         )}
         {/* Left Sidebar */}
-        {leftSidebarOpen && (
+        {currentProjectId && leftSidebarOpen && (
           <div className="absolute inset-y-0 left-0 z-40 w-[min(18rem,86vw)] flex-shrink-0 shadow-2xl transition-all duration-300 lg:relative lg:z-auto lg:w-auto lg:shadow-none">
             <Sidebar
               projectId={currentProjectId}
@@ -878,7 +897,7 @@ export default function Main() {
             />
           </div>
         )}
-        {!leftSidebarOpen && (
+        {currentProjectId && !leftSidebarOpen && (
           <div className="hidden w-12 shrink-0 border-r border-slate-200 bg-white lg:flex lg:flex-col lg:items-center lg:py-3">
             <button
               type="button"
@@ -1145,7 +1164,7 @@ export default function Main() {
         </div>
 
         {/* Right Sidebar */}
-        {isDesktopLayout && (
+        {currentProjectId && isDesktopLayout && (
           <div
             className="relative flex-shrink-0 shadow-none"
             style={{ width: rightSidebarOpen ? rightSidebarWidth : 48 }}
@@ -1180,7 +1199,7 @@ export default function Main() {
             />
           </div>
         )}
-        {!isDesktopLayout && rightSidebarOpen && (
+        {currentProjectId && !isDesktopLayout && rightSidebarOpen && (
           <div
             className="absolute inset-y-0 right-0 z-40 flex-shrink-0 shadow-2xl"
             style={{ width: `min(${rightSidebarWidth}px, 92vw)` }}
@@ -1208,7 +1227,7 @@ export default function Main() {
           onOpenTutor={() => setActiveTab('ai')}
         />
       )}
-      {onboardingOpen && (
+      {currentProjectId && onboardingOpen && (
         <div className="pointer-events-none fixed inset-0 z-50">
           <div
             className={`pointer-events-auto absolute w-[min(22rem,calc(100vw-2rem))] rounded-2xl border border-indigo-100 bg-white p-4 shadow-2xl shadow-slate-900/15 ${GUIDE_CARD_PLACEMENT_CLASS[STUDENT_ONBOARDING_STEPS[onboardingStep].placement]}`}

@@ -9,9 +9,8 @@ export class ProjectApi {
         this.client = client
     }
 
-    async getProjects(archived?: boolean): Promise<{ projects: Project[], total: number }> {
-        const config = archived === undefined ? undefined : { params: { archived } }
-        return this.client.get(API_ENDPOINTS.PROJECTS.BASE, config)
+    async getProjects(archived?: boolean, skip?: number): Promise<{ projects: Project[], total: number }> {
+        return this.client.get(API_ENDPOINTS.PROJECTS.BASE, { params: { archived, skip } })
     }
 
     async getProject(id: string): Promise<Project> {

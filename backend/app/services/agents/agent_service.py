@@ -10,6 +10,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
+from app.core.ai_scaffold_mode import normalize_ai_scaffold_mode
 from app.core.config import settings
 from app.core.llm_config import get_llm, resolve_role_model_id
 from app.core.llm_runtime import get_group_lock, guarded_ainvoke, guarded_astream
@@ -411,7 +412,7 @@ class AgentService:
 
     def _is_stage_aware_graph(self, context: Optional[Dict[str, Any]]) -> bool:
         graph_version = str((context or {}).get("graph_version") or "").strip()
-        ai_scaffold_mode = str((context or {}).get("ai_scaffold_mode") or "").strip()
+        ai_scaffold_mode = normalize_ai_scaffold_mode((context or {}).get("ai_scaffold_mode"))
         if graph_version == "research-graph-v3-stage-aware":
             return True
         # Older local/cloud projects often have multi_agent enabled before graph_version existed.

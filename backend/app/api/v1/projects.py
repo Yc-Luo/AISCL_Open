@@ -4,7 +4,7 @@ import logging
 import secrets
 from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 
 from app.api.v1.auth import get_current_user
 from app.core.config import settings
@@ -93,6 +93,11 @@ async def refresh_stage_memory_after_transition(project_id: str, previous_stage:
     """Refresh previous-stage memory without blocking the stage-switch request."""
     try:
         from app.services.group_memory_service import group_memory_service
+        from app.services.learning_object_memory_service import is_experimental_memory_enabled
+
+        project = await Project.get(project_id)
+        if not project or not is_experimental_memory_enabled(project.experiment_version):
+            return
 
         await group_memory_service.maybe_refresh_stage_memory(
             project_id=project_id,
@@ -183,6 +188,7 @@ async def validate_project_leader(project: Project, leader_id: Optional[str]) ->
 
 @router.get("", response_model=ProjectListResponse)
 async def get_projects(
+    response: Response,
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=100),
     archived: Optional[bool] = None,
@@ -206,15 +212,17 @@ async def get_projects(
             {"members.user_id": str(current_user.id)},
             {"course_id": {"$in": teacher_course_ids}},
         ]
-    # Admins can see all projects
+    elif current_user.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unsupported project role")
 
     if archived is not None:
         query["is_archived"] = archived
 
-    projects_cursor = Project.find(query).skip(skip).limit(limit)
+    projects_cursor = Project.find(query).sort("_id").skip(skip).limit(limit)
     projects_list = await projects_cursor.to_list()
     total = await Project.find(query).count()
 
+    response.headers["Cache-Control"] = "no-store"
     return ProjectListResponse(
         projects=[
             build_project_response(p)
@@ -410,6 +418,7 @@ async def join_project_by_group_code(
 @router.get("/{project_id}", response_model=ProjectResponse)
 async def get_project(
     project_id: str,
+    response: Response,
     current_user: User = Depends(get_current_user),
 ) -> ProjectResponse:
     """Get project details."""
@@ -423,6 +432,7 @@ async def get_project(
     # Check permission
     await ensure_project_access(current_user, project)
 
+    response.headers["Cache-Control"] = "no-store"
     return build_project_response(project)
 
 
@@ -518,6 +528,7 @@ async def delete_project(
 @router.get("/{project_id}/experiment-version", response_model=ExperimentVersionResponse)
 async def get_experiment_version(
     project_id: str,
+    response: Response,
     current_user: User = Depends(get_current_user),
 ) -> ExperimentVersionResponse:
     """Get experiment-version configuration for a project."""
@@ -530,6 +541,7 @@ async def get_experiment_version(
 
     await ensure_project_access(current_user, project)
     payload = await project_service.get_experiment_version(project)
+    response.headers["Cache-Control"] = "no-store"
     return ExperimentVersionResponse(**payload)
 
 

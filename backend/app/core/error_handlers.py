@@ -15,7 +15,7 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
     """Handle HTTP exceptions with proper logging and response formatting."""
     logger.warning(
         f"HTTP Exception: {exc.status_code} - {exc.detail} "
-        f"(Path: {request.url.path}, Method: {request.method}, Client: {request.client.host})"
+        f"(Path: {request.url.path}, Method: {request.method}, Client: {request.client.host if request.client else 'unknown'})"
     )
 
     return JSONResponse(
@@ -89,7 +89,7 @@ async def general_exception_handler(request: Request, exc: Exception) -> JSONRes
     """Handle general exceptions with proper logging."""
     logger.error(
         f"Unhandled Exception: {type(exc).__name__}: {str(exc)} "
-        f"(Path: {request.url.path}, Method: {request.method}, Client: {request.client.host})",
+        f"(Path: {request.url.path}, Method: {request.method}, Client: {request.client.host if request.client else 'unknown'})",
         exc_info=True
     )
 

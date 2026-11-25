@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
 from app.api.v1.auth import get_current_user
+from app.core.ai_scaffold_mode import normalize_ai_scaffold_mode
 from app.core.security import limiter
 from app.core.permissions import can_manage_project_scope, check_project_member_permission
 from app.repositories.ai_conversation import AIConversation
@@ -51,7 +52,7 @@ SUBAGENT_VIEW_LABELS: Dict[str, str] = {
 
 
 def _ai_scaffold_mode(experiment_version: Optional[dict]) -> str:
-    return str((experiment_version or {}).get("ai_scaffold_mode") or "single_agent").strip().lower()
+    return normalize_ai_scaffold_mode((experiment_version or {}).get("ai_scaffold_mode"))
 
 
 def _is_multi_agent_mode(experiment_version: Optional[dict]) -> bool:
@@ -222,19 +223,23 @@ async def _build_project_ai_context(
     base_context: Optional[dict],
 ) -> dict:
     """Attach task brief and shared group-stage memory to student AI context."""
-    stage_id = chat_data.current_stage or (project.experiment_version or {}).get("current_stage")
-    group_id = f"project:{str(project.id)}"
-    stage_memory = await group_memory_service.get_stage_memory_context(
-        project_id=str(project.id),
-        group_id=group_id,
-        stage_id=stage_id,
-    )
-    group_state = await group_memory_service.refresh_and_get_group_state_context(
-        project_id=str(project.id),
-        group_id=group_id,
-        stage_id=stage_id,
-        project=project,
-    )
+    experiment_version = project.experiment_version or {}
+    stage_memory = {}
+    group_state = {}
+    if _is_multi_agent_mode(experiment_version):
+        stage_id = chat_data.current_stage or experiment_version.get("current_stage")
+        group_id = f"project:{project.id}"
+        stage_memory = await group_memory_service.get_stage_memory_context(
+            project_id=str(project.id),
+            group_id=group_id,
+            stage_id=stage_id,
+        )
+        group_state = await group_memory_service.refresh_and_get_group_state_context(
+            project_id=str(project.id),
+            group_id=group_id,
+            stage_id=stage_id,
+            project=project,
+        )
     project_task_context = await group_memory_service.get_project_task_context(project)
     contextual_notes = []
     if chat_data.context_source:
@@ -651,7 +656,7 @@ async def chat_stream(
                     else None
                 ),
                 "graph_version": experiment_version.get("graph_version"),
-                "ai_scaffold_mode": experiment_version.get("ai_scaffold_mode"),
+                "ai_scaffold_mode": _ai_scaffold_mode(experiment_version),
                 "process_scaffold_mode": experiment_version.get("process_scaffold_mode"),
                 "current_stage": chat_data.current_stage,
                 "enabled_rule_set": chat_data.enabled_rule_set,

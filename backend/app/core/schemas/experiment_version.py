@@ -20,7 +20,7 @@ class ExperimentVersionUpdateRequest(BaseModel):
     )
     stage_control_mode: str = Field(default="soft_guidance", pattern="^(soft_guidance|hard_constraint)$")
     process_scaffold_mode: str = Field(default="on", pattern="^(on|off)$")
-    ai_scaffold_mode: str = Field(default="multi_agent", pattern="^(single_agent|multi_agent)$")
+    ai_scaffold_mode: str = Field(default="single_agent", pattern="^(single_agent|multi_agent)$")
     broadcast_stage_updates: bool = True
     group_condition: Optional[str] = Field(default=None, max_length=50, alias="condition_group")
     enabled_scaffold_layers: List[str] = Field(default_factory=list)
@@ -60,7 +60,7 @@ class ExperimentVersionResponse(BaseModel):
     version_name: str = Field(default="default")
     stage_control_mode: str = Field(default="soft_guidance", pattern="^(soft_guidance|hard_constraint)$")
     process_scaffold_mode: str = Field(default="on", pattern="^(on|off)$")
-    ai_scaffold_mode: str = Field(default="multi_agent", pattern="^(single_agent|multi_agent)$")
+    ai_scaffold_mode: str = Field(default="single_agent", pattern="^(single_agent|multi_agent)$")
     broadcast_stage_updates: bool = True
     group_condition: Optional[str] = None
     enabled_scaffold_layers: List[str] = Field(default_factory=list)

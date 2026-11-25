@@ -22,7 +22,7 @@ const StudentList = lazy(() => import('../components/features/teacher/studentlis
 const ProjectManager = lazy(() => import('../components/features/teacher/projectmanager/ProjectManager'))
 const ProjectDashboard = lazy(() => import('../components/features/teacher/studentanalytics/ProjectDashboard'))
 const TeacherSettings = lazy(() => import('../components/features/teacher/settings/TeacherSettings'))
-const DashboardOverview = lazy(() => import('../components/features/teacher/overview/DashboardOverview'))
+const TeacherClasses = lazy(() => import('../pages/teacher/TeacherClasses'))
 const CourseResource = lazy(() => import('../components/features/teacher/courseresource/CourseResource'))
 const CourseTaskRelease = lazy(() => import('../components/features/teacher/taskrelease/CourseTaskRelease'))
 const AssignmentReview = lazy(() => import('../components/features/teacher/assignmentreview/AssignmentReview'))
@@ -153,7 +153,7 @@ export function Router() {
         }
       >
         <Route index element={<Navigate to="overview" replace />} />
-        <Route path="overview" element={<DashboardOverview />} />
+        <Route path="overview/:courseId?" element={<TeacherClasses />} />
         <Route path="class-manager" element={<ClassManagement />} />
         <Route path="student-list" element={<StudentList />} />
         <Route path="project-manager" element={<ProjectManager />} />

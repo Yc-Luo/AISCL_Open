@@ -1,10 +1,11 @@
 """Chat log API routes."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import uuid
 from typing import Optional
 
+from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.v1.auth import get_current_user
@@ -143,15 +144,23 @@ def build_help_request_response(
     )
 
 
-@router.get("/projects/{project_id}/messages", response_model=ChatLogListResponse)
+class ChatCursorListResponse(ChatLogListResponse):
+    next_cursor: str | None
+
+
+@router.get(
+    "/projects/{project_id}/messages",
+    response_model=ChatCursorListResponse | ChatLogListResponse,
+)
 async def get_chat_messages(
     project_id: str,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
     message_type: Optional[str] = Query(None, pattern="^(text|system|ai|file)$"),
     current_user: User = Depends(get_current_user),
+    cursor: Optional[str] = Query(None, max_length=80),
 ) -> ChatLogListResponse:
-    """Get chat messages for a project with pagination."""
+    """Fetch newest-first history. Pass cursor="" to start cursor pagination."""
     # Check project access
     project = await Project.get(project_id)
     if not project:
@@ -175,11 +184,40 @@ async def get_chat_messages(
     if message_type:
         query["message_type"] = message_type
 
-    # Get messages (most recent first)
-    messages_cursor = (
-        ChatLog.find(query).skip(skip).limit(limit).sort("-created_at")
+    page_query = query
+    if cursor is not None and skip:
+        raise HTTPException(status_code=422, detail="Cannot combine cursor and skip")
+    if cursor:
+        try:
+            timestamp, object_id = cursor.split("|")
+            created_at = datetime.fromisoformat(timestamp)
+            if not ObjectId.is_valid(object_id):
+                raise ValueError("Invalid message ID")
+            if created_at.tzinfo is not None:
+                created_at = created_at.astimezone(timezone.utc).replace(tzinfo=None)
+        except (ValueError, OverflowError):
+            raise HTTPException(status_code=422, detail="Invalid chat cursor") from None
+        boundary_id = ObjectId(object_id)
+        page_query = {
+            **query,
+            "$or": [
+                {"created_at": {"$lt": created_at}},
+                {"created_at": created_at, "_id": {"$lt": boundary_id}},
+            ],
+        }
+
+    messages_list = await (
+        ChatLog.find(page_query)
+        .sort("-created_at", "-_id")
+        .skip(skip)
+        .limit(limit + int(cursor is not None))
+        .to_list()
     )
-    messages_list = await messages_cursor.to_list()
+    next_cursor = None
+    if len(messages_list) > limit:
+        messages_list = messages_list[:limit]
+        last = messages_list[-1]
+        next_cursor = f"{last.created_at.isoformat()}|{last.id}"
     total = await ChatLog.find(query).count()
 
     # Get user info for messages
@@ -192,18 +230,15 @@ async def get_chat_messages(
     )
     users = {}
     if user_ids:
-        import bson
-        from app.repositories.user import User
-
         # Convert string IDs to ObjectIds for lookup
-        object_ids = [bson.ObjectId(uid) for uid in user_ids if bson.ObjectId.is_valid(uid)]
+        object_ids = [ObjectId(uid) for uid in user_ids if ObjectId.is_valid(uid)]
         user_list = await User.find({"_id": {"$in": object_ids}}).to_list()
         users = {str(u.id): u for u in user_list}
 
-    return ChatLogListResponse(
-        messages=[build_chat_response(msg, users) for msg in messages_list],
-        total=total,
-    )
+    messages = [build_chat_response(msg, users) for msg in messages_list]
+    if cursor is not None:
+        return ChatCursorListResponse(messages=messages, total=total, next_cursor=next_cursor)
+    return ChatLogListResponse(messages=messages, total=total)
 
 
 @router.get(

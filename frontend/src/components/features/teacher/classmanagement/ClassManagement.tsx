@@ -48,6 +48,9 @@ const DEFAULT_TASK_CONTENT = '请在这里填写本次活动或项目的完整�
 
 export default function ClassManagement() {
     const navigate = useNavigate();
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const currentSemester = `${currentYear} ${now.getMonth() < 8 ? '春季' : '秋季'}`;
     const [searchQuery, setSearchQuery] = useState('');
     const [courses, setCourses] = useState<Course[]>([]);
     const [loading, setLoading] = useState(true);
@@ -59,7 +62,7 @@ export default function ClassManagement() {
 
     // Form states
     const [name, setName] = useState('');
-    const [semester, setSemester] = useState('2026 春季');
+    const [semester, setSemester] = useState(currentSemester);
     const [description, setDescription] = useState('');
     const [experimentTemplateKey, setExperimentTemplateKey] = useState('');
     const [initialTaskTitle, setInitialTaskTitle] = useState(DEFAULT_TASK_TITLE);
@@ -68,6 +71,12 @@ export default function ClassManagement() {
     const [notice, setNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
     const [pendingDeleteCourse, setPendingDeleteCourse] = useState<Course | null>(null);
     const [deletingCourse, setDeletingCourse] = useState(false);
+    const semesterOptions = [...new Set([
+        ...Array.from({ length: 6 }, (_, index) => currentYear + 2 - index)
+            .flatMap(year => [`${year} 秋季`, `${year} 春季`]),
+        ...courses.map(course => course.semester).filter(Boolean),
+        semester,
+    ])];
 
     const fetchCourses = async () => {
         try {
@@ -157,6 +166,7 @@ export default function ClassManagement() {
             setSubmitting(true);
             await courseService.updateCourse(selectedCourse.id, {
                 name,
+                semester: semester === selectedCourse.semester ? undefined : semester,
                 description,
                 experiment_template_key: experimentTemplateKey || undefined,
                 initial_task_document_title: initialTaskTitle || undefined,
@@ -192,7 +202,7 @@ export default function ClassManagement() {
 
     const resetForm = () => {
         setName('');
-        setSemester('2026 春季');
+        setSemester(currentSemester);
         setDescription('');
         setExperimentTemplateKey('');
         setInitialTaskTitle(DEFAULT_TASK_TITLE);
@@ -290,7 +300,7 @@ export default function ClassManagement() {
                         </div>
                         <div>
                             <p className="text-xs font-bold text-slate-400 uppercase tracking-widest">当前学期</p>
-                            <p className="text-2xl font-bold text-slate-900">2026 春季</p>
+                            <p className="text-2xl font-bold text-slate-900">{currentSemester}</p>
                         </div>
                     </div>
                 </div>
@@ -438,10 +448,7 @@ export default function ClassManagement() {
                                 onChange={e => setSemester(e.target.value)}
                                 className="w-full px-3 py-2 bg-slate-50 border-none rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
                             >
-                                <option>2026 春季</option>
-                                <option>2025 秋季</option>
-                                <option>2025 春季</option>
-                                <option>2024 秋季</option>
+                                {semesterOptions.map(option => <option key={option} value={option} disabled={!option}>{option || '（未设置）'}</option>)}
                             </select>
                         </div>
                         <div className="space-y-2">
@@ -504,7 +511,7 @@ export default function ClassManagement() {
                         <DialogHeader>
                             <DialogTitle className="text-2xl font-bold">修改班级信息</DialogTitle>
                             <DialogDescription className="text-slate-500 mt-2">
-                            更新班级名称、实验模板以及项目说明内容。项目说明会同步到学生端小组文档，作为任务理解与问题构建的起点。
+                            更新班级名称、学期、实验模板以及项目说明内容。项目说明会同步到学生端小组文档，作为任务理解与问题构建的起点。
                             </DialogDescription>
                         </DialogHeader>
                     <form onSubmit={handleUpdate} className="space-y-6 mt-6">
@@ -517,6 +524,17 @@ export default function ClassManagement() {
                                 onChange={e => setName(e.target.value)}
                                 className="rounded-xl bg-slate-50 border-none"
                             />
+                        </div>
+                        <div className="space-y-2">
+                            <label htmlFor="edit-course-semester" className="text-sm font-bold text-slate-800">所属学期</label>
+                            <select
+                                id="edit-course-semester"
+                                value={semester}
+                                onChange={e => setSemester(e.target.value)}
+                                className="w-full px-3 py-2 bg-slate-50 border-none rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
+                            >
+                                {semesterOptions.map(option => <option key={option} value={option} disabled={!option}>{option || '（未设置）'}</option>)}
+                            </select>
                         </div>
                         <div className="space-y-2">
                             <label htmlFor="edit-course-description" className="text-sm font-bold text-slate-800">描述</label>

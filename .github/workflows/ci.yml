@@ -14,6 +14,14 @@ jobs:
   backend-test:
     name: Backend Checks
     runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:7.0
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok'"
+          --health-interval 5s --health-timeout 5s --health-retries 12
 
     steps:
       - uses: actions/checkout@v4
@@ -33,6 +41,16 @@ jobs:
           python -m pip install --upgrade pip poetry
           poetry check --lock
 
+      - name: Test API and AI isolation
+        working-directory: ./backend
+        env:
+          CHAT_TEST_MONGODB_URI: mongodb://127.0.0.1:27017
+          SECRET_KEY: ephemeral-ci-test-secret-not-for-deployment
+          JWT_SECRET_KEY: ephemeral-ci-jwt-secret-not-for-deployment
+        run: |
+          poetry install --no-root
+          poetry run python -m pytest -q tests
+
   frontend-test:
     name: Frontend Build
     runs-on: ubuntu-latest
@@ -49,6 +67,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci --legacy-peer-deps
+
+      - name: Test frontend interactions
+        run: npm --workspace frontend run test -- --run
 
       - name: Build frontend
         run: npm --workspace frontend run build

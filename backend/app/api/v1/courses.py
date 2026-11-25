@@ -233,6 +233,8 @@ async def update_course(
 
     if course_data.name:
         course.name = course_data.name
+    if course_data.semester is not None:
+        course.semester = course_data.semester
     if course_data.description is not None:
         course.description = course_data.description
     if "experiment_template_key" in course_data.model_fields_set:

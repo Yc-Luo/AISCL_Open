@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+from app.core.ai_scaffold_mode import normalize_ai_scaffold_mode
 from app.repositories.collaboration_snapshot import CollaborationSnapshot
 from app.repositories.course import Course
 from app.repositories.document import Document
@@ -23,7 +24,7 @@ class ProjectService:
             "version_name": "default",
             "stage_control_mode": "soft_guidance",
             "process_scaffold_mode": "on",
-            "ai_scaffold_mode": "multi_agent",
+            "ai_scaffold_mode": "single_agent",
             "broadcast_stage_updates": True,
             "group_condition": None,
             "enabled_scaffold_layers": [],
@@ -66,6 +67,7 @@ class ProjectService:
 
         payload = ProjectService.build_default_experiment_version(str(project.id))
         payload.update(dict(project.experiment_version))
+        payload["ai_scaffold_mode"] = normalize_ai_scaffold_mode(payload.get("ai_scaffold_mode"))
         payload["project_id"] = str(project.id)
         return payload
 
@@ -76,6 +78,9 @@ class ProjectService:
         if project.experiment_version:
             experiment_version.update(dict(project.experiment_version))
         experiment_version.update(dict(data))
+        experiment_version["ai_scaffold_mode"] = normalize_ai_scaffold_mode(
+            experiment_version.get("ai_scaffold_mode")
+        )
         experiment_version["project_id"] = str(project.id)
         experiment_version["updated_at"] = datetime.utcnow()
         project.experiment_version = experiment_version

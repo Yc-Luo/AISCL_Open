@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { Link, useNavigate } from 'react-router-dom'
 import { LogIn, Plus, Users, X } from 'lucide-react'
 import { projectService, ProjectListResponse } from '../../services/api/project'
 import { Course, courseService } from '../../services/api/course'
@@ -8,6 +8,11 @@ import { useAuthStore } from '../../stores/authStore'
 type GroupAction = 'join-course' | 'create-group' | 'join-group'
 
 export default function ProjectList() {
+  const user = useAuthStore((state) => state.user)
+  return user ? <AccountProjectList key={JSON.stringify([user.id, user.role])} /> : null
+}
+
+function AccountProjectList() {
   const [projects, setProjects] = useState<ProjectListResponse | null>(null)
   const [courses, setCourses] = useState<Course[]>([])
   const [loading, setLoading] = useState(true)
@@ -18,38 +23,52 @@ export default function ProjectList() {
   const [groupCode, setGroupCode] = useState('')
   const [notice, setNotice] = useState<string | null>(null)
   const [activeAction, setActiveAction] = useState<GroupAction | null>(null)
+  const [reload, setReload] = useState(0)
   const navigate = useNavigate()
-  const { user, fetchUser } = useAuthStore()
-
-  const loadData = async () => {
-    try {
-      // Fetch both active and archived projects
-      const [activeData, archivedData, courseData] = await Promise.all([
-        projectService.getProjects(false),
-        projectService.getProjects(true),
-        user?.role === 'student' ? courseService.getCourses() : Promise.resolve([] as Course[])
-      ])
-
-      setProjects({
-        projects: [...activeData.projects, ...archivedData.projects],
-        total: activeData.total + archivedData.total
-      })
-      setCourses(courseData)
-      if (!selectedCourseId && courseData.length > 0) {
-        setSelectedCourseId(courseData[0].id)
-      }
-    } catch (error) {
-      console.error('Failed to fetch projects:', error)
-      setNotice('数据加载失败，请刷新后重试。')
-    } finally {
-      setLoading(false)
-    }
+  const user = useAuthStore((state) => state.user)
+  const mounted = useRef(false)
+  useLayoutEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
+  const isCurrentAccount = () => {
+    const current = useAuthStore.getState().user
+    return mounted.current && current?.id === user?.id && current?.role === user?.role
   }
 
   useEffect(() => {
-    loadData()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user?.role])
+    let cancelled = false
+    const loadProjects = async () => {
+      try {
+        const first = await projectService.getProjects()
+        const entries = [...first.projects]
+        for (let skip = entries.length; skip > 0 && skip < first.total && !cancelled;) {
+          const page = await projectService.getProjects(undefined, skip)
+          if (!page.projects.length) break
+          entries.push(...page.projects)
+          skip += page.projects.length
+        }
+        if (!cancelled) {
+          const unique = [...new Map(entries.map((project) => [project.id, project])).values()]
+          unique.sort((a, b) => Number(a.is_archived) - Number(b.is_archived))
+          setProjects({ projects: unique, total: first.total })
+        }
+      } catch {
+        if (!cancelled) setProjects(null)
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    void loadProjects()
+    if (user?.role === 'student') {
+      void courseService.getCourses().then((data) => {
+        if (!cancelled) setCourses(data)
+      }).catch(() => {
+        if (!cancelled) setNotice('课程加载失败，请刷新后重试。')
+      })
+    }
+    return () => { cancelled = true }
+  }, [user?.role, reload])
 
   const handleJoinCourse = async () => {
     if (!courseInviteCode.trim()) return
@@ -57,9 +76,9 @@ export default function ProjectList() {
     setNotice(null)
     try {
       await courseService.joinCourse(courseInviteCode)
+      if (!isCurrentAccount()) return
       setCourseInviteCode('')
-      await fetchUser()
-      await loadData()
+      setReload((previous) => previous + 1)
       setActiveAction(null)
       setNotice('已加入课程，可以创建或加入该课程下的小组。')
     } catch (error: any) {
@@ -82,7 +101,7 @@ export default function ProjectList() {
         description: '',
         course_id: selectedCourseId || undefined,
       })
-      navigate(`/project/${newProject.id}`)
+      if (isCurrentAccount()) navigate(`/project/${newProject.id}`)
     } catch (error: any) {
       console.error('Failed to create project:', error)
       setNotice(error.response?.data?.detail || '创建小组失败。')
@@ -103,7 +122,7 @@ export default function ProjectList() {
         course_id: selectedCourseId,
         group_code: groupCode.trim().toUpperCase(),
       })
-      navigate(`/project/${project.id}`)
+      if (isCurrentAccount()) navigate(`/project/${project.id}`)
     } catch (error: any) {
       setNotice(error.response?.data?.detail || '加入小组失败，请检查小组码。')
     } finally {
@@ -172,7 +191,15 @@ export default function ProjectList() {
           </div>
         )}
 
-        {projects && projects.projects.length === 0 ? (
+        {!projects ? (
+          <div role="alert" className="py-12 text-center text-gray-600">
+            小组列表加载失败。
+            <button type="button" className="ml-2 text-indigo-700 underline" onClick={() => {
+              setLoading(true)
+              setReload((previous) => previous + 1)
+            }}>重试</button>
+          </div>
+        ) : projects.projects.length === 0 ? (
           <div className="text-center py-12">
             <p className="text-gray-600 mb-4">还没有小组</p>
             {user?.role === 'student' && (
@@ -188,17 +215,17 @@ export default function ProjectList() {
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {projects?.projects.map((project) => (
-              <div
+            {projects.projects.map((project) => (
+              <Link
                 key={project.id}
-                onClick={() => navigate(`/project/${project.id}`)}
+                to={`/project/${project.id}`}
                 className="bg-white rounded-lg shadow p-6 cursor-pointer hover:shadow-lg transition-shadow"
               >
                 <div className="flex items-center justify-between mb-2">
                   <h3 className="text-lg font-semibold truncate flex-1 mr-2">{project.name}</h3>
                   {project.is_archived && (
                     <span className="shrink-0 px-2 py-0.5 bg-emerald-50 text-emerald-600 text-[10px] font-bold rounded-md border border-emerald-100 italic">
-                      已提交
+                      已归档
                     </span>
                   )}
                 </div>
@@ -217,7 +244,7 @@ export default function ProjectList() {
                     {getLearningMemberCount(project)} 名成员
                   </div>
                 </div>
-              </div>
+              </Link>
             ))}
           </div>
         )}
@@ -274,7 +301,7 @@ export default function ProjectList() {
                   {courses.map((course) => (
                     <option key={course.id} value={course.id}>{course.name}（{course.semester}）</option>
                   ))}
-                  {courses.length === 0 && <option value="">请先加入课程</option>}
+                  <option value="" disabled>请选择课程</option>
                 </select>
                 <input
                   value={projectName}
@@ -285,7 +312,7 @@ export default function ProjectList() {
                 <button
                   type="button"
                   onClick={handleCreateProject}
-                  disabled={actionLoading || courses.length === 0}
+                  disabled={actionLoading || !selectedCourseId}
                   className="w-full rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
                 >
                   {actionLoading ? '创建中...' : '创建小组'}
@@ -303,7 +330,7 @@ export default function ProjectList() {
                   {courses.map((course) => (
                     <option key={course.id} value={course.id}>{course.name}（{course.semester}）</option>
                   ))}
-                  {courses.length === 0 && <option value="">请先加入课程</option>}
+                  <option value="" disabled>请选择课程</option>
                 </select>
                 <input
                   value={groupCode}
@@ -314,7 +341,7 @@ export default function ProjectList() {
                 <button
                   type="button"
                   onClick={handleJoinProject}
-                  disabled={actionLoading || courses.length === 0 || !groupCode.trim()}
+                  disabled={actionLoading || !selectedCourseId || !groupCode.trim()}
                   className="w-full rounded-lg border border-indigo-100 bg-indigo-50 px-4 py-2 text-sm font-semibold text-indigo-700 hover:bg-indigo-100 disabled:opacity-50"
                 >
                   {actionLoading ? '加入中...' : '加入小组'}

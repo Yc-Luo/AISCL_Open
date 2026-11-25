@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { ArchiveRestore, FolderPlus, Search, Eye, BarChart2, MoreVertical, Users, Clock } from 'lucide-react';
 import { Button, Input, Badge, ConfirmDialog } from '../../../ui';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { projectService } from '../../../../services/api/project';
 import { Project } from '../../../../types';
 import ProjectEditModal from './ProjectEditModal';
@@ -9,6 +9,8 @@ import { courseService, Course } from '../../../../services/api/course';
 
 export default function ProjectManager() {
     const navigate = useNavigate();
+    const [params, setParams] = useSearchParams();
+    const courseFilter = params.get('course') || '';
     const [searchQuery, setSearchQuery] = useState('');
     const [filterStatus, setFilterStatus] = useState<'all' | 'active' | 'completed'>('all');
     const [projects, setProjects] = useState<Project[]>([]);
@@ -29,7 +31,14 @@ export default function ProjectManager() {
                 projectService.getProjects(),
                 courseService.getCourses().catch(() => [] as Course[]),
             ]);
-            setProjects(projectData.projects);
+            const allProjects = [...projectData.projects];
+            for (let skip = allProjects.length; skip > 0 && skip < projectData.total;) {
+                const page = await projectService.getProjects(undefined, skip);
+                if (!page.projects.length) break;
+                allProjects.push(...page.projects);
+                skip += page.projects.length;
+            }
+            setProjects([...new Map(allProjects.map(project => [project.id, project])).values()]);
             setCourses(courseData);
         } catch (error) {
             console.error('Failed to fetch projects:', error);
@@ -94,7 +103,8 @@ export default function ProjectManager() {
             (filterStatus === 'active' && !project.is_archived) ||
             (filterStatus === 'completed' && project.is_archived);
 
-        return matchesSearch && matchesStatus;
+        const matchesCourse = !courseFilter || (project.course_id || 'unbound') === courseFilter;
+        return matchesSearch && matchesStatus && matchesCourse;
     });
     const courseMap = new Map(courses.map(course => [course.id, course]));
     const groupedProjects = filteredProjects.reduce<Array<{ key: string; title: string; subtitle: string; projects: Project[] }>>((groups, project) => {
@@ -151,7 +161,27 @@ export default function ProjectManager() {
 
             {/* Filters */}
             <div className="bg-white rounded-lg border border-gray-200 p-4 shadow-sm">
-                <div className="flex flex-col md:flex-row gap-4 justify-between">
+                <div className="flex flex-wrap items-center gap-3">
+                    <select
+                        aria-label="按班级筛选"
+                        className="max-w-full min-w-0 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+                        value={courseFilter}
+                        onChange={(event) => {
+                            const next = new URLSearchParams(params);
+                            if (event.target.value) next.set('course', event.target.value);
+                            else next.delete('course');
+                            setParams(next, { replace: true });
+                        }}
+                    >
+                        <option value="">全部班级</option>
+                        {courseFilter && courseFilter !== 'unbound' && !courseMap.has(courseFilter) &&
+                            <option value={courseFilter}>当前班级</option>}
+                        {courses.map(course => (
+                            <option key={course.id} value={course.id}>{course.name}{course.semester ? ` · ${course.semester}` : ''}</option>
+                        ))}
+                        {(courseFilter === 'unbound' || projects.some(project => !project.course_id)) &&
+                            <option value="unbound">未绑定班级</option>}
+                    </select>
                     <div className="relative flex-1 max-w-md">
                         <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
                         <Input
@@ -237,10 +267,13 @@ export default function ProjectManager() {
                                     variant="outline"
                                     size="sm"
                                     className="flex-1 gap-1.5"
-                                    onClick={() => navigate(`/project/${project.id}`)}
+                                    asChild
                                 >
-                                    <Eye className="w-4 h-4" />
-                                    监控
+                                    <Link to={`/project/${project.id}?observe=manager`} target="_blank" rel="noopener">
+                                        <Eye className="w-4 h-4" />
+                                        观察
+                                        <span className="sr-only">（新标签页）</span>
+                                    </Link>
                                 </Button>
                                 <Button
                                     variant="outline"
