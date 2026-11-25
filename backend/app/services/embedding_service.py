@@ -129,22 +129,32 @@ class EmbeddingService:
         if not settings.RAG_VECTOR_ENABLED:
             return []
         if config.provider == "minimax" and config.api_key:
-            return await EmbeddingService._embed_with_minimax(
+            vectors = await EmbeddingService._embed_with_minimax(
                 cleaned_texts,
                 config=config,
                 purpose=purpose,
             )
-        if (
+        elif (
             config.provider in {"openai", "openai_compatible", "openai-compatible"}
             and config.api_key
         ):
-            return await EmbeddingService._embed_with_openai_compatible(
+            vectors = await EmbeddingService._embed_with_openai_compatible(
                 cleaned_texts,
                 config=config,
             )
 
-        logger.warning("Unsupported or incomplete embedding provider: %s", config.provider)
-        return []
+        else:
+            logger.warning("Unsupported or incomplete embedding provider: %s", config.provider)
+            return []
+
+        if len(vectors) != len(cleaned_texts) or any(not vector for vector in vectors):
+            logger.warning(
+                "Expected one nonempty embedding per input (%d); received %d vectors",
+                len(cleaned_texts),
+                len(vectors),
+            )
+            return []
+        return vectors
 
     @staticmethod
     def _resolve_embedding_endpoint(base_url: str) -> str:

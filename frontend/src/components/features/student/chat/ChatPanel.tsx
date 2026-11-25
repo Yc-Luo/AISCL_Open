@@ -15,6 +15,8 @@ import {
   Undo2
 } from 'lucide-react'
 import { storageService } from '../../../../services/api/storage'
+import { getResourceImageId } from '../../../../lib/resourceImage'
+import ResourceImage from '../../../ui/ResourceImage'
 import { syncService } from '../../../../services/sync/SyncService'
 
 import { useAuthStore } from '../../../../stores/authStore'
@@ -142,7 +144,7 @@ function ProjectChatPanel({ projectId, isActive = true, onUnreadChange, onMentio
   const [typingUsers, setTypingUsers] = useState<Set<string>>(new Set())
 
   // New States for Lightbox, Context Menu, and Reply
-  const [lightboxImage, setLightboxImage] = useState<{ url: string, name: string } | null>(null)
+  const [lightboxImage, setLightboxImage] = useState<{ url: string; name: string; resourceId?: string } | null>(null)
   const [lightboxZoom, setLightboxZoom] = useState(1)
   const [lightboxRotation, setLightboxRotation] = useState(0)
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, message: ChatMessage } | null>(null)
@@ -387,14 +389,25 @@ function ProjectChatPanel({ projectId, isActive = true, onUnreadChange, onMentio
   }
 
   // Lightbox Handlers
-  const handleDownload = (url: string, name: string) => {
-    const link = document.createElement('a')
-    link.href = url
-    link.download = name
-    link.target = '_blank'
-    document.body.appendChild(link)
-    link.click()
-    document.body.removeChild(link)
+  const handleDownload = async ({ url, name, resourceId }: NonNullable<typeof lightboxImage>) => {
+    const id = getResourceImageId(url, resourceId)
+    let objectUrl: string | undefined
+    try {
+      if (id) objectUrl = URL.createObjectURL(await storageService.viewResourceImage(id))
+      const link = document.createElement('a')
+      link.href = objectUrl || url
+      link.download = name
+      link.target = '_blank'
+      link.rel = 'noopener noreferrer'
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+    } catch {
+      setToast({ message: '图片下载失败，请检查权限或稍后重试。', type: 'error' })
+    } finally {
+      const downloadUrl = objectUrl
+      if (downloadUrl) window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000)
+    }
   }
 
   // Context Menu Handlers
@@ -706,7 +719,7 @@ function ProjectChatPanel({ projectId, isActive = true, onUnreadChange, onMentio
               </button>
               <button
                 type="button"
-                onClick={() => handleDownload(lightboxImage.url, lightboxImage.name)}
+                onClick={() => void handleDownload(lightboxImage)}
                 className="p-2 text-white/70 hover:text-white transition-colors"
                 title="Download"
               >
@@ -724,8 +737,9 @@ function ProjectChatPanel({ projectId, isActive = true, onUnreadChange, onMentio
           </div>
 
           <div className="flex-1 w-full flex items-center justify-center p-12 overflow-auto">
-            <img
+            <ResourceImage
               src={lightboxImage.url}
+              resourceId={lightboxImage.resourceId}
               className="max-w-full max-h-full transition-transform duration-300 shadow-2xl"
               style={{ transform: `scale(${lightboxZoom}) rotate(${lightboxRotation}deg)` }}
               alt="Preview"
@@ -926,8 +940,10 @@ function ProjectChatPanel({ projectId, isActive = true, onUnreadChange, onMentio
                     {/* Image Rendering */}
                     {msg.message_type === 'file' && msg.file_info && (
                       <div className="mt-1">
-                        <img
+                        <ResourceImage
                           src={msg.file_info.url}
+                          resourceId={msg.file_info.resource_id}
+                          loading="lazy"
                           alt={msg.file_info.name}
                           className="max-w-full rounded-lg border border-gray-100 shadow-sm cursor-zoom-in hover:brightness-95 transition-all"
                           onLoad={() => {
@@ -936,7 +952,9 @@ function ProjectChatPanel({ projectId, isActive = true, onUnreadChange, onMentio
                           onClick={(event) => {
                             event.preventDefault()
                             event.stopPropagation()
-                            setLightboxImage({ url: msg.file_info!.url, name: msg.file_info!.name })
+                            setLightboxImage({
+                              url: msg.file_info!.url, name: msg.file_info!.name, resourceId: msg.file_info!.resource_id,
+                            })
                             setLightboxZoom(1)
                             setLightboxRotation(0)
                           }}

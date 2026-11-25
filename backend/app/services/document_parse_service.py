@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import re
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -153,59 +154,54 @@ class DocumentParseService:
         if not resource:
             return False
 
-        config = await self.get_mineru_config()
+        fallback_text = fallback_text.strip()
         if not self.can_parse_with_mineru(resource.mime_type, resource.filename):
-            resource.parse_status = "unsupported"
-            resource.parse_provider = "local"
-            resource.parse_error = None
-            await resource.save()
-            if fallback_text:
-                return await rag_service.process_resource(resource_id, fallback_text)
-            return False
+            return await self._index_local_text(resource, fallback_text)
 
-        if not config.enabled:
-            resource.parse_status = "unsupported"
-            resource.parse_provider = "mineru"
-            resource.parse_error = "MinerU is not configured"
-            await resource.save()
-            if fallback_text:
-                return await rag_service.process_resource(resource_id, fallback_text)
-            return False
-
-        resource.parse_status = "parsing"
+        config = await self.get_mineru_config()
         resource.parse_provider = "mineru"
-        resource.parse_error = None
-        await resource.save()
+        if not config.enabled:
+            if fallback_text:
+                return await self._index_local_text(resource, fallback_text)
+            await resource.set_rag_status("disabled", "MinerU is not configured")
+            return False
+
+        await resource.set_rag_status("parsing")
 
         try:
             markdown, zip_bytes, content_json = await self._parse_with_mineru(resource, config)
-            if not markdown:
-                raise ValueError("MinerU result did not contain Markdown content")
-
             base_key = self._parsed_result_prefix(resource)
-            markdown_key = f"{base_key}/full.md"
             zip_key = f"{base_key}/mineru_result.zip"
-            storage_service.upload_file_bytes(markdown_key, markdown.encode("utf-8"), "text/markdown")
             storage_service.upload_file_bytes(zip_key, zip_bytes, "application/zip")
-            resource.parsed_markdown_key = markdown_key
             resource.parsed_zip_key = zip_key
-            if content_json:
+            if markdown is not None:
+                markdown_key = f"{base_key}/full.md"
+                storage_service.upload_file_bytes(markdown_key, markdown.encode("utf-8"), "text/markdown")
+                resource.parsed_markdown_key = markdown_key
+            if content_json is not None:
                 content_key = f"{base_key}/content_list.json"
                 storage_service.upload_file_bytes(content_key, content_json, "application/json")
                 resource.parsed_content_key = content_key
-            resource.parse_status = "indexed"
-            resource.parse_error = None
-            resource.parsed_at = datetime.utcnow()
-            await resource.save()
-            return await rag_service.process_resource(resource_id, markdown)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("MinerU parsing failed for resource %s: %s", resource_id, exc)
-            resource.parse_status = "failed"
-            resource.parse_error = str(exc)[:1000]
-            await resource.save()
+        except Exception as exc:
+            logger.warning("MinerU parsing or artifact storage failed for resource %s: %s", resource_id, exc)
             if fallback_text:
-                return await rag_service.process_resource(resource_id, fallback_text)
+                return await self._index_local_text(resource, fallback_text)
+            await resource.set_rag_status("failed", "MinerU parsing or artifact storage failed")
             return False
+
+        resource.parsed_at = datetime.utcnow()
+        # MinerU can emit bare image references without any readable text.
+        content = re.sub(r"!\[\s*\]\([^\n)]*\)", "", markdown or "").strip()
+        if not content and fallback_text:
+            return await self._index_local_text(resource, fallback_text)
+        return await rag_service.index_resource(resource, content)
+
+    @staticmethod
+    async def _index_local_text(resource: Resource, content: str) -> bool:
+        resource.parse_provider = "local"
+        if content and resource.parsed_at is None:
+            resource.parsed_at = datetime.utcnow()
+        return await rag_service.index_resource(resource, content)
 
     @staticmethod
     def _parsed_result_prefix(resource: Resource) -> str:
@@ -213,7 +209,7 @@ class DocumentParseService:
             return f"courses/{resource.course_id}/parsed/{resource.id}"
         return f"projects/{resource.project_id}/parsed/{resource.id}"
 
-    async def _parse_with_mineru(self, resource: Resource, config: MinerUConfig) -> tuple[str, bytes, Optional[bytes]]:
+    async def _parse_with_mineru(self, resource: Resource, config: MinerUConfig) -> tuple[Optional[str], bytes, Optional[bytes]]:
         file_url = storage_service.generate_presigned_get_url(
             resource.file_key,
             expires_in=max(config.timeout_seconds + 600, 1800),
@@ -299,15 +295,13 @@ class DocumentParseService:
         return f"{base}/api/v4"
 
     @staticmethod
-    def _extract_mineru_zip(zip_bytes: bytes) -> tuple[str, Optional[bytes]]:
+    def _extract_mineru_zip(zip_bytes: bytes) -> tuple[Optional[str], Optional[bytes]]:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
             names = archive.namelist()
             markdown_name = next((name for name in names if name.endswith("full.md")), None)
             if not markdown_name:
                 markdown_name = next((name for name in names if name.lower().endswith(".md")), None)
-            if not markdown_name:
-                raise ValueError("MinerU zip has no Markdown file")
-            markdown = archive.read(markdown_name).decode("utf-8", errors="ignore").strip()
+            markdown = archive.read(markdown_name).decode("utf-8", errors="ignore") if markdown_name else None
             content_name = next((name for name in names if name.endswith("_content_list.json") or name.endswith("content_list.json")), None)
             content_json = archive.read(content_name) if content_name else None
             return markdown, content_json

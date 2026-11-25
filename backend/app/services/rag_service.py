@@ -5,6 +5,7 @@ disabled because they pull large ML/CUDA wheels during Docker build, which is
 too costly for the teaching-experiment server.
 """
 
+import logging
 import re
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +19,8 @@ from app.services.research_event_service import research_event_service
 from app.services.vector_store_service import vector_store_service
 from app.services.web_search_service import web_search_service
 from app.services.wiki_service import wiki_service
+
+logger = logging.getLogger(__name__)
 
 
 class RAGService:
@@ -35,16 +38,29 @@ class RAGService:
         content: str,
         chunk_size: Optional[int] = None,
         overlap: Optional[int] = None,
-    ):
+    ) -> bool:
         """Index an uploaded resource into the external vector store."""
         resource = await Resource.get(resource_id)
         if not resource:
             return False
+        return await RAGService.index_resource(
+            resource, content, chunk_size=chunk_size, overlap=overlap
+        )
 
+    @staticmethod
+    async def index_resource(
+        resource: Resource,
+        content: str,
+        *,
+        chunk_size: Optional[int] = None,
+        overlap: Optional[int] = None,
+    ) -> bool:
+        """Index extracted text and persist the ingestion status on its resource."""
         index_project_id = resource.project_id
         if resource.scope == "course" and resource.course_id:
             index_project_id = RAGService.course_resource_namespace(resource.course_id)
         if not index_project_id:
+            await resource.set_rag_status("failed", "Resource has no vector namespace")
             return False
 
         return await RAGService.index_text(
@@ -64,6 +80,7 @@ class RAGService:
             },
             chunk_size=chunk_size,
             overlap=overlap,
+            resource=resource,
         )
 
     @staticmethod
@@ -106,6 +123,7 @@ class RAGService:
         stage_id: Optional[str] = None,
         chunk_size: Optional[int] = None,
         overlap: Optional[int] = None,
+        resource: Optional[Resource] = None,
     ) -> bool:
         """Chunk, embed, and index text into Qdrant."""
         chunks = RAGService._chunk_text(
@@ -114,10 +132,31 @@ class RAGService:
             overlap=overlap if overlap is not None else settings.RAG_CHUNK_OVERLAP,
         )
         if not chunks:
+            if resource is not None:
+                await resource.set_rag_status("no_text")
             return False
 
-        vectors = await embedding_service.embed_texts(chunks)
-        if not vectors:
+        if not vector_store_service.is_enabled() or not await embedding_service.is_enabled():
+            if resource is not None:
+                await resource.set_rag_status("disabled", "Vector search is not configured")
+            return False
+
+        if resource is not None:
+            await resource.set_rag_status("embedding")
+        try:
+            vectors = await embedding_service.embed_texts(chunks)
+        except Exception as exc:
+            logger.warning("Embedding failed for %s %s: %s", source_type, source_id, exc)
+            if resource is not None:
+                await resource.set_rag_status("failed", "Embedding failed")
+            return False
+        if len(vectors) != len(chunks) or any(not vector for vector in vectors):
+            logger.warning(
+                "Expected %d nonempty vectors for %s %s; received %d",
+                len(chunks), source_type, source_id, len(vectors),
+            )
+            if resource is not None:
+                await resource.set_rag_status("failed", "Embedding did not return one vector per chunk")
             return False
 
         points = []
@@ -139,7 +178,15 @@ class RAGService:
                 },
             })
 
-        return await vector_store_service.upsert_points(points)
+        if resource is not None:
+            await resource.set_rag_status("indexing")
+        indexed = await vector_store_service.upsert_points(points)
+        if resource is not None:
+            if indexed:
+                await resource.set_rag_status("indexed")
+            else:
+                await resource.set_rag_status("failed", "Vector indexing failed")
+        return indexed
 
     @staticmethod
     def _chunk_text(text: str, *, chunk_size: int, overlap: int) -> List[str]:

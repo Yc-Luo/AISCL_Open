@@ -3,10 +3,11 @@
 import logging
 import asyncio
 from typing import Dict, Tuple
+from anyio import CancelScope
 from fastapi import WebSocket, WebSocketDisconnect, Query, status
 
 from app.services.auth_service import verify_token
-from app.services.room_mapping_service import validate_room_access
+from app.services.room_mapping_service import room_access_lock, validate_room_access
 from app.services.collaboration_service import collaboration_service
 
 # ypy-websocket integration
@@ -24,15 +25,35 @@ class FastAPIWebsocketAdapter:
     """Adapter to make FastAPI WebSocket compatible with ypy-websocket."""
     def __init__(self, websocket: WebSocket):
         self._ws = websocket
+        self.revoked = False
+        self.serve_scope = CancelScope()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> bytes:
+        return await self.recv()
 
     async def send(self, message: bytes):
-        await self._ws.send_bytes(message)
+        if not self.revoked:
+            await self._ws.send_bytes(message)
 
     async def recv(self) -> bytes:
+        if self.revoked:
+            raise StopAsyncIteration
         try:
-            return await self._ws.receive_bytes()
+            message = await self._ws.receive_bytes()
         except WebSocketDisconnect:
-            raise StopAsyncIteration()
+            raise StopAsyncIteration from None
+        if self.revoked:
+            raise StopAsyncIteration
+        return message
+
+    async def close_revoked(self) -> None:
+        try:
+            await self._ws.close(code=status.WS_1008_POLICY_VIOLATION)
+        except (WebSocketDisconnect, OSError, RuntimeError):
+            logger.debug("Revoked Yjs socket was already closing", exc_info=True)
 
     @property
     def path(self):
@@ -52,6 +73,26 @@ rooms: Dict[str, YRoom] = {}
 room_connection_counts: Dict[str, int] = {}
 room_observers: Dict[str, object] = {}
 rooms_lock = asyncio.Lock()
+user_rooms: Dict[str, Dict[str, set[FastAPIWebsocketAdapter]]] = {}
+
+
+def get_user_rooms(user_id: str) -> set[str]:
+    return set(user_rooms.get(user_id, ()))
+
+
+async def revoke_rooms(user_id: str, room_ids: set[str]) -> None:
+    subscriptions = user_rooms.get(user_id, {})
+    adapters = [
+        adapter
+        for room_id in room_ids
+        for adapter in subscriptions.get(room_id, ())
+        if not adapter.revoked
+    ]
+    # Stop serving immediately, without waiting for the peer to acknowledge close.
+    for adapter in adapters:
+        adapter.revoked = True
+        adapter.serve_scope.cancel()
+    await asyncio.gather(*(adapter.close_revoked() for adapter in adapters))
 
 
 def parse_room_name(room_name: str) -> Tuple[str, str]:
@@ -192,37 +233,46 @@ async def websocket_endpoint(websocket: WebSocket, room_name: str, token: str = 
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    # Validate room access
-    try:
-        has_access = await validate_room_access(room_name, user_id)
-        if not has_access:
-            logger.warning("Access denied for user %s to room: %s", user_id, room_name)
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+    async with room_access_lock(user_id):
+        try:
+            has_access = await validate_room_access(room_name, user_id)
+            if not has_access:
+                logger.warning("Access denied for user %s to room: %s", user_id, room_name)
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+        except Exception as e:
+            logger.error("Error validating room access for user %s to room %s: %s", user_id, room_name, str(e))
+            await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
             return
-        logger.debug("Access granted for user %s to room: %s", user_id, room_name)
-    except Exception as e:
-        logger.error("Error validating room access for user %s to room %s: %s", user_id, room_name, str(e))
-        await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
-        return
 
-    # Accept WebSocket connection
-    try:
-        await websocket.accept()
-        logger.info("WebSocket connection established for user %s in room: %s", user_id, room_name)
-    except Exception as e:
-        logger.error("Failed to accept WebSocket connection for user %s in room %s: %s", user_id, room_name, str(e))
-        return
+        try:
+            await websocket.accept()
+        except Exception as e:
+            logger.error("Failed to accept WebSocket connection for user %s in room %s: %s", user_id, room_name, str(e))
+            return
 
-    room = await get_or_create_room(room_name)
+        room = await get_or_create_room(room_name)
+        adapter = FastAPIWebsocketAdapter(websocket)
+        user_rooms.setdefault(user_id, {}).setdefault(room_name, set()).add(adapter)
+
     snapshot_type, project_id = parse_room_name(room_name)
-    
-    adapter = FastAPIWebsocketAdapter(websocket)
     try:
-        await room.serve(adapter)
+        with adapter.serve_scope:
+            await room.serve(adapter)
     except Exception as e:
         if not isinstance(e, StopAsyncIteration):
             logger.warning(f"WebSocket session ended for room {room_name}: {e}")
     finally:
+        # ypy-websocket's normal client cleanup can be skipped by cancellation.
+        if adapter in room.clients:
+            room.clients.remove(adapter)
+        subscriptions = user_rooms[user_id]
+        subscriptions[room_name].remove(adapter)
+        if not subscriptions[room_name]:
+            del subscriptions[room_name]
+        if not subscriptions:
+            del user_rooms[user_id]
+
         # Save state on disconnect to ensure data is captured immediately
         # Bypassing debounce to prevent data loss on page refresh
         try:

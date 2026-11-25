@@ -101,9 +101,17 @@ class VectorStoreService:
                         f"/collections/{settings.QDRANT_COLLECTION}/points"
                     ),
                     headers=VectorStoreService._headers(),
+                    params={"wait": "true"},
                     json={"points": points},
                 )
                 response.raise_for_status()
+                data = response.json()
+                if (
+                    data.get("status") != "ok"
+                    or (data.get("result") or {}).get("status") != "completed"
+                ):
+                    logger.warning("Qdrant upsert did not report completion")
+                    return False
                 return True
         except Exception as exc:
             logger.warning("Qdrant upsert failed: %s", exc)

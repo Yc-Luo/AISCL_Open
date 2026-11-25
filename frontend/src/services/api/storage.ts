@@ -20,6 +20,13 @@ export const storageService = {
     return `${apiBase}${API_ENDPOINTS.RESOURCES}/resources/${resourceId}/view`
   },
 
+  async viewResourceImage(resourceId: string, signal?: AbortSignal): Promise<Blob> {
+    const response = await api.get<Blob>(`${API_ENDPOINTS.RESOURCES}/resources/${resourceId}/view`, {
+      responseType: 'blob', signal, params: { authenticated: '1' },
+    })
+    return response.data
+  },
+
   async getResources(
     projectId: string,
     options?: { includeCourseResources?: boolean }

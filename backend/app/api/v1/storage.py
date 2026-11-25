@@ -4,7 +4,6 @@ import hashlib
 import os
 import mimetypes
 import uuid
-from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -493,36 +492,20 @@ async def _create_resource_from_uploaded_object(
             resource = await Resource.get(resource_id)
             if not resource:
                 return
-            file_bytes = await run_in_threadpool(storage_service.get_file_bytes, file_key)
             text_content = ""
             if text_extraction_service.can_extract(normalized_mime_type, resource_data.filename):
+                file_bytes = await run_in_threadpool(storage_service.get_file_bytes, file_key)
                 text_content = text_extraction_service.extract_text(
                     file_bytes,
                     normalized_mime_type,
                     resource_data.filename,
                 )
-            if not text_content:
-                text_content = (
-                    f"资源文件：{resource_data.filename}\n"
-                    f"类型：{normalized_mime_type}\n"
-                    "该文件暂未抽取正文，可作为资源库引用来源。"
-                )
-            if document_parse_service.can_parse_with_mineru(normalized_mime_type, resource_data.filename):
-                await document_parse_service.process_resource(resource_id, fallback_text=text_content)
-            else:
-                indexed = await rag_service.process_resource(resource_id, text_content)
-                resource.parse_status = "indexed" if indexed else "unsupported"
-                resource.parse_provider = "local"
-                resource.parse_error = None if indexed else "No indexable text was produced"
-                resource.parsed_at = datetime.utcnow() if indexed else None
-                await resource.save()
+            await document_parse_service.process_resource(resource_id, fallback_text=text_content)
         except Exception as exc:
             print(f"Resource RAG indexing skipped: {exc}")
             resource = await Resource.get(resource_id)
             if resource:
-                resource.parse_status = "failed"
-                resource.parse_error = str(exc)[:1000]
-                await resource.save()
+                await resource.set_rag_status("failed", "Resource processing failed")
 
     if resource.source_type in {"library", "ai_knowledge"}:
         background_tasks.add_task(process_resource_task, str(resource.id), resource.file_key)
@@ -805,21 +788,17 @@ async def _ensure_resource_download_access(current_user: User, resource: Resourc
 
 @router.get("/resources/{resource_id}/view")
 async def view_resource(
-    resource_id: str
+    resource_id: str,
+    current_user: User = Depends(get_current_user),
 ):
-    """View image resources by proxying from storage.
-
-    This endpoint remains unauthenticated because editor image tags cannot attach
-    Bearer headers. To avoid exposing arbitrary active content, only validated
-    image resources are served here. Other resources must use the authenticated
-    download endpoint.
-    """
+    """Stream a validated image after checking the same scope as downloads."""
     resource = await Resource.get(resource_id)
     if not resource:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Resource not found",
         )
+    await _ensure_resource_download_access(current_user, resource)
 
     normalized_mime_type = _normalize_mime_type(resource.mime_type)
     if normalized_mime_type not in INLINE_IMAGE_MIME_TYPES:
@@ -837,9 +816,10 @@ async def view_resource(
             )
 
         # Get object stream from storage
-        response = storage_service.client.get_object(
+        response = await run_in_threadpool(
+            storage_service.client.get_object,
             settings.MINIO_BUCKET_NAME,
-            resource.file_key
+            resource.file_key,
         )
         
         # Generator to yield chunks and ensure closing
@@ -855,7 +835,7 @@ async def view_resource(
             media_type=normalized_mime_type,
             headers={
                 "Content-Disposition": content_disposition_header(resource.filename, "inline"),
-                "Cache-Control": "private, max-age=300",
+                "Cache-Control": "private, no-store",
                 "X-Content-Type-Options": "nosniff",
             },
         )

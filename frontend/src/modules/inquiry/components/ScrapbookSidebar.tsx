@@ -5,6 +5,7 @@ import { ScrollArea } from '../../../components/ui/scroll-area';
 import { Button } from '../../../components/ui/button';
 import { Plus, Trash2, X, Check } from 'lucide-react';
 import { useInquiryActions } from './InquiryContext';
+import ResourceImage from '../../../components/ui/ResourceImage';
 
 interface ScrapbookSidebarProps {
     isVisible: boolean;
@@ -98,7 +99,7 @@ export const ScrapbookSidebar: React.FC<ScrapbookSidebarProps> = ({ isVisible })
                                     </div>
                                     {card.imageUrl && (
                                         <div className="mb-2 rounded-lg overflow-hidden border border-slate-100 bg-slate-50">
-                                            <img src={card.imageUrl} alt="预览" className="w-full h-auto object-cover max-h-32" />
+                                            <ResourceImage src={card.imageUrl} alt="预览" className="w-full h-auto object-cover max-h-32" loading="lazy" />
                                         </div>
                                     )}
                                     <p className="line-clamp-6 text-slate-700 leading-relaxed">{card.content}</p>

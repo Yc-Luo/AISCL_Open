@@ -7,7 +7,7 @@ from socketio.exceptions import ConnectionRefusedError
 
 from app.core.config import settings
 from app.services.auth_service import verify_token
-from app.services.room_mapping_service import validate_room_access
+from app.services.room_mapping_service import room_access_lock, validate_room_access
 from app.websocket.handlers.collaboration_handler import unload_resources
 
 # Create Socket.IO server
@@ -27,8 +27,43 @@ MAX_BATCH_PAYLOAD_CHARS = 1_000_000
 
 # Store user connections: {user_id: [sid1, sid2, ...]}
 user_connections: Dict[str, list] = {}
-# Store room members: {room_id: {user_id: sid}}
-room_members: Dict[str, Dict[str, str]] = {}
+# Store room members: {room_id: {user_id: {sid, ...}}}
+room_members: Dict[str, Dict[str, set[str]]] = {}
+
+
+def get_user_rooms(user_id: str) -> set[str]:
+    return {
+        room_id
+        for sid in user_connections.get(user_id, ())
+        for room_id in sio.rooms(sid)
+        if room_id != sid
+    }
+
+
+async def _remove_room_session(user_id: str, sid: str, room_id: str) -> None:
+    await sio.leave_room(sid, room_id)
+    members = room_members.get(room_id)
+    sessions = members.get(user_id) if members is not None else None
+    if not sessions or sid not in sessions:
+        return
+
+    sessions.remove(sid)
+    if sessions:
+        return
+
+    del members[user_id]
+    if not members:
+        del room_members[room_id]
+        await unload_resources(room_id)
+    else:
+        await sio.emit("user_left", {"roomId": room_id, "user_id": user_id}, room=room_id)
+
+
+async def revoke_rooms(user_id: str, room_ids: set[str]) -> None:
+    for sid in tuple(user_connections.get(user_id, ())):
+        for room_id in room_ids.intersection(sio.rooms(sid)):
+            await _remove_room_session(user_id, sid, room_id)
+            await sio.emit("room_left", {"room": room_id}, room=sid)
 
 
 def normalize_room_id(room_id: str, module: Optional[str] = None) -> str:
@@ -107,29 +142,9 @@ async def disconnect(sid, *args):
             if not user_connections[user_id]:
                 del user_connections[user_id]
 
-        # Remove from all rooms
-        # Leave all rooms and clean up room_members
-        for room_id, members in list(room_members.items()):
-            if user_id in members and members[user_id] == sid:
-                # Remove user from room
-                del members[user_id]
-                logger.info(f"User {user_id} removed from room {room_id}")
-
-                # Notify others
-                await sio.emit(
-                    "user_left",
-                    {"roomId": room_id, "user_id": user_id},
-                    room=room_id,
-                )
-
-                # If room is empty, remove it from the index
-                if not members:
-                    # Use pop to avoid KeyError in async race conditions
-                    room_members.pop(room_id, None)
-                    logger.info(f"Room {room_id} closed as it is now empty")
-                    # Unload heavy resources
-                    from app.websocket.handlers.collaboration_handler import unload_resources
-                    await unload_resources(room_id)
+        for room_id in sio.rooms(sid):
+            if room_id != sid:
+                await _remove_room_session(user_id, sid, room_id)
 
     logger.info(f"Client disconnected: {sid}, user_id: {user_id}")
 
@@ -154,48 +169,42 @@ async def join_room(sid, data):
     module = data.get("module")
 
     room_id = normalize_room_id(room_id, module)
-    if not await ensure_room_access(user_id, room_id):
-        await sio.emit(
-            "room_join_error",
-            {"room": room_id, "message": "No permission to join this room"},
-            room=sid,
-        )
-        return
+    async with room_access_lock(user_id):
+        if not await ensure_room_access(user_id, room_id):
+            await sio.emit(
+                "room_join_error",
+                {"room": room_id, "message": "No permission to join this room"},
+                room=sid,
+            )
+            return
+        if sid not in user_connections.get(user_id, ()):
+            return
 
-    await sio.enter_room(sid, room_id)
-    logger.info(f"[join_room] User {user_id} joined room {room_id}")
+        await sio.enter_room(sid, room_id)
+        room_members.setdefault(room_id, {}).setdefault(user_id, set()).add(sid)
 
-    # Track room members
-    if room_id not in room_members:
-        room_members[room_id] = {}
-    room_members[room_id][user_id] = sid
+        from app.repositories.user import User
 
-    # Get user info
-    from app.repositories.user import User
+        user = await User.get(user_id)
+        if user and room_id in sio.rooms(sid):
+            await sio.emit(
+                "user_joined",
+                {
+                    "user_id": user_id,
+                    "username": user.username,
+                    "avatar_url": user.avatar_url,
+                    "role": user.role,
+                    "roomId": room_id,
+                },
+                room=room_id,
+                skip_sid=sid,
+            )
 
-    user = await User.get(user_id)
-    if user:
-        # Notify room members
-        await sio.emit(
-            "user_joined",
-            {
-                "user_id": user_id,
-                "username": user.username,
-                "avatar_url": user.avatar_url,
-                "role": user.role,
-                "roomId": room_id,
-            },
-            room=room_id,
-            skip_sid=sid,
-        )
-
-    await sio.emit("room_joined", {"room": room_id}, room=sid)
-
-    # If it's a Yjs room, trigger a full state bridge
-    module = data.get("module")
-    if module in ["whiteboard", "collaboration", "document", "inquiry"]:
-        from app.websocket.handlers.collaboration_handler import sync_yjs_state
-        await sync_yjs_state(sio, sid, room_id, module)
+        if room_id in sio.rooms(sid):
+            await sio.emit("room_joined", {"room": room_id}, room=sid)
+            if module in ["whiteboard", "collaboration", "document", "inquiry"]:
+                from app.websocket.handlers.collaboration_handler import sync_yjs_state
+                await sync_yjs_state(sio, sid, room_id, module)
 
 
 @sio.event
@@ -210,20 +219,8 @@ async def leave_room(sid, data):
     if not room_id:
         return
 
-    if not (room_id.startswith("project:") or room_id.startswith("doc:") or room_id.startswith("wb:") or room_id.startswith("inquiry:")):
-        room_id = f"project:{room_id}"
-
-    await sio.leave_room(sid, room_id)
-
-    # Remove from room members
-    if room_id in room_members and user_id in room_members[room_id]:
-        del room_members[room_id][user_id]
-        if not room_members[room_id]:
-            del room_members[room_id]
-            # Unload room data
-            from app.websocket.handlers.collaboration_handler import unload_resources
-            await unload_resources(room_id)
-
+    room_id = normalize_room_id(room_id, data.get("module"))
+    await _remove_room_session(user_id, sid, room_id)
     await sio.emit("room_left", {"room": room_id}, room=sid)
 
 

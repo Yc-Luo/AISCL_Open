@@ -20,6 +20,26 @@ class ProjectService:
     """Service for project operations beyond basic CRUD routes."""
 
     @staticmethod
+    async def remove_project_membership(project: Project, user_id: str) -> None:
+        """Persist the removal and recheck the former member's live access."""
+        from app.websocket.room_access import revoke_project_room_access
+
+        project.members = [
+            member for member in project.members if member.get("user_id") != user_id
+        ]
+        if project.leader_id == user_id:
+            project.leader_id = next(
+                (
+                    member["user_id"]
+                    for member in project.members
+                    if member.get("user_id") and member["user_id"] != project.owner_id
+                ),
+                None,
+            )
+        await project.save()
+        await revoke_project_room_access(str(project.id), user_id)
+
+    @staticmethod
     def build_default_experiment_version(project_id: str) -> Dict[str, Any]:
         """Build default experiment-version payload for a project."""
         return {

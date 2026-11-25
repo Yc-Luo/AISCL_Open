@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional
 
 from beanie import Document
-from pydantic import Field
+from pydantic import Field, model_validator
 
 
 class Resource(Document):
@@ -23,7 +23,7 @@ class Resource(Document):
     uploaded_at: datetime = Field(default_factory=datetime.utcnow)
     parse_status: str = Field(
         default="pending",
-        pattern="^(pending|parsing|indexed|failed|unsupported)$",
+        pattern="^(pending|parsing|embedding|indexing|indexed|failed|unsupported|no_text|disabled|unverified)$",
         index=True,
     )
     parse_provider: Optional[str] = Field(default=None, index=True)
@@ -33,6 +33,20 @@ class Resource(Document):
     parsed_content_key: Optional[str] = None
     parsed_zip_key: Optional[str] = None
     parsed_at: Optional[datetime] = None
+    indexed_at: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def mark_legacy_index_unverified(self) -> "Resource":
+        # Older uploads recorded extraction as indexed without a Qdrant receipt.
+        if self.parse_status == "indexed" and self.indexed_at is None:
+            self.parse_status = "unverified"
+        return self
+
+    async def set_rag_status(self, status: str, error: Optional[str] = None) -> None:
+        self.parse_status = status
+        self.parse_error = error
+        self.indexed_at = datetime.utcnow() if status == "indexed" else None
+        await self.save()
 
     class Settings:
         """Beanie settings."""

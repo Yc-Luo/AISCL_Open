@@ -8,7 +8,6 @@ import TextAlign from '@tiptap/extension-text-align'
 import Highlight from '@tiptap/extension-highlight'
 import { Color } from '@tiptap/extension-color'
 import { TextStyle } from '@tiptap/extension-text-style'
-import Image from '@tiptap/extension-image'
 import Placeholder from '@tiptap/extension-placeholder'
 import { Table } from '@tiptap/extension-table'
 import { TableCell } from '@tiptap/extension-table-cell'
@@ -20,6 +19,7 @@ import { documentService, Document } from '../../../../services/api/document'
 import { storageService } from '../../../../services/api/storage'
 import { wikiService } from '../../../../services/api/wiki'
 import { Annotation, AnnotationAttributes } from '../../../../extensions/Annotation'
+import { ResourceImageExtension } from '../../../../extensions/ResourceImageExtension'
 import EditorToolbar from './EditorToolbar'
 import RemoteCursors from './RemoteCursors'
 import AnnotationInput from './AnnotationInput'
@@ -354,7 +354,7 @@ export default function DocumentEditor({
           class: 'border border-slate-300 px-3 py-2 align-top',
         },
       }),
-      Image.configure({
+      ResourceImageExtension.configure({
         HTMLAttributes: {
           class: 'max-w-full h-auto rounded-lg border border-slate-200 shadow-sm my-4',
         },

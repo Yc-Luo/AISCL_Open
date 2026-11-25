@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.v1.auth import get_current_user
 from app.repositories.course import Course
+from app.repositories.project import Project
 from app.repositories.user import User
 from app.core.schemas.course import (
     CourseAISettings,
@@ -728,13 +729,25 @@ async def remove_student_from_course(
             detail="Only course owner can remove students",
         )
 
-    from app.repositories.user import User as UserModel
-
-    # Remove student
+    course_id = str(course.id)
+    student = await User.get(student_id)
     if student_id in course.students:
         course.students.remove(student_id)
         await course.save_changes()
-        student = await UserModel.get(student_id)
-        if student and student.class_id == str(course.id):
-            student.class_id = None
-            await student.save()
+    if student and student.role != "student":
+        return
+    if student and student.class_id == course_id:
+        student.class_id = None
+        await student.save()
+
+    # Project access is granted independently of the course roster.
+    projects = await Project.find(
+        {
+            "course_id": course_id,
+            "$or": [{"owner_id": student_id}, {"members.user_id": student_id}],
+        }
+    ).to_list()
+    for project in projects:
+        if project.owner_id == student_id:
+            project.owner_id = course.teacher_id
+        await project_service.remove_project_membership(project, student_id)

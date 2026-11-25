@@ -4,6 +4,7 @@ import { InquiryNodeData } from '../types';
 import { MessageSquare, ShieldCheck, ShieldAlert, Reply, Link as LinkIcon } from 'lucide-react';
 import { cn } from '../../../lib/utils';
 import { useInquiryActions } from './InquiryContext';
+import ResourceImage from '../../../components/ui/ResourceImage';
 
 interface BaseNodeProps {
     nodeId: string;
@@ -75,7 +76,7 @@ const BaseNode = ({
         <div className="text-sm text-slate-700 leading-relaxed break-words font-medium mb-2">
             {imageUrl ? (
                 <div className="rounded-lg overflow-hidden border border-slate-100 bg-slate-50 mb-2">
-                    <img src={imageUrl} alt="素材图片" className="w-full h-auto object-contain max-h-[300px]" />
+                    <ResourceImage src={imageUrl} alt="素材图片" className="w-full h-auto object-contain max-h-[300px]" loading="lazy" />
                 </div>
             ) : null}
             {children}

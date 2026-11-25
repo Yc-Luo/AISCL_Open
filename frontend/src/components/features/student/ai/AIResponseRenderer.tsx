@@ -1,5 +1,6 @@
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import ResourceImage from '../../../ui/ResourceImage'
 
 interface AIResponseRendererProps {
     content: string
@@ -42,6 +43,9 @@ export default function AIResponseRenderer({
             <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
                 components={{
+                    img({ src, alt, title }) {
+                        return <ResourceImage src={src} alt={alt} title={title} loading="lazy" />
+                    },
                     h1({ children }) {
                         return (
                             <h1 className="mb-1 mt-2 text-[15px] font-black leading-5 text-slate-900">

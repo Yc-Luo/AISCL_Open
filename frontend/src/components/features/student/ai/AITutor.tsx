@@ -7,6 +7,7 @@ import { trackingService } from '../../../../services/tracking/TrackingService'
 import { useScrapbookActions } from '../../../../modules/inquiry/hooks/useScrapbookActions'
 import { Image as ImageIcon, Lightbulb, Loader2, X } from 'lucide-react'
 import { Toast } from '../../../ui/Toast'
+import ResourceImage from '../../../ui/ResourceImage'
 import { ExperimentVersion } from '../../../../types'
 import { normalizeStageId } from '../../../../lib/stageModel'
 
@@ -824,7 +825,9 @@ export default function AITutor({ projectId, experimentVersion }: AITutorProps) 
                                     />
                                 ) : (
                                     <div className="prose prose-sm prose-invert max-w-none text-sm leading-6 prose-p:my-1 prose-img:my-2 prose-img:max-h-48 prose-img:rounded-xl prose-img:border prose-img:border-white/20 prose-img:object-contain">
-                                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
+                                            img: ({ src, alt, title }) => <ResourceImage src={src} alt={alt} title={title} loading="lazy" />,
+                                        }}>
                                             {msg.content}
                                         </ReactMarkdown>
                                     </div>
@@ -894,7 +897,7 @@ export default function AITutor({ projectId, experimentVersion }: AITutorProps) 
                     {pendingImage && (
                         <div className="mb-3 flex items-center justify-between gap-3 rounded-2xl border border-indigo-100 bg-indigo-50 px-3 py-2">
                             <div className="flex min-w-0 items-center gap-2">
-                                <img
+                                <ResourceImage
                                     src={pendingImage.url}
                                     alt={pendingImage.name}
                                     className="h-10 w-10 rounded-xl border border-white object-cover"

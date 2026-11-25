@@ -4,8 +4,10 @@ This service manages the mapping between Socket.IO rooms (project-level)
 and Y.js rooms (resource-level) for real-time collaboration.
 """
 
+import asyncio
 import logging
 from typing import Dict, List, Optional
+from weakref import WeakValueDictionary
 
 from app.repositories.project import Project
 from app.repositories.document import Document
@@ -19,6 +21,17 @@ SOCKETIO_ROOM_PREFIX = "project:"
 YJS_WHITEBOARD_PREFIX = "wb:"
 YJS_DOCUMENT_PREFIX = "doc:"
 YJS_INQUIRY_PREFIX = "inquiry:"
+
+# Serialize admission and revocation for one user in this worker.
+_room_access_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+
+
+def room_access_lock(user_id: str) -> asyncio.Lock:
+    lock = _room_access_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _room_access_locks[user_id] = lock
+    return lock
 
 
 def get_room_mapping(project_id: str) -> Dict[str, any]:
@@ -95,6 +108,14 @@ def parse_room_id(room_id: str) -> Dict[str, Optional[str]]:
             "project_id": None,
             "resource_id": None,
         }
+
+
+async def room_belongs_to_project(room_id: str, project_id: str) -> bool:
+    parsed = parse_room_id(room_id)
+    if parsed["type"] == "yjs_document":
+        document = await Document.get(parsed["resource_id"])
+        return bool(document and document.project_id == project_id)
+    return parsed["project_id"] == project_id
 
 
 async def validate_room_access(room_id: str, user_id: str) -> bool:

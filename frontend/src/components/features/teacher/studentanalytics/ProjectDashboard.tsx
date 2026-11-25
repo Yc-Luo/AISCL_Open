@@ -468,6 +468,9 @@ export default function ProjectDashboard() {
         format: 'csv' | 'json'
     ) => {
         if (!selectedProjectId) return;
+        if (kind === 'ai-tutor-transcripts' && !window.confirm(
+            `确认单独导出「${selectedProject?.name || selectedProjectId}」的 AI 导师私密对话全文？文件包含学生个人对话内容，请仅在具备相应授权和研究需要时导出，并妥善保管。`
+        )) return;
         const exportKey = `${kind}-${format}`;
         setExportingResearch(exportKey);
         setResearchExportMessage(null);
@@ -575,17 +578,16 @@ export default function ProjectDashboard() {
                         'text/csv;charset=utf-8'
                     );
                 }
-                setResearchExportMessage(`已导出 AI导师个人对话全文 ${data.total} 条。`);
+                setResearchExportMessage(`已单独导出 AI 导师私密对话全文 ${data.total} 条。`);
                 return;
             }
 
-            const [health, events, features, lsa, groupChat, aiTutor] = await Promise.all([
+            const [health, events, features, lsa, groupChat] = await Promise.all([
                 analyticsService.getResearchHealth(selectedProjectId),
                 analyticsService.getResearchEvents(selectedProjectId, { limit: 10000 }),
                 analyticsService.getGroupStageFeatures(selectedProjectId),
                 analyticsService.getLSAReady(selectedProjectId),
                 analyticsService.getGroupChatTranscripts(selectedProjectId),
-                analyticsService.getAITutorTranscripts(selectedProjectId),
             ]);
             const readableEvents = events.events.map(buildReadableResearchEventRow);
             const bundle = {
@@ -602,14 +604,13 @@ export default function ProjectDashboard() {
                 group_stage_features: features,
                 lsa_ready: lsa,
                 group_chat_transcripts: groupChat,
-                ai_tutor_transcripts: aiTutor,
             };
             downloadTextFile(
                 `research_bundle_${projectSlug}_${timestamp}.json`,
                 JSON.stringify(bundle, null, 2),
                 'application/json;charset=utf-8'
             );
-            setResearchExportMessage('已导出研究数据包。');
+            setResearchExportMessage('已导出常规研究数据包。');
         } catch (error) {
             console.error('Research export failed:', error);
             setResearchExportMessage('研究数据导出失败，请检查网络或稍后重试。');
@@ -1007,7 +1008,7 @@ export default function ProjectDashboard() {
                             用于核查当前小组是否已经稳定记录支架、探究、共享记录与阶段事件，避免正式实验开始后才发现数据链缺口。
                         </p>
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                         {researchHealth?.last_event_time && (
                             <span className="text-xs text-slate-400">
                                 最近事件：{new Date(researchHealth.last_event_time).toLocaleString()}
@@ -1031,7 +1032,7 @@ export default function ProjectDashboard() {
                             className="gap-2 rounded-lg"
                         >
                             <Download className="w-4 h-4" />
-                            {exportingResearch === 'bundle-json' ? '导出中...' : '导出研究数据包'}
+                            {exportingResearch === 'bundle-json' ? '导出中...' : '导出常规研究数据包'}
                         </Button>
                     </div>
                 </div>
@@ -1094,7 +1095,7 @@ export default function ProjectDashboard() {
                                 <div>
                                     <div className="text-sm font-semibold text-slate-800">研究数据导出</div>
                                     <p className="mt-1 text-xs leading-5 text-slate-500">
-                                        用于正式实验留档与第六章过程分析。建议每次课堂结束后至少导出一次研究数据包。
+                                        常规研究数据包不含 AI 导师私密对话全文。
                                     </p>
                                     {researchExportMessage && (
                                         <div className="mt-2 text-xs text-indigo-700">{researchExportMessage}</div>
@@ -1140,20 +1141,20 @@ export default function ProjectDashboard() {
                                     <Button
                                         variant="outline"
                                         size="sm"
-                                        onClick={() => handleResearchExport('ai-tutor-transcripts', 'csv')}
-                                        disabled={!selectedProjectId || !!exportingResearch}
-                                        className="rounded-lg"
-                                    >
-                                        AI导师对话 CSV
-                                    </Button>
-                                    <Button
-                                        variant="outline"
-                                        size="sm"
                                         onClick={() => handleResearchExport('bundle', 'json')}
                                         disabled={!selectedProjectId || !!exportingResearch}
                                         className="rounded-lg"
                                     >
-                                        完整包 JSON
+                                        常规研究数据包 JSON
+                                    </Button>
+                                    <Button
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={() => handleResearchExport('ai-tutor-transcripts', 'csv')}
+                                        disabled={!selectedProjectId || !!exportingResearch}
+                                        className="rounded-lg"
+                                    >
+                                        单独导出 AI 导师私密对话全文 CSV
                                     </Button>
                                 </div>
                             </div>

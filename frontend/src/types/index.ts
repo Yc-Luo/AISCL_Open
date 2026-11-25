@@ -137,7 +137,7 @@ export interface Resource {
   source_type?: string
   uploaded_by: string
   uploaded_at: string
-  parse_status?: 'pending' | 'parsing' | 'indexed' | 'failed' | 'unsupported'
+  parse_status?: 'pending' | 'parsing' | 'embedding' | 'indexing' | 'indexed' | 'failed' | 'unsupported' | 'no_text' | 'disabled' | 'unverified'
   parse_provider?: string | null
   parse_error?: string | null
   parsed_at?: string | null

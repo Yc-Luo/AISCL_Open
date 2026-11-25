@@ -41,6 +41,17 @@ interface ResourceLibraryProps {
 }
 
 const MAX_RESOURCE_BYTES = 50 * 1024 * 1024
+const ACTIVE_RAG_STAGES = {
+  parsing: '正在解析资源',
+  embedding: '正在生成文本向量',
+  indexing: '正在写入 AI 检索索引',
+} as const
+const INACTIVE_RAG_LABELS = {
+  no_text: '未提取到可索引文本，原文件已保存',
+  disabled: '解析或向量检索未配置，原文件已保存',
+  unverified: '历史检索索引未验证',
+  unsupported: '该资源仅作为文件保存，暂未进入 AI 检索',
+} as const
 
 type PreviewKind = 'image' | 'video' | 'audio' | 'pdf' | 'office' | 'text' | 'unsupported'
 
@@ -88,8 +99,8 @@ export default function ResourceLibrary({ projectId }: ResourceLibraryProps) {
   }, [projectId, fetchResources])
 
   useEffect(() => {
-    const hasUnfinishedParsing = resources.some((resource) =>
-      ['pending', 'parsing'].includes(resource.parse_status || 'pending')
+    const hasUnfinishedParsing = resources.some(({ parse_status = 'pending' }) =>
+      parse_status === 'pending' || parse_status in ACTIVE_RAG_STAGES
     )
     if (!projectId || !hasUnfinishedParsing) return
     const timer = window.setInterval(() => {
@@ -366,14 +377,14 @@ export default function ResourceLibrary({ projectId }: ResourceLibraryProps) {
     if (status === 'indexed') {
       return { title: '已完成解析并进入 AI 检索', icon: <CheckCircle2 size={14} />, className: 'bg-emerald-50 text-emerald-700 ring-1 ring-emerald-100' }
     }
-    if (status === 'parsing') {
-      return { title: '资源正在解析入库', icon: <Loader2 size={14} className="animate-spin" />, className: 'bg-indigo-50 text-indigo-700 ring-1 ring-indigo-100' }
+    if (status === 'parsing' || status === 'embedding' || status === 'indexing') {
+      return { title: ACTIVE_RAG_STAGES[status], icon: <Loader2 size={14} className="animate-spin" />, className: 'bg-indigo-50 text-indigo-700 ring-1 ring-indigo-100' }
     }
     if (status === 'failed') {
-      return { title: resource.parse_error || '解析失败，可稍后重试或联系教师', icon: <TriangleAlert size={14} />, className: 'bg-rose-50 text-rose-700 ring-1 ring-rose-100' }
+      return { title: resource.parse_error || '资源入库失败，可联系教师', icon: <TriangleAlert size={14} />, className: 'bg-rose-50 text-rose-700 ring-1 ring-rose-100' }
     }
-    if (status === 'unsupported') {
-      return { title: '该资源仅作为文件保存，暂未进入 AI 检索', icon: <MinusCircle size={14} />, className: 'bg-slate-50 text-slate-500 ring-1 ring-slate-100' }
+    if (status === 'unsupported' || status === 'no_text' || status === 'disabled' || status === 'unverified') {
+      return { title: INACTIVE_RAG_LABELS[status], icon: <MinusCircle size={14} />, className: 'bg-slate-50 text-slate-500 ring-1 ring-slate-100' }
     }
     return { title: '等待解析入库', icon: <Clock3 size={14} />, className: 'bg-amber-50 text-amber-700 ring-1 ring-amber-100' }
   }

@@ -70,7 +70,8 @@ export class ChatAdapter {
                 name: fileInfo.name,
                 size: fileInfo.size,
                 url: fileInfo.url,
-                mime_type: fileInfo.mimeType || fileInfo.mime_type
+                mime_type: fileInfo.mimeType || fileInfo.mime_type,
+                resource_id: fileInfo.resourceId || fileInfo.resource_id,
             } : undefined
         };
 

@@ -117,15 +117,6 @@ async def refresh_stage_memory_after_transition(project_id: str, previous_stage:
         )
 
 
-def _resolve_next_group_leader(project: Project) -> Optional[str]:
-    """Return a safe fallback student leader for legacy or changed groups."""
-    for member in project.members:
-        user_id = member.get("user_id")
-        if user_id and user_id != project.owner_id:
-            return user_id
-    return None
-
-
 def generate_group_code() -> str:
     """Generate a short group code for student self-joining."""
     return secrets.token_hex(3).upper()[:6]
@@ -817,11 +808,12 @@ async def remove_project_member(
         "Only project owner or scoped teacher can remove members",
     )
 
-    # Remove member
-    project.members = [m for m in project.members if m.get("user_id") != user_id]
-    if project.leader_id == user_id:
-        project.leader_id = _resolve_next_group_leader(project)
-    await project.save()
+    if project.owner_id == user_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Transfer project ownership before removing the owner",
+        )
+    await project_service.remove_project_membership(project, user_id)
 
 
 @router.post("/{project_id}/archive", response_model=ProjectResponse)
@@ -1004,6 +996,7 @@ async def transfer_ownership(
 
     from datetime import datetime
 
+    previous_owner_id = project.owner_id
     # Update old owner role to editor
     old_owner = next(
         (m for m in project.members if m.get("user_id") == project.owner_id), None
@@ -1018,6 +1011,9 @@ async def transfer_ownership(
     project.owner_id = new_owner_id
     project.updated_at = datetime.utcnow()
     await project.save()
+
+    from app.websocket.room_access import revoke_project_room_access
+    await revoke_project_room_access(str(project.id), previous_owner_id)
 
     return ProjectResponse(
         id=str(project.id),
