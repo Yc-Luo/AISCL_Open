@@ -1,9 +1,17 @@
 """Validated course learning design and its server-owned revision."""
 
-from typing import Literal, Self, get_args
+from typing import Annotated, Literal, Self, get_args
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from app.services.agents.multi_agent_roles import SUBAGENT_LABELS
 
@@ -65,17 +73,34 @@ class StageItem(BaseModel):
     activity_guidance: str = Field(max_length=1600)
 
 
+ModelId = Annotated[str, StringConstraints(strict=True, pattern=r"^\S(?:.*\S)?$")]
+
+
+class ModelAssignments(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    default_model_id: ModelId | None = None
+    role_model_ids: dict[str, ModelId] = Field(default_factory=dict)
+
+
 class LearningDesign(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     roles: list[RoleItem | CustomRoleItem] = Field(max_length=len(get_args(BuiltinRoleId)) + MAX_CUSTOM_ROLES)
     orchestration_mode: Literal["adaptive", "single", "parallel", "debate", "pipeline"]
     stages: list[StageItem] = Field(max_length=4)
+    model_assignments: ModelAssignments | None = None
 
     @model_validator(mode="after")
     def validate_items(self) -> Self:
-        if len({role.id for role in self.roles}) != len(self.roles):
+        role_ids = {role.id for role in self.roles}
+        if len(role_ids) != len(self.roles):
             raise ValueError("Role IDs must be unique")
+        # Built-ins omitted from the request are materialized in the snapshot.
+        if self.model_assignments:
+            known_roles = role_ids.union(get_args(BuiltinRoleId))
+            if self.model_assignments.role_model_ids.keys() - known_roles:
+                raise ValueError("Model overrides must refer to built-in roles or custom roles in this design")
         if len({stage.id for stage in self.stages}) != len(self.stages):
             raise ValueError("Stage IDs must be unique")
         custom_names = [role.name.casefold() for role in self.roles if isinstance(role, CustomRoleItem)]
@@ -100,6 +125,7 @@ class DesignSnapshot(LearningDesign):
         return cls(
             revision=uuid4().hex,
             orchestration_mode=design.orchestration_mode,
+            model_assignments=design.model_assignments.model_copy(deep=True) if design.model_assignments else None,
             roles=[
                 *(
                     roles[role_id] if role_id in roles else RoleItem(id=role_id, enabled=True, prompt="")
@@ -126,6 +152,15 @@ class DesignSnapshot(LearningDesign):
 
 class LearningDesignResponse(BaseModel):
     design: DesignSnapshot | None
+
+
+class LearningDesignModel(BaseModel):
+    id: str
+    name: str
+
+
+class LearningDesignModelsResponse(BaseModel):
+    models: list[LearningDesignModel]
 
 
 class ApplyLearningDesignResponse(BaseModel):

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import operator
 import re
+from contextlib import asynccontextmanager
 from typing import Dict, Any, AsyncGenerator, Optional, List, Union, Annotated, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -13,7 +14,7 @@ from langgraph.types import Send
 
 from app.core.ai_scaffold_mode import normalize_ai_scaffold_mode
 from app.core.config import settings
-from app.core.llm_config import get_llm, resolve_role_model_id
+from app.core.llm_config import course_dialogue_llm, get_llm, resolve_role_model_id
 from app.core.llm_runtime import get_group_lock, guarded_ainvoke, guarded_astream
 from app.services.rag_service import rag_service
 from app.services.research_event_service import research_event_service
@@ -254,10 +255,6 @@ class AgentService:
     ) -> AsyncGenerator[Union[str, Dict[str, Any]], None]:
         """Stream response using the Graph."""
         
-        # Initialize graph if needed (Double Check Locking Pattern in Production)
-        if not self.graph:
-            await self.initialize()
-
         group_lock = None
         if context and not context.get("_group_lock_acquired"):
             if context.get("source_actor_type") == "ai_assistant":
@@ -285,6 +282,9 @@ class AgentService:
             ):
                 yield event
             return
+
+        if not self.graph:
+            await self.initialize()
 
         # Role-aware retrieval plan: route first, then decide whether retrieval is needed.
         resolved_project_id = (
@@ -819,6 +819,25 @@ class AgentService:
             ),
         }
 
+    @asynccontextmanager
+    async def _reply_model(
+        self, *, context: Dict[str, Any], model_role: str, temperature: float,
+        agent_name: Optional[str] = None, fallback_model_id: Optional[str] = None,
+    ):
+        course_models = context.get("course_models") or {}
+        class_model_id = (
+            (course_models.get("role_model_ids") or {}).get(agent_name)
+            or course_models.get("default_model_id")
+        )
+        if class_model_id:
+            async with course_dialogue_llm(
+                model_id=class_model_id, owner_id=course_models["course_owner_id"], temperature=temperature,
+            ) as llm:
+                yield llm
+        else:
+            model_id = await resolve_role_model_id(model_role, fallback_model_id=fallback_model_id)
+            yield await get_llm(temperature=temperature, model_id=model_id)
+
     async def _synthesize_stage_agent_outputs(
         self,
         *,
@@ -838,13 +857,7 @@ class AgentService:
         raw_joined = "\n\n".join(sections).strip()
 
         try:
-            llm = await get_llm(
-                temperature=0.25,
-                model_id=await resolve_role_model_id("answer_synthesizer"),
-            )
-            response = await guarded_ainvoke(
-                llm,
-                [
+            messages = [
                     SystemMessage(
                         content=(
                             "你是 AISCL 的反馈整合节点。你的任务是把多个支架智能体的候选回应"
@@ -897,8 +910,11 @@ class AgentService:
 - 不替小组完成最终答案。
 - 字数通常 350-900 字，复杂问题最多 1200 字。"""
                     ),
-                ],
-            )
+            ]
+            async with self._reply_model(
+                context=context, model_role="answer_synthesizer", temperature=0.25,
+            ) as llm:
+                response = await guarded_ainvoke(llm, messages)
             content = response.content if hasattr(response, "content") else str(response)
             cleaned = str(content or "").strip()
             return cleaned or raw_joined
@@ -1010,33 +1026,28 @@ class AgentService:
             )),
             ("human", "{input}"),
         ])
-        role_model_id = await resolve_role_model_id(
-            agent_def.get("model_role") or agent_name,
-            fallback_model_id=context.get("runtime_model_id"),
-        )
-        runtime_llm = await get_llm(
-            temperature=0.7,
-            model_id=role_model_id,
-        )
-        chain = prompt | runtime_llm
         try:
-            async for chunk in guarded_astream(chain, {"input": message}):
-                content = getattr(chunk, "content", "") or ""
-                if not content:
-                    continue
-                for event in parser.feed(str(content)):
-                    if event["type"] == "thinking":
-                        thinking_buffer += event.get("content", "")
-                    if event["type"] == "output" and event.get("content", "").strip():
-                        visible_output_seen = True
-                    yield event
-        except Exception as exc:
+            async with self._reply_model(
+                context=context, model_role=agent_def.get("model_role") or agent_name,
+                temperature=0.7, agent_name=agent_name, fallback_model_id=context.get("runtime_model_id"),
+            ) as runtime_llm:
+                chain = prompt | runtime_llm
+                async for chunk in guarded_astream(chain, {"input": message}):
+                    content = getattr(chunk, "content", "") or ""
+                    if not content:
+                        continue
+                    for event in parser.feed(str(content)):
+                        if event["type"] == "thinking":
+                            thinking_buffer += event.get("content", "")
+                        if event["type"] == "output" and event.get("content", "").strip():
+                            visible_output_seen = True
+                        yield event
+        except Exception:
             yield {
                 "type": "output",
                 "agent": agent_name,
                 "label": label,
                 "content": "本轮角色暂时无法完整生成。可以先围绕当前问题补充依据、明确判断标准，并把下一步分工写入协作文档。",
-                "error": str(exc),
             }
         flush_events = parser.flush()
         for event in flush_events:

@@ -11,6 +11,10 @@ from pydantic import ValidationError
 logger = logging.getLogger(__name__)
 
 
+def _is_teacher_model_route(request: Request) -> bool:
+    return request.url.path.startswith("/api/v1/teacher-model-connections") or request.url.path.startswith("/teacher-model-connections")
+
+
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
     """Handle HTTP exceptions with proper logging and response formatting."""
     logger.warning(
@@ -38,6 +42,9 @@ async def validation_exception_handler(request: Request, exc: ValidationError) -
     except Exception:
         # Fallback if serialization fails
         error_details = [{"message": str(exc)}]
+
+    if _is_teacher_model_route(request):
+        error_details = [{"message": "Invalid model connection settings"}]
 
     logger.warning(
         f"Validation Error: {error_details} "
@@ -67,6 +74,10 @@ async def request_validation_exception_handler(request: Request, exc: RequestVal
         error_details = [{"message": str(exc)}]
         body = "Could not parse body"
 
+    if _is_teacher_model_route(request):
+        error_details = [{"message": "Invalid model connection settings"}]
+        body = "[redacted]"
+
     logger.warning(
         f"Request Validation Error: {error_details} "
         f"(Path: {request.url.path}, Method: {request.method}, Body: {body})"
@@ -87,11 +98,14 @@ async def request_validation_exception_handler(request: Request, exc: RequestVal
 
 async def general_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Handle general exceptions with proper logging."""
-    logger.error(
-        f"Unhandled Exception: {type(exc).__name__}: {str(exc)} "
-        f"(Path: {request.url.path}, Method: {request.method}, Client: {request.client.host if request.client else 'unknown'})",
-        exc_info=True
-    )
+    if _is_teacher_model_route(request):
+        logger.error("Teacher model connection request failed (%s)", type(exc).__name__)
+    else:
+        logger.error(
+            f"Unhandled Exception: {type(exc).__name__}: {str(exc)} "
+            f"(Path: {request.url.path}, Method: {request.method}, Client: {request.client.host if request.client else 'unknown'})",
+            exc_info=True,
+        )
 
     return JSONResponse(
         status_code=500,

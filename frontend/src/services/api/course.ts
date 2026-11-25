@@ -64,10 +64,21 @@ export interface StageItem {
     activity_guidance: string
 }
 
+export interface LearningDesignModelOption {
+    id: string
+    name: string
+}
+
+export interface LearningDesignModelAssignments {
+    default_model_id: string | null
+    role_model_ids: Record<string, string>
+}
+
 export interface LearningDesign {
     roles: LearningDesignRole[]
     orchestration_mode: 'adaptive' | 'single' | 'parallel' | 'debate' | 'pipeline'
     stages: StageItem[]
+    model_assignments?: LearningDesignModelAssignments | null
 }
 
 export interface DesignSnapshot extends LearningDesign {
@@ -157,6 +168,11 @@ export const courseService = {
     getLearningDesign: async (courseId: string): Promise<DesignSnapshot | null> => {
         const response = await api.get<{ design: DesignSnapshot | null }>(`/courses/${encodeURIComponent(courseId)}/learning-design`)
         return response.data.design
+    },
+
+    getLearningDesignModels: async (courseId: string): Promise<LearningDesignModelOption[]> => {
+        const response = await api.get<{ models: LearningDesignModelOption[] }>(`/courses/${encodeURIComponent(courseId)}/learning-design/models`)
+        return response.data.models.map(({ id, name }) => ({ id, name }))
     },
 
     saveLearningDesign: async (courseId: string, design: LearningDesign): Promise<DesignSnapshot | null> => {

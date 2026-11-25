@@ -52,6 +52,7 @@ class MongoDB:
         from app.repositories.learning_object_memory import LearningObjectMemory
         from app.repositories.scaffold_round_memory import ScaffoldRoundMemory
         from app.repositories.export_job import ExportJob
+        from app.repositories.teacher_model_connection import TeacherModelConnection
 
         await init_beanie(
             database=database,
@@ -88,6 +89,7 @@ class MongoDB:
                 LearningObjectMemory,
                 ScaffoldRoundMemory,
                 ExportJob,
+                TeacherModelConnection,
             ],
             recreate_views=False,  # Prevent index recreation conflicts
         )

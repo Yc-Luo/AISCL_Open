@@ -26,9 +26,15 @@ from app.core.schemas.learning_design import (
     ApplyLearningDesignResponse,
     DesignSnapshot,
     LearningDesign,
+    LearningDesignModelsResponse,
     LearningDesignResponse,
 )
 from app.services.auth_service import get_password_hash
+from app.services.course_model_service import (
+    CourseModelUnavailable,
+    list_course_model_choices,
+    validate_course_model_assignments,
+)
 from app.services.project_service import project_service
 from app.services.research_config_service import research_config_service
 
@@ -334,11 +340,22 @@ async def get_course_learning_design(
     return LearningDesignResponse(design=course.learning_design)
 
 
+@router.get("/{course_id}/learning-design/models", response_model=LearningDesignModelsResponse)
+async def get_course_learning_design_models(
+    course: Course = Depends(_get_course_for_ai_configuration),
+) -> LearningDesignModelsResponse:
+    return LearningDesignModelsResponse(models=await list_course_model_choices(course))
+
+
 @router.put("/{course_id}/learning-design", response_model=LearningDesignResponse)
 async def update_course_learning_design(
     design: LearningDesign,
     course: Course = Depends(_get_course_for_ai_configuration),
 ) -> LearningDesignResponse:
+    try:
+        await validate_course_model_assignments(course, design.model_assignments)
+    except CourseModelUnavailable as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
     snapshot = DesignSnapshot.from_design(design)
     result = await Course.find_one({"_id": course.id}).set(
         {"learning_design": snapshot.model_dump(), "updated_at": datetime.utcnow()},
@@ -359,6 +376,10 @@ async def apply_course_learning_design(
     snapshot = course.learning_design
     if snapshot is None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No saved learning design")
+    try:
+        await validate_course_model_assignments(course, snapshot.model_assignments)
+    except CourseModelUnavailable as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     if not await project_service.apply_course_learning_design(course, project_id, snapshot):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active course group not found")
     return ApplyLearningDesignResponse(project_id=str(project_id), revision=snapshot.revision)

@@ -1,4 +1,5 @@
 import json
+from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 from langchain_openai import ChatOpenAI
 from langchain_community.llms import Ollama
@@ -76,6 +77,84 @@ async def _find_model_definition(model_id: Optional[str]) -> Optional[Dict[str, 
             if str(item.get("id") or "").strip() == target:
                 return item
     return None
+
+
+class DedicatedModelUnavailable(ValueError):
+    """An explicit model connection is missing or cannot use its own credentials."""
+
+
+class _CompatibleChatOpenAI(ChatOpenAI):
+    """Keep the token field used by compatible Chat Completions providers."""
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        if "max_completion_tokens" in payload:
+            payload["max_tokens"] = payload.pop("max_completion_tokens")
+        return payload
+
+
+async def list_dedicated_chat_models() -> dict[str, dict]:
+    """Return eligible administrator-defined connections for explicit class bindings."""
+    from app.core.teacher_model_transport import normalize_teacher_endpoint
+    from app.services.teacher_model_service import TEACHER_MODEL_PREFIX
+
+    items = await _get_json_config("user_custom_models", [])
+    models: dict[str, dict] = {}
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or item.get("enabled") is False:
+            continue
+        model_id = str(item.get("id") or "").strip()
+        provider = _normalize_provider(item.get("provider") or "openai_compatible")
+        key = item.get("key") or item.get("api_key")
+        if (
+            _is_default_model_id(model_id) or model_id.startswith(TEACHER_MODEL_PREFIX)
+            or provider not in {"openai", "openai_compatible", "deepseek", "deepseek-chat"}
+            or not isinstance(key, str) or not _is_real_secret(key)
+        ):
+            continue
+        try:
+            base_url = normalize_teacher_endpoint(item.get("base_url") or item.get("url") or item.get("api_base") or "")
+        except ValueError:
+            continue
+        models.setdefault(model_id, {
+            "id": model_id, "name": str(item.get("name") or model_id).strip() or model_id,
+            "provider": provider, "base_url": base_url, "api_key": key.strip(),
+        })
+    return models
+
+
+@asynccontextmanager
+async def course_dialogue_llm(
+    *, model_id: str, owner_id: str, temperature: float,
+    max_tokens: int | None = None, timeout: float | None = None,
+):
+    """Use the requested connection only; never borrow a system endpoint or key."""
+    from app.core.teacher_model_transport import create_teacher_async_http_client, normalize_teacher_endpoint
+    from app.services.teacher_model_service import TEACHER_MODEL_PREFIX, load_teacher_model_definition
+
+    if model_id.startswith(TEACHER_MODEL_PREFIX):
+        definition = await load_teacher_model_definition(owner_id, model_id)
+    else:
+        definition = (await list_dedicated_chat_models()).get(model_id)
+    if not definition or not _is_real_secret(definition.get("api_key")):
+        raise DedicatedModelUnavailable("Configured model connection is unavailable")
+    try:
+        base_url = normalize_teacher_endpoint(definition["base_url"])
+    except ValueError:
+        raise DedicatedModelUnavailable("Configured model endpoint is unavailable") from None
+    api_key = definition["api_key"]
+    model_name = definition["id"]
+    timeout = timeout or settings.LLM_REQUEST_TIMEOUT_SECONDS
+    official_openai = definition["provider"] == "openai" and base_url == "https://api.openai.com/v1"
+    chat_model = ChatOpenAI if official_openai else _CompatibleChatOpenAI
+    async with create_teacher_async_http_client(base_url, timeout=timeout) as client:
+        model = chat_model(
+            model=model_name, temperature=None if official_openai else temperature, openai_api_key=api_key,
+            openai_api_base=base_url, http_async_client=client, timeout=timeout,
+            max_tokens=max_tokens or settings.LLM_MAX_OUTPUT_TOKENS, max_retries=0,
+            use_responses_api=False,
+        )
+        yield attach_llm_metadata(model, provider=definition["provider"], api_key=api_key, model=model_name)
 
 
 async def _get_role_model_map() -> Dict[str, str]:

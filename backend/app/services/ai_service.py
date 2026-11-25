@@ -1,6 +1,7 @@
 """AI service for chat and conversation management."""
 
 
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 import re
@@ -8,7 +9,7 @@ from typing import AsyncIterator, List, Optional
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 import tiktoken
-from app.core.llm_config import get_llm, get_llm_for_role
+from app.core.llm_config import course_dialogue_llm, get_llm, get_llm_for_role
 from app.core.llm_runtime import guarded_ainvoke, guarded_astream
 from app.repositories.ai_conversation import AIConversation
 from app.repositories.ai_message import AIMessage as AIMessageModel
@@ -377,6 +378,7 @@ class AIService:
         category: str = "chat",
         message_metadata: Optional[dict] = None,
         graph_context: Optional[dict] = None,
+        course_models: Optional[dict] = None,
     ) -> dict:
         """Non-streaming chat with AI.
 
@@ -429,7 +431,11 @@ class AIService:
 
         # Update title if this is the first real exchange
         if len(history) == 0:
-            new_title = await AIService.generate_conversation_title(message)
+            new_title = (
+                AIService._direct_conversation_title(message)
+                if course_models or (graph_context or {}).get("course_models")
+                else await AIService.generate_conversation_title(message)
+            )
             conversation.title = new_title
             await conversation.save()
 
@@ -468,8 +474,15 @@ class AIService:
                 context_text = "\n\nContext:\n" + AIService.format_context_for_prompt(context)
                 messages[-1] = HumanMessage(content=message + context_text)
             messages = AIService.truncate_context(messages, AIService.MAX_CONTEXT_TOKENS)
-            llm = await get_llm_for_role(role.name, role.temperature)
-            response = await guarded_ainvoke(llm, messages)
+            if course_models and course_models.get("default_model_id"):
+                async with course_dialogue_llm(
+                    model_id=course_models["default_model_id"], owner_id=course_models["course_owner_id"],
+                    temperature=role.temperature or 0.7,
+                ) as llm:
+                    response = await guarded_ainvoke(llm, messages)
+            else:
+                llm = await get_llm_for_role(role.name, role.temperature)
+                response = await guarded_ainvoke(llm, messages)
             response_text = AIService.sanitize_model_output(
                 response.content if hasattr(response, "content") else str(response)
             )
@@ -492,7 +505,7 @@ class AIService:
         await ai_message.insert()
 
         # Generate dynamic suggestions
-        suggestions = [] if graph_context else await AIService.generate_followup_suggestions(response_text)
+        suggestions = [] if graph_context or course_models else await AIService.generate_followup_suggestions(response_text)
 
         return {
             "conversation_id": str(conversation.id),
@@ -611,12 +624,22 @@ class AIService:
         await ai_message.insert()
 
     @staticmethod
+    @asynccontextmanager
+    async def _dialogue_model(model_id: Optional[str], temperature: float, course_model_owner_id: Optional[str]):
+        if course_model_owner_id and model_id:
+            async with course_dialogue_llm(model_id=model_id, owner_id=course_model_owner_id, temperature=temperature) as llm:
+                yield llm
+        else:
+            yield await get_llm(temperature=temperature, model_id=model_id)
+
+    @staticmethod
     async def raw_completion_stream(
         message: str,
         *,
         model_id: Optional[str] = None,
         temperature: float = 0.7,
         context_messages: Optional[List[dict]] = None,
+        course_model_owner_id: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """Direct LLM stream for control/default AI with optional neutral chat context."""
         messages = AIService._coerce_raw_context_messages(context_messages)
@@ -624,13 +647,13 @@ class AIService:
         messages = AIService._with_direct_formatting_instruction(messages)
         messages = AIService.truncate_raw_messages(messages, AIService.MAX_CONTEXT_TOKENS)
 
-        llm = await get_llm(temperature=temperature, model_id=model_id)
-        async for chunk in guarded_astream(llm, messages):
-            content = AIService.sanitize_model_output(
-                chunk.content if hasattr(chunk, "content") else str(chunk)
-            )
-            if content:
-                yield content
+        async with AIService._dialogue_model(model_id, temperature, course_model_owner_id) as llm:
+            async for chunk in guarded_astream(llm, messages):
+                content = AIService.sanitize_model_output(
+                    chunk.content if hasattr(chunk, "content") else str(chunk)
+                )
+                if content:
+                    yield content
 
     @staticmethod
     async def raw_chat(
@@ -641,6 +664,7 @@ class AIService:
         category: str = "chat",
         model_id: Optional[str] = None,
         context_messages: Optional[List[dict]] = None,
+        course_model_owner_id: Optional[str] = None,
     ) -> dict:
         """Direct non-streaming chat: preserve history with only neutral readability guidance."""
         if conversation_id:
@@ -671,8 +695,8 @@ class AIService:
         messages = AIService._with_direct_formatting_instruction(messages)
         messages = AIService.truncate_raw_messages(messages, AIService.MAX_CONTEXT_TOKENS)
 
-        llm = await get_llm(temperature=0.7, model_id=model_id)
-        response = await guarded_ainvoke(llm, messages)
+        async with AIService._dialogue_model(model_id, 0.7, course_model_owner_id) as llm:
+            response = await guarded_ainvoke(llm, messages)
         response_text = AIService.sanitize_model_output(
             response.content if hasattr(response, "content") else str(response)
         )
@@ -708,6 +732,7 @@ class AIService:
         category: str = "chat",
         model_id: Optional[str] = None,
         context_messages: Optional[List[dict]] = None,
+        course_model_owner_id: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """Direct streaming chat: preserve history with only neutral readability guidance."""
         if conversation_id:
@@ -744,16 +769,16 @@ class AIService:
             content=message,
         ).insert()
 
-        llm = await get_llm(temperature=0.7, model_id=model_id)
         full_response = ""
-        async for chunk in guarded_astream(llm, messages):
-            content = AIService.sanitize_model_output(
-                chunk.content if hasattr(chunk, "content") else str(chunk)
-            )
-            if not content:
-                continue
-            full_response += content
-            yield content
+        async with AIService._dialogue_model(model_id, 0.7, course_model_owner_id) as llm:
+            async for chunk in guarded_astream(llm, messages):
+                content = AIService.sanitize_model_output(
+                    chunk.content if hasattr(chunk, "content") else str(chunk)
+                )
+                if not content:
+                    continue
+                full_response += content
+                yield content
 
         if not full_response.strip():
             full_response = EMPTY_DIRECT_REPLY_FALLBACK

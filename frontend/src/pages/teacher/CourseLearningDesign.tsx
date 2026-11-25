@@ -1,9 +1,10 @@
-import { useEffect, useId, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useId, useState, type FormEvent } from 'react'
 import { ChevronDown, Plus, RotateCcw, Save, Trash2, Users } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogTitle, DialogTrigger } from '../../components/ui/dialog'
-import { courseService, type BuiltinLearningDesignRole, type BuiltinRoleId, type CustomLearningDesignRole, type DesignSnapshot, type LearningDesign, type LearningDesignRole, type StageItem } from '../../services/api/course'
+import { courseService, type BuiltinLearningDesignRole, type BuiltinRoleId, type CustomLearningDesignRole, type DesignSnapshot, type LearningDesign, type LearningDesignModelAssignments, type LearningDesignModelOption, type LearningDesignRole, type StageItem } from '../../services/api/course'
 import { projectService } from '../../services/api/project'
+import TeacherModelConnections from './TeacherModelConnections'
 
 const roles: { id: BuiltinRoleId; label: string; example: string }[] = [
   { id: 'evidence_researcher', label: '资料研究员', example: '示例：请帮助小组核对资料来源，指出还需要补充的证据。' },
@@ -30,6 +31,8 @@ const modes = {
 }
 const field = 'w-full min-w-0 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-sm placeholder:text-slate-500 focus:placeholder:text-transparent'
 type Notice = { message: string; error?: boolean }
+type DesignDraft = LearningDesign & { model_assignments: LearningDesignModelAssignments }
+type ModelCatalog = { status: 'loading' | 'error' } | { status: 'ready'; models: LearningDesignModelOption[] }
 
 function defaultRole(id: BuiltinRoleId): BuiltinLearningDesignRole {
   return { id, enabled: true, prompt: '' }
@@ -44,8 +47,26 @@ function customRoleId(): CustomLearningDesignRole['id'] {
   return `custom_${Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')}`
 }
 
-function editorValues(snapshot: DesignSnapshot | null): LearningDesign {
+function withCurrentRoleModels(draft: DesignDraft): DesignDraft {
+  const { default_model_id, role_model_ids } = draft.model_assignments
   return {
+    ...draft,
+    model_assignments: {
+      default_model_id,
+      role_model_ids: Object.fromEntries(draft.roles.flatMap(({ id }) =>
+        role_model_ids[id] ? [[id, role_model_ids[id]]] : [])),
+    },
+  }
+}
+
+function assignedModelIds(assignments: LearningDesign['model_assignments']): string[] {
+  if (!assignments) return []
+  const roleIds = Object.values(assignments.role_model_ids)
+  return assignments.default_model_id ? [assignments.default_model_id, ...roleIds] : roleIds
+}
+
+function editorValues(snapshot: DesignSnapshot | null): DesignDraft {
+  return withCurrentRoleModels({
     roles: [
       ...roles.map(({ id }) => {
         const saved = snapshot?.roles.find(role => role.id === id)
@@ -58,7 +79,29 @@ function editorValues(snapshot: DesignSnapshot | null): LearningDesign {
       const saved = snapshot?.stages.find(stage => stage.id === id)
       return { id, name: saved?.name === label ? '' : saved?.name ?? '', activity_guidance: saved?.activity_guidance ?? '' }
     }),
-  }
+    model_assignments: snapshot?.model_assignments ?? { default_model_id: null, role_model_ids: {} },
+  })
+}
+
+function ModelSelect({ label, inherited, value, catalog, onChange }: {
+  label: string
+  inherited: string
+  value: string
+  catalog: ModelCatalog
+  onChange: (value: string) => void
+}) {
+  const models = catalog.status === 'ready' ? catalog.models : []
+  const unmatched = !!value && !models.some(model => model.id === value)
+  return (
+    <label className="block text-sm font-medium">{label}
+      <select className={`${field} mt-1`} value={value} onChange={event => onChange(event.target.value)}
+        aria-invalid={unmatched && catalog.status === 'ready'} disabled={catalog.status !== 'ready' && !value}>
+        <option value="">{inherited}</option>
+        {unmatched && <option value={value} disabled>{catalog.status === 'ready' ? '原选模型已不可用' : '原选模型待核验'}</option>}
+        {models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}
+      </select>
+    </label>
+  )
 }
 
 export default function CourseLearningDesign({ courseId }: { courseId: string }) {
@@ -90,7 +133,15 @@ function DesignEditor({ courseId }: { courseId: string }) {
   const [draft, setDraft] = useState(() => editorValues(null))
   const [saving, setSaving] = useState(false)
   const [notice, setNotice] = useState<Notice | null>(null)
-  const dirty = JSON.stringify(draft) !== JSON.stringify(editorValues(saved))
+  const [catalog, setCatalog] = useState<ModelCatalog>({ status: 'loading' })
+  const [catalogAttempt, setCatalogAttempt] = useState(0)
+  const savedValues = editorValues(saved)
+  const savedModelIds = assignedModelIds(saved?.model_assignments)
+  const orphans = savedModelIds.length !== assignedModelIds(savedValues.model_assignments).length
+  const dirty = orphans || JSON.stringify(draft) !== JSON.stringify(savedValues)
+  const modelIds = assignedModelIds(draft.model_assignments)
+  const modelsValid = !modelIds.length || (catalog.status === 'ready'
+    && modelIds.every(id => catalog.models.some(model => model.id === id)))
   const hasEnabledRole = draft.roles.some(role => role.enabled)
   const customRoles = draft.roles.filter(isCustomRole)
   const customNames = customRoles.map(role => role.name.trim().toLowerCase())
@@ -110,7 +161,7 @@ function DesignEditor({ courseId }: { courseId: string }) {
   })
   const canSave = !saving && hasEnabledRole && customRoles.length <= maxCustomRoles
     && !customErrors.some(({ nameError, promptError }) => nameError || promptError)
-    && (!saved || dirty)
+    && modelsValid && (!saved || dirty)
 
   useEffect(() => {
     let active = true
@@ -123,13 +174,42 @@ function DesignEditor({ courseId }: { courseId: string }) {
     return () => { active = false }
   }, [courseId, attempt])
 
-  function edit(update: (current: LearningDesign) => LearningDesign) {
-    setDraft(update)
+  useEffect(() => {
+    let active = true
+    courseService.getLearningDesignModels(courseId).then(models => {
+      if (active) setCatalog({ status: 'ready', models })
+    }, () => { if (active) setCatalog({ status: 'error' }) })
+    return () => { active = false }
+  }, [courseId, catalogAttempt])
+
+  const reloadModelCatalog = useCallback(() => {
+    setCatalog({ status: 'loading' })
+    setCatalogAttempt(current => current + 1)
+  }, [])
+
+  function edit(update: (current: DesignDraft) => DesignDraft) {
+    setDraft(current => withCurrentRoleModels(update(current)))
     setNotice(null)
   }
 
-  function editRole(id: LearningDesignRole['id'], patch: Partial<Omit<CustomLearningDesignRole, 'id'>>) {
-    edit(current => ({ ...current, roles: current.roles.map(role => role.id === id ? { ...role, ...patch } : role) }))
+  function withRoleModel(current: DesignDraft, id: string, modelId: string): DesignDraft {
+    const role_model_ids = { ...current.model_assignments.role_model_ids }
+    if (modelId) role_model_ids[id] = modelId
+    else delete role_model_ids[id]
+    return { ...current, model_assignments: { ...current.model_assignments, role_model_ids } }
+  }
+
+  function editRole(id: LearningDesignRole['id'], patch: Partial<Omit<CustomLearningDesignRole, 'id'>>, resetModel = false) {
+    edit(current => ({
+      ...(resetModel ? withRoleModel(current, id, '') : current),
+      roles: current.roles.map(role => role.id === id ? { ...role, ...patch } : role),
+    }))
+  }
+
+  function roleModelSelect(id: LearningDesignRole['id'], label: string) {
+    return <ModelSelect label={`${label}模型`} inherited="跟随班级默认" catalog={catalog}
+      value={draft.model_assignments.role_model_ids[id] ?? ''}
+      onChange={modelId => edit(current => withRoleModel(current, id, modelId))} />
   }
 
   function addCustomRole() {
@@ -156,6 +236,7 @@ function DesignEditor({ courseId }: { courseId: string }) {
         // An explicit blank prompt uses the runtime default without copying system text into the editor.
         roles: draft.roles.map(role => isCustomRole(role) ? { ...role, name: role.name.trim() } : role),
         stages: draft.stages.filter(stage => stage.name !== '' || stage.activity_guidance !== ''),
+        ...(modelIds.length || savedModelIds.length ? { model_assignments: draft.model_assignments } : {}),
       })
       if (!design) throw new Error('Missing saved learning design')
       setSaved(design)
@@ -181,8 +262,30 @@ function DesignEditor({ courseId }: { courseId: string }) {
 
   return (
     <div className="space-y-3 pb-2 pt-1">
+      <TeacherModelConnections onChanged={reloadModelCatalog} />
       <form id={formId} onSubmit={save}>
         <fieldset disabled={saving} className="min-w-0 space-y-4">
+          <fieldset className="min-w-0 space-y-2">
+            <legend className="mb-2 text-sm font-semibold">模型设置</legend>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <ModelSelect label="班级默认模型" inherited="沿用平台模型设置" catalog={catalog}
+                value={draft.model_assignments.default_model_id ?? ''}
+                onChange={modelId => edit(current => ({ ...current, model_assignments: {
+                  ...current.model_assignments, default_model_id: modelId || null,
+                } }))} />
+            </div>
+            {catalog.status === 'loading' && <p role="status" className="text-sm text-slate-600">正在加载可用模型…</p>}
+            {catalog.status === 'error' && <div className="flex flex-wrap items-center gap-2">
+              <p role="alert" className="text-sm text-red-700">无法加载可用模型。</p>
+              <Button type="button" size="sm" variant="outline" onClick={reloadModelCatalog}>重试加载模型</Button>
+            </div>}
+            {catalog.status === 'ready' && !modelsValid && <p role="alert" className="text-sm text-red-700">原选模型已不可用，请重新选择或清除后再保存或应用。</p>}
+            <Button type="button" size="sm" variant="outline" className="whitespace-normal"
+              disabled={!Object.keys(draft.model_assignments.role_model_ids).length}
+              onClick={() => edit(current => ({ ...current, model_assignments: {
+                ...current.model_assignments, role_model_ids: {},
+              } }))}>所有角色使用班级默认</Button>
+          </fieldset>
           <fieldset className="min-w-0">
             <legend className="mb-2 text-sm font-semibold">AI 角色</legend>
             <div className="grid gap-x-5 gap-y-3 sm:grid-cols-2">
@@ -197,12 +300,14 @@ function DesignEditor({ courseId }: { courseId: string }) {
                       </label>
                       <Button type="button" size="icon" variant="ghost" className="h-8 w-8 shrink-0"
                         title={`恢复${label}默认设置`} aria-label={`恢复${label}默认设置`}
-                        disabled={role.enabled && !role.prompt} onClick={() => editRole(id, { enabled: true, prompt: '' })}>
+                        disabled={role.enabled && !role.prompt && !draft.model_assignments.role_model_ids[id]}
+                        onClick={() => editRole(id, { enabled: true, prompt: '' }, true)}>
                         <RotateCcw size={15} aria-hidden="true" />
                       </Button>
                     </div>
                     <textarea aria-label={`${label}提示词`} rows={3} maxLength={maxRolePromptLength} className={field}
                       value={role.prompt} placeholder={example} onChange={event => editRole(id, { prompt: event.target.value })} />
+                    {roleModelSelect(id, label)}
                   </div>
                 )
               })}
@@ -248,6 +353,7 @@ function DesignEditor({ courseId }: { courseId: string }) {
                       </label>
                       {promptError && <span id={promptErrorId} className="block text-xs text-red-700">{promptError}</span>}
                     </div>
+                    {roleModelSelect(role.id, role.name.trim() || `自定义角色 ${index + 1}`)}
                     <div className="flex items-center justify-between gap-2">
                       <label className="flex items-center gap-2 text-sm">
                         <input type="checkbox" checked={role.enabled} onChange={event => editRole(role.id, { enabled: event.target.checked })} />
@@ -297,7 +403,7 @@ function DesignEditor({ courseId }: { courseId: string }) {
       {!hasEnabledRole && <p role="alert" className="text-sm text-red-700">请至少启用一个 AI 角色。</p>}
       <div className="flex flex-wrap items-center gap-2">
         <Button type="submit" form={formId} size="sm" className="gap-1.5" disabled={!canSave}><Save size={15} aria-hidden="true" />{saving ? '正在保存…' : '保存学习设计'}</Button>
-        <ApplyDesign courseId={courseId} enabled={!!saved && !dirty && !saving} onApplied={setNotice} />
+        <ApplyDesign courseId={courseId} enabled={!!saved && !dirty && !saving && modelsValid} onApplied={setNotice} />
         <span className="text-sm text-slate-600">{dirty ? '有未保存的修改' : !saved ? '尚未保存' : '已保存'}</span>
       </div>
       {notice && <p role={notice.error ? 'alert' : 'status'} className={`break-words text-sm ${notice.error ? 'text-red-700' : 'text-emerald-700'}`}>{notice.message}</p>}

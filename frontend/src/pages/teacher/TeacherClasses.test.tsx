@@ -14,11 +14,14 @@ vi.mock('../../services/api/course', () => ({
   courseService: {
     getCourses: vi.fn(), getCourseStudents: vi.fn(),
     getCourseAISettings: vi.fn(), updateCourseAISettings: vi.fn(),
-    getLearningDesign: vi.fn(), saveLearningDesign: vi.fn(), applyLearningDesign: vi.fn(),
+    getLearningDesign: vi.fn(), getLearningDesignModels: vi.fn(), saveLearningDesign: vi.fn(), applyLearningDesign: vi.fn(),
     createCourse: vi.fn(), updateCourse: vi.fn(), getExperimentTemplates: vi.fn(),
   },
 }))
 vi.mock('../../services/api/project', () => ({ projectService: { getProjects: vi.fn() } }))
+vi.mock('./TeacherModelConnections', () => ({
+  default: ({ onChanged }: { onChanged: () => void }) => <button type="button" onClick={onChanged}>更新连接</button>,
+}))
 
 function open(path = '') {
   const course = { teacher_id: 'me', students: ['s1'], invite_code: '', created_at: '' }
@@ -33,6 +36,7 @@ function open(path = '') {
   ])
   vi.mocked(courseService.getCourseAISettings).mockResolvedValue(null)
   vi.mocked(courseService.getLearningDesign).mockResolvedValue(null)
+  vi.mocked(courseService.getLearningDesignModels).mockResolvedValue([])
   render(<MemoryRouter initialEntries={[`/teacher/overview${path}`]}>
     <Routes><Route path="/teacher/overview/:courseId?" element={<TeacherClasses />} /></Routes>
   </MemoryRouter>)
@@ -69,6 +73,7 @@ it('does not fetch the roster for a direct link to an unowned class', async () =
   expect(courseService.getCourseStudents).not.toHaveBeenCalled()
   expect(courseService.getCourseAISettings).not.toHaveBeenCalled()
   expect(courseService.getLearningDesign).not.toHaveBeenCalled()
+  expect(courseService.getLearningDesignModels).not.toHaveBeenCalled()
 })
 
 it('pages the roster, clamps jumps and resets the page when the page size changes', async () => {
@@ -241,6 +246,8 @@ it('opens the learning design on demand, edits sparse snapshots and restores a r
   fireEvent.click(section)
   expect(prompt.value).toBe('')
   expect(courseService.getLearningDesign).toHaveBeenCalledTimes(1)
+  expect(courseService.getLearningDesignModels).toHaveBeenCalledTimes(1)
+  expect(courseService.getLearningDesignModels).toHaveBeenCalledWith('spring')
 
   fireEvent.click(screen.getByRole('radio', { name: '多角色接力' }))
   const name = screen.getByRole<HTMLInputElement>('textbox', { name: /问题构建.*阶段名称/ })
@@ -268,6 +275,105 @@ it('opens the learning design on demand, edits sparse snapshots and restores a r
   expect(projectService.getProjects).not.toHaveBeenCalled()
   expect(courseService.applyLearningDesign).not.toHaveBeenCalled()
   expect(courseService.updateCourseAISettings).not.toHaveBeenCalled()
+})
+
+it('saves class, built-in and custom model choices separately from the role JSON', async () => {
+  open('/spring')
+  const custom = { id: 'custom_example', name: '核验员', prompt: '核验资料', enabled: true, routing_anchor: 'evidence_researcher' } as const
+  vi.mocked(courseService.getLearningDesign).mockResolvedValue({ ...existingDesign, roles: [...existingDesign.roles, custom], model_assignments: null })
+  vi.mocked(courseService.getLearningDesignModels).mockResolvedValue([{ id: 'connection-a', name: '模型 A' }, { id: 'connection-b', name: '模型 B' }])
+  vi.mocked(courseService.saveLearningDesign).mockImplementation(async (_, design) => ({ ...design, revision: 'r2' }))
+  fireEvent.click(await screen.findByRole('button', { name: '班级学习设计' }))
+  const defaultModel = await screen.findByRole<HTMLSelectElement>('combobox', { name: '班级默认模型' })
+  const builtin = screen.getByRole<HTMLSelectElement>('combobox', { name: '资料研究员模型' })
+  const customModel = screen.getByRole<HTMLSelectElement>('combobox', { name: '核验员模型' })
+  expect(defaultModel.selectedOptions[0].textContent).toBe('沿用平台模型设置')
+  expect(builtin.selectedOptions[0].textContent).toBe('跟随班级默认')
+  fireEvent.change(defaultModel, { target: { value: 'connection-a' } })
+  fireEvent.change(builtin, { target: { value: 'connection-b' } })
+  fireEvent.change(customModel, { target: { value: 'connection-b' } })
+  const save = screen.getByRole('button', { name: '保存学习设计' })
+  fireEvent.click(save)
+  await screen.findByText('班级学习设计已保存，现有小组未更改。')
+  const submitted = vi.mocked(courseService.saveLearningDesign).mock.calls[0][1]
+  expect(submitted.model_assignments).toEqual({
+    default_model_id: 'connection-a', role_model_ids: { evidence_researcher: 'connection-b', [custom.id]: 'connection-b' },
+  })
+  expect(submitted.roles[0]).toEqual(existingDesign.roles[0])
+  expect(submitted.roles[4]).toEqual(custom)
+
+  fireEvent.click(screen.getByRole('button', { name: '所有角色使用班级默认' }))
+  expect(defaultModel.value).toBe('connection-a')
+  expect(builtin.value).toBe('')
+  expect(customModel.value).toBe('')
+  fireEvent.click(save)
+  await screen.findByText('班级学习设计已保存，现有小组未更改。')
+  expect(courseService.saveLearningDesign).toHaveBeenLastCalledWith('spring', {
+    ...submitted, model_assignments: { default_model_id: 'connection-a', role_model_ids: {} },
+  })
+})
+
+it('refreshes after connection changes and requires an explicit change for unavailable choices', async () => {
+  open('/spring')
+  vi.mocked(courseService.getLearningDesign).mockResolvedValue({ ...existingDesign, model_assignments: { default_model_id: 'old', role_model_ids: {} } })
+  vi.mocked(courseService.getLearningDesignModels).mockResolvedValueOnce([{ id: 'old', name: '旧模型' }])
+  vi.mocked(courseService.saveLearningDesign).mockImplementation(async (_, design) => ({ ...design, revision: 'r2' }))
+  fireEvent.click(await screen.findByRole('button', { name: '班级学习设计' }))
+  const defaultModel = await screen.findByRole<HTMLSelectElement>('combobox', { name: '班级默认模型' })
+  await within(defaultModel).findByRole('option', { name: '旧模型' })
+  const apply = screen.getByRole<HTMLButtonElement>('button', { name: '应用到小组' })
+  const save = screen.getByRole<HTMLButtonElement>('button', { name: '保存学习设计' })
+  expect(apply.disabled).toBe(false)
+  fireEvent.click(screen.getByRole('button', { name: '更新连接' }))
+  await screen.findByText('原选模型已不可用，请重新选择或清除后再保存或应用。')
+  expect(defaultModel.value).toBe('old')
+  expect(defaultModel.selectedOptions[0].textContent).toBe('原选模型已不可用')
+  expect(apply.disabled).toBe(true)
+  fireEvent.change(screen.getByRole('textbox', { name: '问题构建活动指导' }), { target: { value: '阶段修改' } })
+  expect(save.disabled).toBe(true)
+  fireEvent.change(defaultModel, { target: { value: '' } })
+  fireEvent.click(save)
+  await screen.findByText('班级学习设计已保存，现有小组未更改。')
+  expect(vi.mocked(courseService.saveLearningDesign).mock.calls[0][1].model_assignments).toEqual({ default_model_id: null, role_model_ids: {} })
+})
+
+it('retries the catalog locally and leaves unassigned designs usable while it fails', async () => {
+  open('/spring')
+  vi.mocked(courseService.getLearningDesign).mockResolvedValue({ ...existingDesign, model_assignments: null })
+  vi.mocked(courseService.getLearningDesignModels).mockRejectedValueOnce(new Error('private diagnostic'))
+    .mockResolvedValueOnce([{ id: 'new', name: '新连接' }])
+  vi.mocked(courseService.saveLearningDesign).mockImplementation(async (_, design) => ({ ...design, revision: 'r2' }))
+  fireEvent.click(await screen.findByRole('button', { name: '班级学习设计' }))
+  await screen.findByText('无法加载可用模型。')
+  expect(screen.queryByText('private diagnostic')).toBeNull()
+  fireEvent.change(screen.getByRole('textbox', { name: '问题构建活动指导' }), { target: { value: '阶段修改' } })
+  fireEvent.click(screen.getByRole('button', { name: '保存学习设计' }))
+  await screen.findByText('班级学习设计已保存，现有小组未更改。')
+  expect(vi.mocked(courseService.saveLearningDesign).mock.calls[0][1]).not.toHaveProperty('model_assignments')
+  fireEvent.click(screen.getByRole('button', { name: '重试加载模型' }))
+  const selector = within(screen.getByRole('combobox', { name: '班级默认模型' }))
+  expect(await selector.findByRole('option', { name: '新连接' })).toBeTruthy()
+  expect(courseService.getLearningDesign).toHaveBeenCalledTimes(1)
+})
+
+it('cleans up role bindings when a role is restored or removed', async () => {
+  open('/spring')
+  const custom = { id: 'custom_example', name: '核验员', prompt: '核验资料', enabled: true, routing_anchor: 'evidence_researcher' } as const
+  vi.mocked(courseService.getLearningDesign).mockResolvedValue({
+    ...existingDesign, roles: [...existingDesign.roles, custom],
+    model_assignments: { default_model_id: null, role_model_ids: { evidence_researcher: 'old', [custom.id]: 'old', custom_orphan: 'old' } },
+  })
+  vi.mocked(courseService.saveLearningDesign).mockImplementation(async (_, design) => ({ ...design, revision: 'r2' }))
+  fireEvent.click(await screen.findByRole('button', { name: '班级学习设计' }))
+  await screen.findByText('原选模型已不可用，请重新选择或清除后再保存或应用。')
+  fireEvent.click(screen.getByRole('button', { name: '恢复资料研究员默认设置' }))
+  expect(screen.getByRole<HTMLSelectElement>('combobox', { name: '资料研究员模型' }).value).toBe('')
+  fireEvent.click(screen.getByRole('button', { name: '移除自定义角色' }))
+  fireEvent.click(screen.getByRole('button', { name: '保存学习设计' }))
+  await screen.findByText('班级学习设计已保存，现有小组未更改。')
+  const submitted = vi.mocked(courseService.saveLearningDesign).mock.calls[0][1]
+  expect(submitted.model_assignments).toEqual({ default_model_id: null, role_model_ids: {} })
+  expect(submitted.roles.some(role => role.id === custom.id)).toBe(false)
 })
 
 it('requires a confirmed save and explicit confirmation before applying to one eligible group on a later page', async () => {

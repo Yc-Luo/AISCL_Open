@@ -9,7 +9,9 @@ import uuid
 from typing import Any, Dict, Optional
 
 from app.core.ai_scaffold_mode import normalize_ai_scaffold_mode
+from app.core.llm_config import DedicatedModelUnavailable
 from app.services.agents.course_learning_design import resolve_course_learning_design
+from app.services.course_model_service import CourseModelUnavailable, resolve_project_model_assignments
 
 from app.services.agents.auto_prompt_policy import (
     AUTO_GROUP_PROMPT_RULE_TYPES,
@@ -600,6 +602,7 @@ async def _process_ai_reply(
 ):
     """Process AI response in background and broadcast."""
     typing_started = False
+    course_models = {}
     try:
         from app.services.agents.agent_service import agent_service
         from app.services.agents.deep_agents_shim import derive_routing_decision_from_context
@@ -627,6 +630,10 @@ async def _process_ai_reply(
         experiment_version = getattr(project, "experiment_version", None) or {}
         current_stage = experiment_version.get("current_stage")
         ai_scaffold_mode = normalize_ai_scaffold_mode(experiment_version.get("ai_scaffold_mode"))
+        if project:
+            course_models = await resolve_project_model_assignments(
+                project, include_roles=ai_scaffold_mode == "multi_agent",
+            )
         shared_memory_enabled = is_experimental_memory_enabled(experiment_version)
         group_memory: Dict[str, Any] = await _build_recent_group_chat_context(
             project_id=project_id,
@@ -681,6 +688,7 @@ async def _process_ai_reply(
             "ai_scaffold_mode": ai_scaffold_mode,
             "process_scaffold_mode": experiment_version.get("process_scaffold_mode"),
             "runtime_model_id": _group_multi_agent_model_id(experiment_version),
+            "course_models": course_models,
             **(resolve_course_learning_design(experiment_version, current_stage) if ai_scaffold_mode == "multi_agent" else {}),
         }
         ai_user_id = "ai_assistant"
@@ -747,8 +755,9 @@ async def _process_ai_reply(
 
             async for chunk in ai_service.raw_completion_stream(
                 user_content,
-                model_id=_default_chat_model_id(experiment_version),
+                model_id=course_models.get("default_model_id") or _default_chat_model_id(experiment_version),
                 context_messages=direct_context_messages,
+                **({"course_model_owner_id": course_models["course_owner_id"]} if course_models else {}),
             ):
                 full_response += chunk
                 candidate_display = _sanitize_stream_display_content(full_response)
@@ -960,11 +969,19 @@ async def _process_ai_reply(
             )
         
     except Exception as e:
-        logger.exception("Error processing AI reply for project %s: %s", project_id, e)
+        unavailable_model = isinstance(e, (CourseModelUnavailable, DedicatedModelUnavailable))
+        if course_models or unavailable_model:
+            logger.warning("Configured model request failed for project %s (%s)", project_id, type(e).__name__)
+        else:
+            logger.exception("Error processing AI reply for project %s: %s", project_id, e)
         try:
             fallback_text = (
                 "AISCL智能助手暂时没有成功生成回应。请稍后重试，或先把当前问题、已有依据和下一步分工写在群聊中。"
             )
+            if unavailable_model:
+                fallback_text = "小组配置的模型连接不可用，请联系教师检查连接或授权。"
+            elif course_models:
+                fallback_text = "班级模型暂时无法回应，请联系教师检查模型连接。"
             fallback_id = str(uuid.uuid4())
             fallback_timestamp = _utc_iso_timestamp()
             from app.repositories.chat_log import ChatLog

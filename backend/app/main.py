@@ -14,6 +14,7 @@ from app.api.v1 import (
     projects,
     storage,
     courses,
+    teacher_model_connections,
     course_task_releases,
     tasks,
     calendar,
@@ -189,6 +190,7 @@ app.include_router(users.router, prefix="/api/v1")
 app.include_router(projects.router, prefix="/api/v1")
 app.include_router(storage.router, prefix="/api/v1")
 app.include_router(courses.router, prefix="/api/v1")
+app.include_router(teacher_model_connections.router, prefix="/api/v1")
 app.include_router(course_task_releases.router, prefix="/api/v1")
 app.include_router(tasks.router, prefix="/api/v1")
 app.include_router(calendar.router, prefix="/api/v1")

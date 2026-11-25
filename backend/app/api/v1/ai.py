@@ -39,6 +39,7 @@ from app.services.intervention_service import intervention_service
 from app.services.rag_service import rag_service
 from app.services.agents.agent_service import agent_service
 from app.services.agents.course_learning_design import resolve_course_learning_design
+from app.services.course_model_service import CourseModelUnavailable, resolve_project_model_assignments
 from app.services.group_memory_service import group_memory_service
 from app.services.learning_object_memory_service import is_experimental_memory_enabled
 
@@ -308,6 +309,22 @@ async def _get_chat_conversation(conversation_id: str, project_id: str, user_id:
     return conversation
 
 
+async def _course_models_for_request(project: Project, *, include_roles: bool) -> dict:
+    try:
+        return await resolve_project_model_assignments(project, include_roles=include_roles)
+    except CourseModelUnavailable:
+        raise HTTPException(status_code=409, detail="小组配置的模型连接不可用，请联系教师检查连接或授权。") from None
+
+
+def _direct_model_options(version: dict, course_models: dict) -> dict:
+    if course_models.get("default_model_id"):
+        return {
+            "model_id": course_models["default_model_id"],
+            "course_model_owner_id": course_models["course_owner_id"],
+        }
+    return {"model_id": _default_chat_model_id(version)}
+
+
 async def _build_direct_ai_context(
     *,
     project: Project,
@@ -375,16 +392,23 @@ async def chat(
         if getattr(project, "experiment_version", None)
         else {}
     )
-    if not _is_multi_agent_mode(experiment_version):
+    multi_agent = _is_multi_agent_mode(experiment_version)
+    course_models = await _course_models_for_request(project, include_roles=multi_agent)
+    if not multi_agent:
         direct_context = await _build_direct_ai_context(project=project, chat_data=chat_data)
-        response = await ai_service.raw_chat(
-            project_id=chat_data.project_id,
-            user_id=str(current_user.id),
-            message=chat_data.message or "",
-            conversation_id=chat_data.conversation_id,
-            model_id=_default_chat_model_id(experiment_version),
-            context_messages=direct_context,
-        )
+        try:
+            response = await ai_service.raw_chat(
+                project_id=chat_data.project_id,
+                user_id=str(current_user.id),
+                message=chat_data.message or "",
+                conversation_id=chat_data.conversation_id,
+                context_messages=direct_context,
+                **_direct_model_options(experiment_version, course_models),
+            )
+        except Exception:
+            if course_models:
+                raise HTTPException(status_code=502, detail="班级模型暂时无法回应，请联系教师检查模型连接。") from None
+            raise
         return AIChatResponse(
             conversation_id=response["conversation_id"],
             message=response["message"],
@@ -396,6 +420,8 @@ async def chat(
     # Retrieve context using RAG if enabled. Only multi-agent experimental
     # conditions use platform context and support metadata.
     course_graph = _configured_tutor_context(project, chat_data, str(current_user.id))
+    if course_graph and course_models:
+        course_graph["course_models"] = course_models
     context = None
     if chat_data.use_rag and not course_graph:
         try:
@@ -422,20 +448,25 @@ async def chat(
     use_role_view = True
 
     # Chat with AI
-    response = await ai_service.chat(
-        project_id=chat_data.project_id,
-        user_id=str(current_user.id),
-        message=chat_data.message,
-        role_id=chat_data.role_id,
-        conversation_id=chat_data.conversation_id,
-        context=context,
-        **({"graph_context": course_graph} if course_graph else {}),
-        message_metadata=(
-            {"ai_meta": _build_tutor_ai_meta(chat_data, use_role_view=use_role_view)}
-            if chat_data.role_id == "default-tutor"
-            else None
-        ),
-    )
+    try:
+        response = await ai_service.chat(
+            project_id=chat_data.project_id,
+            user_id=str(current_user.id),
+            message=chat_data.message,
+            role_id=chat_data.role_id,
+            conversation_id=chat_data.conversation_id,
+            context=context,
+            **({"graph_context": course_graph} if course_graph else {}),
+            message_metadata=(
+                {"ai_meta": _build_tutor_ai_meta(chat_data, use_role_view=use_role_view)}
+                if chat_data.role_id == "default-tutor"
+                else None
+            ),
+        )
+    except Exception:
+        if course_models:
+            raise HTTPException(status_code=502, detail="班级模型暂时无法回应，请联系教师检查模型连接。") from None
+        raise
 
     return AIChatResponse(
         conversation_id=response["conversation_id"],
@@ -463,6 +494,7 @@ async def ai_action(
         )
 
     await ensure_project_access(current_user, project)
+    course_models = await _course_models_for_request(project, include_roles=False)
 
     # Define specialized prompts based on action type
     prompts = {
@@ -499,16 +531,22 @@ async def ai_action(
 
     # Use ai_service to perform the chat
     # We pass use_rag=False because the context is already provided explicitly in the content
-    response = await ai_service.chat(
-        project_id=action_data.project_id,
-        user_id=str(current_user.id),
-        message=user_message,
-        role_id=None, # Use default role
-        conversation_id=None, # New session for each action usually
-        context=action_context,
-        system_message_override=system_prompt,
-        category="action",
-    )
+    try:
+        response = await ai_service.chat(
+            project_id=action_data.project_id,
+            user_id=str(current_user.id),
+            message=user_message,
+            role_id=None,
+            conversation_id=None,
+            context=action_context,
+            system_message_override=system_prompt,
+            category="action",
+            **({"course_models": course_models} if course_models else {}),
+        )
+    except Exception:
+        if course_models:
+            raise HTTPException(status_code=502, detail="班级模型暂时无法回应，请联系教师检查模型连接。") from None
+        raise
 
     return AIChatResponse(
         conversation_id=response["conversation_id"],
@@ -534,6 +572,9 @@ async def chat_stream(
         )
 
     await ensure_project_access(current_user, project)
+    version = project.experiment_version or {}
+    multi_agent = _is_multi_agent_mode(version)
+    course_models = await _course_models_for_request(project, include_roles=multi_agent)
 
     conversation: Optional[AIConversation] = None
     if chat_data.conversation_id:
@@ -561,7 +602,10 @@ async def chat_stream(
             if not should_generate_title or not chat_data.message:
                 return
             try:
-                conversation.title = await ai_service.generate_conversation_title(chat_data.message)
+                conversation.title = (
+                    ai_service._direct_conversation_title(chat_data.message)
+                    if course_models else await ai_service.generate_conversation_title(chat_data.message)
+                )
             except Exception as exc:
                 print(f"Conversation title generation skipped: {exc}")
 
@@ -574,7 +618,7 @@ async def chat_stream(
         course_graph = _configured_tutor_context(project, chat_data, str(current_user.id))
         full_response = ""
 
-        if not _is_multi_agent_mode(experiment_version):
+        if not multi_agent:
             try:
                 direct_context = await _build_direct_ai_context(project=project, chat_data=chat_data)
                 async for chunk in ai_service.raw_chat_stream(
@@ -582,8 +626,8 @@ async def chat_stream(
                     user_id=str(current_user.id),
                     message=chat_data.message or "",
                     conversation_id=str(conversation.id),
-                    model_id=_default_chat_model_id(experiment_version),
                     context_messages=direct_context,
+                    **_direct_model_options(experiment_version, course_models),
                 ):
                     full_response += chunk
                     yield _sse_event("delta", chunk)
@@ -597,10 +641,10 @@ async def chat_stream(
                         "citation_count": 0,
                     },
                 )
-            except Exception as exc:
+            except Exception:
                 yield _sse_event(
                     "error",
-                    {"message": "通用 LLM 暂时无法回应，请稍后重试。", "detail": str(exc)},
+                    {"message": "班级模型暂时无法回应，请联系教师检查模型连接。" if course_models else "通用 LLM 暂时无法回应，请稍后重试。"},
                 )
             return
 
@@ -714,6 +758,7 @@ async def chat_stream(
                 "group_state_source_counts": context.get("group_state_source_counts") if context else None,
                 "runtime_model_id": _tutor_multi_agent_model_id(experiment_version),
                 **course_graph,
+                "course_models": course_models,
             }
 
             user_message = AIMessage(
@@ -833,7 +878,10 @@ async def chat_stream(
                 },
             )
         except Exception:
-            logger.exception("Tutor generation failed for project %s", chat_data.project_id)
+            if course_models:
+                logger.warning("Configured tutor model generation failed for project %s", chat_data.project_id)
+            else:
+                logger.exception("Tutor generation failed for project %s", chat_data.project_id)
             yield _sse_event(
                 "error",
                 {
