@@ -14,7 +14,18 @@ def resolve_course_learning_design(version: dict[str, Any], current_stage: str |
         return {}
 
     overrides = {item["id"]: item for item in design.get("roles", [])}
-    enabled = [role for role in SUBAGENT_LABELS if overrides.get(role, {}).get("enabled", True)]
+    custom_roles = {
+        role_id: {"name": role["name"], "routing_anchor": role["routing_anchor"]}
+        for role_id, role in overrides.items()
+        if role_id not in SUBAGENT_LABELS
+        and role.get("enabled") is True
+        and role.get("name")
+        and role.get("routing_anchor") in SUBAGENT_LABELS
+    }
+    enabled = [
+        *custom_roles,
+        *(role for role in SUBAGENT_LABELS if overrides.get(role, {}).get("enabled", True)),
+    ]
     prompts = {
         role: overrides[role]["prompt"] for role in enabled
         if overrides.get(role, {}).get("prompt")
@@ -24,6 +35,7 @@ def resolve_course_learning_design(version: dict[str, Any], current_stage: str |
     return {
         "learning_design_revision": design["revision"],
         "enabled_subagents": enabled,
+        "teacher_custom_roles": custom_roles,
         "teacher_role_prompts": prompts,
         "teacher_orchestration_mode": design.get("orchestration_mode"),
         "teacher_stage_name": stage.get("name"),

@@ -1,16 +1,18 @@
 import { useEffect, useId, useState, type FormEvent } from 'react'
-import { ChevronDown, RotateCcw, Save, Users } from 'lucide-react'
+import { ChevronDown, Plus, RotateCcw, Save, Trash2, Users } from 'lucide-react'
 import { Button } from '../../components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogTitle, DialogTrigger } from '../../components/ui/dialog'
-import { courseService, type DesignSnapshot, type LearningDesign, type LearningDesignRole, type StageItem } from '../../services/api/course'
+import { courseService, type BuiltinLearningDesignRole, type BuiltinRoleId, type CustomLearningDesignRole, type DesignSnapshot, type LearningDesign, type LearningDesignRole, type StageItem } from '../../services/api/course'
 import { projectService } from '../../services/api/project'
 
-const roles: { id: LearningDesignRole['id']; label: string; example: string }[] = [
+const roles: { id: BuiltinRoleId; label: string; example: string }[] = [
   { id: 'evidence_researcher', label: '资料研究员', example: '示例：请帮助小组核对资料来源，指出还需要补充的证据。' },
   { id: 'viewpoint_challenger', label: '观点挑战者', example: '示例：请针对小组的解释提出反例，引导成员检验原有假设。' },
   { id: 'feedback_prompter', label: '反馈追问者', example: '示例：请基于小组当前论证提出一项具体的修改建议和一个追问。' },
   { id: 'problem_progressor', label: '问题推进者', example: '示例：请帮助小组明确当前问题，邀请成员提出下一步行动。' },
 ]
+const maxCustomRoles = 6
+const maxRolePromptLength = 2500
 
 const stages: { id: StageItem['id']; label: string; example: string }[] = [
   { id: 'problem_construction', label: '问题构建', example: '示例：从任务情境中提出候选问题，与同伴商定共同探究的问题。' },
@@ -29,16 +31,28 @@ const modes = {
 const field = 'w-full min-w-0 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-sm placeholder:text-slate-500 focus:placeholder:text-transparent'
 type Notice = { message: string; error?: boolean }
 
-function defaultRole(id: LearningDesignRole['id']): LearningDesignRole {
+function defaultRole(id: BuiltinRoleId): BuiltinLearningDesignRole {
   return { id, enabled: true, prompt: '' }
+}
+
+function isCustomRole(role: LearningDesignRole): role is CustomLearningDesignRole {
+  return 'routing_anchor' in role
+}
+
+function customRoleId(): CustomLearningDesignRole['id'] {
+  const bytes = crypto.getRandomValues(new Uint8Array(8))
+  return `custom_${Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')}`
 }
 
 function editorValues(snapshot: DesignSnapshot | null): LearningDesign {
   return {
-    roles: roles.map(({ id }) => {
-      const saved = snapshot?.roles.find(role => role.id === id)
-      return saved ? { id, enabled: saved.enabled, prompt: saved.prompt } : defaultRole(id)
-    }),
+    roles: [
+      ...roles.map(({ id }) => {
+        const saved = snapshot?.roles.find(role => role.id === id)
+        return saved ? { id, enabled: saved.enabled, prompt: saved.prompt } : defaultRole(id)
+      }),
+      ...(snapshot?.roles.filter(isCustomRole) ?? []),
+    ],
     orchestration_mode: snapshot?.orchestration_mode ?? 'adaptive',
     stages: stages.map(({ id, label }) => {
       const saved = snapshot?.stages.find(stage => stage.id === id)
@@ -78,7 +92,25 @@ function DesignEditor({ courseId }: { courseId: string }) {
   const [notice, setNotice] = useState<Notice | null>(null)
   const dirty = JSON.stringify(draft) !== JSON.stringify(editorValues(saved))
   const hasEnabledRole = draft.roles.some(role => role.enabled)
-  const canSave = !saving && hasEnabledRole && (!saved || dirty)
+  const customRoles = draft.roles.filter(isCustomRole)
+  const customNames = customRoles.map(role => role.name.trim().toLowerCase())
+  const customErrors = customRoles.map((role, index) => {
+    const name = role.name.trim()
+    const nameKey = customNames[index]
+    const nameError = !name || [...name].length > 40 || /[\r\n\v\f\u0085\u2028\u2029]/.test(role.name)
+      ? '请输入 1–40 个字符的单行名称。'
+      : roles.some(({ label }) => label.toLowerCase() === nameKey)
+        || customNames.some((other, i) => i !== index && other === nameKey)
+        ? '角色名称不可与内置或其他自定义角色重复。'
+        : ''
+    const promptError = !role.prompt.trim() || role.prompt.length > maxRolePromptLength
+      ? '请输入非空提示词，最多 2500 个字符。'
+      : ''
+    return { nameError, promptError }
+  })
+  const canSave = !saving && hasEnabledRole && customRoles.length <= maxCustomRoles
+    && !customErrors.some(({ nameError, promptError }) => nameError || promptError)
+    && (!saved || dirty)
 
   useEffect(() => {
     let active = true
@@ -96,8 +128,17 @@ function DesignEditor({ courseId }: { courseId: string }) {
     setNotice(null)
   }
 
-  function editRole(id: LearningDesignRole['id'], patch: Partial<Omit<LearningDesignRole, 'id'>>) {
+  function editRole(id: LearningDesignRole['id'], patch: Partial<Omit<CustomLearningDesignRole, 'id'>>) {
     edit(current => ({ ...current, roles: current.roles.map(role => role.id === id ? { ...role, ...patch } : role) }))
+  }
+
+  function addCustomRole() {
+    let id = customRoleId()
+    while (customRoles.some(role => role.id === id)) id = customRoleId()
+    edit(current => current.roles.filter(isCustomRole).length >= maxCustomRoles ? current : ({
+      ...current,
+      roles: [...current.roles, { id, enabled: true, prompt: '', name: '', routing_anchor: roles[0].id }],
+    }))
   }
 
   function editStage(id: StageItem['id'], patch: Partial<Omit<StageItem, 'id'>>) {
@@ -113,7 +154,7 @@ function DesignEditor({ courseId }: { courseId: string }) {
       const design = await courseService.saveLearningDesign(courseId, {
         orchestration_mode: draft.orchestration_mode,
         // An explicit blank prompt uses the runtime default without copying system text into the editor.
-        roles: draft.roles,
+        roles: draft.roles.map(role => isCustomRole(role) ? { ...role, name: role.name.trim() } : role),
         stages: draft.stages.filter(stage => stage.name !== '' || stage.activity_guidance !== ''),
       })
       if (!design) throw new Error('Missing saved learning design')
@@ -160,9 +201,65 @@ function DesignEditor({ courseId }: { courseId: string }) {
                         <RotateCcw size={15} aria-hidden="true" />
                       </Button>
                     </div>
-                    <textarea aria-label={`${label}提示词`} rows={3} maxLength={2500} className={field}
+                    <textarea aria-label={`${label}提示词`} rows={3} maxLength={maxRolePromptLength} className={field}
                       value={role.prompt} placeholder={example} onChange={event => editRole(id, { prompt: event.target.value })} />
                   </div>
+                )
+              })}
+            </div>
+            <div className="mt-3 space-y-3 border-t border-slate-200 pt-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <Button type="button" size="sm" variant="outline" className="gap-1.5"
+                  disabled={customRoles.length >= maxCustomRoles} onClick={addCustomRole}>
+                  <Plus size={15} aria-hidden="true" />添加自定义角色
+                </Button>
+                <span className="text-sm text-slate-600">自定义角色 {customRoles.length}/{maxCustomRoles}</span>
+              </div>
+              {customRoles.map((role, index) => {
+                const { nameError, promptError } = customErrors[index]
+                const example = roles.find(({ id }) => id === role.routing_anchor)?.example
+                const nameErrorId = `${formId}-${role.id}-name-error`
+                const promptErrorId = `${formId}-${role.id}-prompt-error`
+                return (
+                  <fieldset key={role.id} className="min-w-0 space-y-2 border-t border-slate-200 pt-2">
+                    <legend className="pr-2 text-sm font-medium">自定义角色 {index + 1}</legend>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <div>
+                        <label className="block text-sm font-medium">角色名称
+                          <input value={role.name} className={`${field} mt-1`}
+                            aria-invalid={!!nameError} aria-describedby={nameError ? nameErrorId : undefined}
+                            onChange={event => editRole(role.id, { name: event.target.value })} />
+                        </label>
+                        {nameError && <span id={nameErrorId} className="mt-1 block text-xs text-red-700">{nameError}</span>}
+                      </div>
+                      <label className="block text-sm font-medium">路由类别
+                        <select value={role.routing_anchor} className={`${field} mt-1`}
+                          onChange={event => editRole(role.id, { routing_anchor: event.target.value as BuiltinRoleId })}>
+                          {roles.map(({ id, label }) => <option key={id} value={id}>{label}</option>)}
+                        </select>
+                      </label>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium">提示词
+                        <textarea rows={3} maxLength={maxRolePromptLength} className={`${field} mt-1`}
+                          value={role.prompt} placeholder={example}
+                          aria-invalid={!!promptError} aria-describedby={promptError ? promptErrorId : undefined}
+                          onChange={event => editRole(role.id, { prompt: event.target.value })} />
+                      </label>
+                      {promptError && <span id={promptErrorId} className="block text-xs text-red-700">{promptError}</span>}
+                    </div>
+                    <div className="flex items-center justify-between gap-2">
+                      <label className="flex items-center gap-2 text-sm">
+                        <input type="checkbox" checked={role.enabled} onChange={event => editRole(role.id, { enabled: event.target.checked })} />
+                        启用
+                      </label>
+                      <Button type="button" size="icon" variant="ghost" className="h-8 w-8 shrink-0"
+                        title="移除自定义角色" aria-label="移除自定义角色"
+                        onClick={() => edit(current => ({ ...current, roles: current.roles.filter(item => item.id !== role.id) }))}>
+                        <Trash2 size={15} aria-hidden="true" />
+                      </Button>
+                    </div>
+                  </fieldset>
                 )
               })}
             </div>

@@ -766,24 +766,25 @@ async def _process_ai_reply(
                     last_emit_time = now
                     await emit_partial(displayed_response)
         else:
-            routing_decision = derive_routing_decision_from_context(
-                subagents=agent_service._get_research_subagents(),
-                context=graph_context,
-            ) or {}
-            ai_meta = _build_group_ai_meta(
-                routing_decision.get("selected_subagent"),
-                routing_decision,
-            )
-            ai_meta.setdefault("routing_summary", []).extend([
-                "已读取项目任务说明" if project_task_context else "暂无项目任务说明",
-                f"阶段滚动记忆：{'已读取' if stage_memory.get('content') else '暂无'}",
-                f"小组状态记忆：{'已读取' if group_state.get('content') else '暂无'}",
-                f"学习对象记忆：{len(experimental_memory.get('learning_objects') or [])}条",
-                f"支架回合记忆：{len(experimental_memory.get('scaffold_rounds') or [])}条",
-                f"协作优化：{(experimental_memory.get('collaboration_optimization') or {}).get('mode') or 'off'}",
-                f"小组讨论记忆：最近{group_memory.get('peer_message_count', 0)}条",
-                f"小组AI互动记忆：最近{group_memory.get('ai_interaction_count', 0)}条",
-            ])
+            if not graph_context.get("learning_design_revision"):
+                routing_decision = derive_routing_decision_from_context(
+                    subagents=agent_service._get_research_subagents(),
+                    context=graph_context,
+                ) or {}
+                ai_meta = _build_group_ai_meta(
+                    routing_decision.get("selected_subagent"),
+                    routing_decision,
+                )
+                ai_meta.setdefault("routing_summary", []).extend([
+                    "已读取项目任务说明" if project_task_context else "暂无项目任务说明",
+                    f"阶段滚动记忆：{'已读取' if stage_memory.get('content') else '暂无'}",
+                    f"小组状态记忆：{'已读取' if group_state.get('content') else '暂无'}",
+                    f"学习对象记忆：{len(experimental_memory.get('learning_objects') or [])}条",
+                    f"支架回合记忆：{len(experimental_memory.get('scaffold_rounds') or [])}条",
+                    f"协作优化：{(experimental_memory.get('collaboration_optimization') or {}).get('mode') or 'off'}",
+                    f"小组讨论记忆：最近{group_memory.get('peer_message_count', 0)}条",
+                    f"小组AI互动记忆：最近{group_memory.get('ai_interaction_count', 0)}条",
+                ])
 
             async for event in agent_service.chat_stream(
                 persona_key="supervisor", # Entry point

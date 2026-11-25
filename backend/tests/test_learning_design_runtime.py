@@ -1,5 +1,6 @@
 """Exercise stored teacher designs with the real graph and an offline model."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -17,6 +18,9 @@ from app.core.schemas.ai import AIChatRequest
 from app.services.agents.course_learning_design import resolve_course_learning_design
 from app.services.agents.orchestration_planner import OrchestrationPlanner
 from app.websocket.handlers import chat_handler
+
+CUSTOM_SOURCE = "custom_0123456789abcdef"
+CUSTOM_REVIEW = "custom_0000000000000002"
 
 
 def configuration(mode):
@@ -84,6 +88,36 @@ def test_specific_role_and_single_available_role_are_not_expanded():
     )
     assert only["orchestration_mode"] == "single"
     assert only["active_agents"] == ["problem_progressor"]
+
+
+def test_custom_roles_follow_routing_anchor_and_respect_exact_preference():
+    roles = {
+        CUSTOM_SOURCE: {"name": "来源核验", "routing_anchor": "evidence_researcher"},
+        CUSTOM_REVIEW: {"name": "出处复核", "routing_anchor": "evidence_researcher"},
+    }
+    choices = {
+        "current_stage": "meaning_exploration",
+        "enabled_subagents": [CUSTOM_SOURCE, CUSTOM_REVIEW, "evidence_researcher", "viewpoint_challenger"],
+        "teacher_orchestration_mode": "parallel",
+        "custom_roles": roles,
+    }
+    planned = OrchestrationPlanner.plan(message="需要补充资料和证据", **choices)
+    assert planned["primary_subagent"] == CUSTOM_SOURCE
+    assert "evidence_researcher" not in planned["active_agents"]
+    assert "来源核验" in planned["agent_instructions"][CUSTOM_SOURCE]
+    assert planned["orchestration_mode"] == "parallel"
+
+    mentioned = OrchestrationPlanner.plan(message="请 @出处复核：分析这条记录", **choices)
+    assert mentioned["active_agents"] == [CUSTOM_REVIEW]
+    assert mentioned["orchestration_mode"] == "single"
+    unmatched = OrchestrationPlanner.plan(message="@出处复核员 讨论新材料", **choices)
+    assert unmatched["orchestration_mode"] == "parallel"
+
+    service = agent_module.AgentService()
+    rag = service._resolve_stage_aware_rag_plan(
+        plan=mentioned, context={"teacher_custom_roles": roles},
+    )
+    assert rag["should_retrieve"] and "resource" in rag["source_types"]
 
 
 @pytest.mark.asyncio
@@ -194,3 +228,61 @@ async def test_graph_executes_configured_mode_and_treats_braces_as_text(mode, ru
     assert all("Check {reference} quality." in prompt and "do not send this" not in prompt for prompt in prompts)
     assert all("selected {passage}" in prompt for prompt in prompts)
     assert any("Check {source} assumptions" in prompt for prompt in prompts)
+
+
+@pytest.mark.asyncio
+async def test_custom_only_graphs_do_not_share_role_name_or_prompt_between_groups():
+    service = agent_module.AgentService()
+    service.graph = object()
+
+    async def run(group, display, instruction):
+        version = configuration("single")
+        for builtin in version["learning_design"]["roles"]:
+            builtin["enabled"] = False
+        version["learning_design"]["roles"].append({
+            "id": CUSTOM_SOURCE,
+            "name": display,
+            "routing_anchor": "evidence_researcher",
+            "enabled": True,
+            "prompt": instruction,
+        })
+        version["learning_design"]["roles"].append({
+            "id": CUSTOM_REVIEW,
+            "name": "Disabled role",
+            "routing_anchor": "feedback_prompter",
+            "enabled": False,
+            "prompt": "Disabled private prompt",
+        })
+        context = {
+            "project_id": group,
+            "current_stage": version["current_stage"],
+            "ai_scaffold_mode": "multi_agent",
+            "use_rag": False,
+            **resolve_course_learning_design(version, version["current_stage"]),
+        }
+        events = [event async for event in service.chat_stream(
+            persona_key="default-tutor", message=group, session_id=group, context=context,
+        )]
+        return next(event for event in events if event.get("type") == "done")
+
+    received = {}
+
+    def offline_model(prompt):
+        system, user = prompt.to_messages()
+        received[user.content] = system.content
+        return SimpleNamespace(content="A prompt-based answer")
+
+    with patch.object(agent_module, "resolve_role_model_id", AsyncMock(return_value=None)) as model, patch.object(
+        agent_module, "get_llm", AsyncMock(return_value=RunnableLambda(offline_model)),
+    ), patch.object(service, "_record_graph_routing_event", AsyncMock()):
+        first, second = await asyncio.gather(
+            run("group-a", "史料核验员", "Protocol A {citation}"),
+            run("group-b", "证据校对员", "Protocol B {citation}"),
+        )
+    assert first["ai_meta"]["primary_agent"] == "史料核验员"
+    assert second["ai_meta"]["primary_agent"] == "证据校对员"
+    assert first["routing_decision"]["active_agents"] == second["routing_decision"]["active_agents"] == [CUSTOM_SOURCE]
+    assert "Protocol A {citation}" in received["group-a"] and "Protocol B" not in received["group-a"]
+    assert "Protocol B {citation}" in received["group-b"] and "Protocol A" not in received["group-b"]
+    assert all("Disabled private prompt" not in text for text in received.values())
+    assert [call.args[0] for call in model.await_args_list] == ["evidence_researcher", "evidence_researcher"]

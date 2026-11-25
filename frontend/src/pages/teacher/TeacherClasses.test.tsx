@@ -319,3 +319,117 @@ it('requires a confirmed save and explicit confirmation before applying to one e
   expect(courseService.applyLearningDesign).toHaveBeenCalledWith('spring', 'target')
   expect(courseService.saveLearningDesign).toHaveBeenCalledTimes(2)
 })
+
+it('saves custom roles in order, reloads them, and saves removal without applying either revision', async () => {
+  open('/spring')
+  vi.mocked(courseService.getLearningDesign).mockResolvedValue(existingDesign)
+  vi.mocked(courseService.saveLearningDesign).mockImplementation(async (_, design) => ({ ...design, revision: 'r2' }))
+  fireEvent.click(await screen.findByRole('button', { name: '班级学习设计' }))
+  const add = await screen.findByRole('button', { name: '添加自定义角色' })
+  const save = screen.getByRole<HTMLButtonElement>('button', { name: '保存学习设计' })
+
+  for (const [index, name] of ['  证据核验员  ', '来源核对员'].entries()) {
+    fireEvent.click(add)
+    const role = within(screen.getByRole('group', { name: `自定义角色 ${index + 1}` }))
+    const anchor = role.getByRole<HTMLSelectElement>('combobox', { name: '路由类别' })
+    fireEvent.change(anchor, { target: { value: 'viewpoint_challenger' } })
+    expect(anchor.selectedOptions[0].textContent).toBe('观点挑战者')
+    const prompt = role.getByRole<HTMLTextAreaElement>('textbox', { name: '提示词' })
+    expect(prompt.value).toBe('')
+    expect(prompt.placeholder).toMatch(/^示例/)
+    expect(prompt.maxLength).toBe(2500)
+    fireEvent.change(role.getByRole('textbox', { name: '角色名称' }), { target: { value: name } })
+    fireEvent.change(prompt, { target: { value: `核对来源 ${index + 1}` } })
+    if (index === 1) fireEvent.click(role.getByRole('checkbox', { name: '启用' }))
+  }
+  fireEvent.click(save)
+  await screen.findByText('班级学习设计已保存，现有小组未更改。')
+  const submitted = vi.mocked(courseService.saveLearningDesign).mock.calls[0][1]
+  expect(submitted.roles.slice(0, 4)).toEqual([
+    existingDesign.roles[0],
+    { id: 'viewpoint_challenger', enabled: true, prompt: '' },
+    { id: 'feedback_prompter', enabled: true, prompt: '' },
+    { id: 'problem_progressor', enabled: true, prompt: '' },
+  ])
+  const [first, second] = submitted.roles.slice(4)
+  expect(first).toEqual({
+    id: expect.stringMatching(/^custom_[0-9a-f]{16}$/), name: '证据核验员', enabled: true,
+    prompt: '核对来源 1', routing_anchor: 'viewpoint_challenger',
+  })
+  expect(second).toEqual({
+    id: expect.stringMatching(/^custom_[0-9a-f]{16}$/), name: '来源核对员', enabled: false,
+    prompt: '核对来源 2', routing_anchor: 'viewpoint_challenger',
+  })
+  expect(second.id).not.toBe(first.id)
+
+  cleanup()
+  open('/spring')
+  vi.mocked(courseService.getLearningDesign).mockResolvedValue({ ...submitted, revision: 'r2' })
+  vi.mocked(courseService.saveLearningDesign).mockImplementation(async (_, design) => ({ ...design, revision: 'r3' }))
+  fireEvent.click(await screen.findByRole('button', { name: '班级学习设计' }))
+  expect((await screen.findAllByRole<HTMLInputElement>('textbox', { name: '角色名称' })).map(input => input.value))
+    .toEqual(['证据核验员', '来源核对员'])
+  const firstRole = within(screen.getByRole('group', { name: '自定义角色 1' }))
+  const secondRole = within(screen.getByRole('group', { name: '自定义角色 2' }))
+  expect(firstRole.getByRole<HTMLTextAreaElement>('textbox', { name: '提示词' }).value).toBe('核对来源 1')
+  expect(secondRole.getByRole<HTMLSelectElement>('combobox', { name: '路由类别' }).value).toBe('viewpoint_challenger')
+  expect(secondRole.getByRole<HTMLInputElement>('checkbox', { name: '启用' }).checked).toBe(false)
+  fireEvent.click(firstRole.getByRole('button', { name: '移除自定义角色' }))
+  const apply = screen.getByRole<HTMLButtonElement>('button', { name: '应用到小组' })
+  expect(apply.disabled).toBe(true)
+  expect(courseService.saveLearningDesign).toHaveBeenCalledTimes(1)
+  fireEvent.click(screen.getByRole('button', { name: '保存学习设计' }))
+  await screen.findByText('班级学习设计已保存，现有小组未更改。')
+  expect(courseService.saveLearningDesign).toHaveBeenLastCalledWith('spring', {
+    ...submitted, roles: [...submitted.roles.slice(0, 4), second],
+  })
+  expect(apply.disabled).toBe(false)
+  expect(courseService.applyLearningDesign).not.toHaveBeenCalled()
+  expect(projectService.getProjects).not.toHaveBeenCalled()
+  expect(courseService.updateCourseAISettings).not.toHaveBeenCalled()
+})
+
+it('validates custom role names and prompts, enforces the cap, and counts enabled custom roles', async () => {
+  open('/spring')
+  fireEvent.click(await screen.findByRole('button', { name: '班级学习设计' }))
+  const add = await screen.findByRole<HTMLButtonElement>('button', { name: '添加自定义角色' })
+  const save = screen.getByRole<HTMLButtonElement>('button', { name: '保存学习设计' })
+  for (let index = 0; index < 6; index++) fireEvent.click(add)
+  expect(add.disabled).toBe(true)
+  expect(screen.getByText('自定义角色 6/6')).toBeTruthy()
+  const groups = screen.getAllByRole('group', { name: /^自定义角色/ })
+  for (const group of groups.slice(2)) fireEvent.click(within(group).getByRole('button', { name: '移除自定义角色' }))
+  expect(add.disabled).toBe(false)
+  expect(save.disabled).toBe(true)
+
+  const first = within(groups[0])
+  const second = within(groups[1])
+  const name = first.getByRole('textbox', { name: '角色名称' })
+  const prompt = first.getByRole('textbox', { name: '提示词' })
+  const change = (field: HTMLElement, value: string) => fireEvent.change(field, { target: { value } })
+  change(second.getByRole('textbox', { name: '角色名称' }), 'Verifier')
+  change(second.getByRole('textbox', { name: '提示词' }), '核验来源。')
+  change(prompt, '核对证据。')
+  for (const invalid of ['  ', '资料研究员', ' verifier ', '字'.repeat(41), '第一行\u2028第二行']) {
+    change(name, invalid)
+    expect(name.getAttribute('aria-invalid')).toBe('true')
+    expect(save.disabled).toBe(true)
+  }
+  change(name, '  Checker  ')
+  expect(save.disabled).toBe(false)
+  for (const invalid of ['  ', '字'.repeat(2501)]) {
+    change(prompt, invalid)
+    expect(prompt.getAttribute('aria-invalid')).toBe('true')
+    expect(save.disabled).toBe(true)
+  }
+  change(prompt, '字'.repeat(2500))
+  for (const label of ['资料研究员', '观点挑战者', '反馈追问者', '问题推进者']) {
+    fireEvent.click(screen.getByRole('checkbox', { name: label }))
+  }
+  expect(save.disabled).toBe(false)
+  fireEvent.click(first.getByRole('checkbox', { name: '启用' }))
+  fireEvent.click(second.getByRole('checkbox', { name: '启用' }))
+  expect(save.disabled).toBe(true)
+  expect(screen.getByText('请至少启用一个 AI 角色。')).toBeTruthy()
+  expect(courseService.saveLearningDesign).not.toHaveBeenCalled()
+})

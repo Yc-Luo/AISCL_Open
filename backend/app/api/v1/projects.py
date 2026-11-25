@@ -14,7 +14,7 @@ from app.core.schemas.experiment_version import (
     ExperimentVersionResponse,
     ExperimentVersionUpdateRequest,
 )
-from app.core.schemas.learning_design import DesignSnapshot
+from app.core.schemas.learning_design import CustomRoleItem, DesignSnapshot, RoleItem
 from app.repositories.project import Project
 from app.repositories.user import User
 from app.core.schemas.project import (
@@ -538,10 +538,15 @@ def _public_experiment_version(payload: dict) -> ExperimentVersionResponse:
         version["stage_guidance"] = design.stages
         version["learning_design_revision"] = design.revision
         if version.get("ai_scaffold_mode") == "multi_agent":
-            disabled = {role.id for role in design.roles if not role.enabled}
+            disabled_builtins = {
+                role.id for role in design.roles if isinstance(role, RoleItem) and not role.enabled
+            }
+            enabled_custom_anchors = {
+                role.routing_anchor for role in design.roles if isinstance(role, CustomRoleItem) and role.enabled
+            }
             version["enabled_scaffold_roles"] = [
                 scaffold_role for scaffold_role, subagent in ROLE_TO_SUBAGENT.items()
-                if subagent not in disabled
+                if subagent not in disabled_builtins or subagent in enabled_custom_anchors
             ]
     return ExperimentVersionResponse(**version)
 

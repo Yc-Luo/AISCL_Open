@@ -40,11 +40,23 @@ export interface CourseAISettings {
     auto_prompt_enabled: boolean
 }
 
-export interface LearningDesignRole {
-    id: 'evidence_researcher' | 'viewpoint_challenger' | 'feedback_prompter' | 'problem_progressor'
+export type BuiltinRoleId = 'evidence_researcher' | 'viewpoint_challenger' | 'feedback_prompter' | 'problem_progressor'
+
+export interface BuiltinLearningDesignRole {
+    id: BuiltinRoleId
     enabled: boolean
     prompt: string
 }
+
+export interface CustomLearningDesignRole {
+    id: `custom_${string}`
+    enabled: boolean
+    prompt: string
+    name: string
+    routing_anchor: BuiltinRoleId
+}
+
+export type LearningDesignRole = BuiltinLearningDesignRole | CustomLearningDesignRole
 
 export interface StageItem {
     id: 'problem_construction' | 'meaning_exploration' | 'explanation_integration' | 'application_solution'

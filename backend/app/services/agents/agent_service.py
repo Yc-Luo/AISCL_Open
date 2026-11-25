@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import operator
+import re
 from typing import Dict, Any, AsyncGenerator, Optional, List, Union, Annotated, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -434,6 +435,14 @@ class AgentService:
         context = context or {}
         resolved_project_id = context.get("project_id") or session_id.split(":")[0]
         subagents = {item["name"]: item for item in self._get_research_subagents()}
+        custom_roles = context.get("teacher_custom_roles") or {}
+        for role_id, role in custom_roles.items():
+            subagents[role_id] = {
+                "name": role_id,
+                "label": role["name"],
+                "model_role": role["routing_anchor"],
+                "system_prompt": f"你是 AISCL 线上小组协作中的“{role['name']}”。{PEDAGOGICAL_RESPONSE_CONTRACT}",
+            }
         plan = OrchestrationPlanner.plan(
             message=message,
             current_stage=context.get("current_stage"),
@@ -442,6 +451,7 @@ class AgentService:
             enabled_subagents=context.get("enabled_subagents"),
             enabled_scaffold_roles=context.get("enabled_scaffold_roles"),
             teacher_orchestration_mode=context.get("teacher_orchestration_mode"),
+            custom_roles=custom_roles,
         )
         active_agents = [agent for agent in plan["active_agents"] if agent in subagents]
         if not active_agents:
@@ -530,7 +540,7 @@ class AgentService:
         }
         yield {
             "type": "routing_step",
-            "message": f"本轮采用“{self._mode_label(mode)}”，主要由“{SUBAGENT_LABELS.get(plan.get('selected_subagent'), 'AI智能助手')}”组织回应。",
+            "message": f"本轮采用“{self._mode_label(mode)}”，主要由“{ai_meta['primary_agent']}”组织回应。",
         }
 
         if mode == "parallel" and len(active_agents) > 1:
@@ -566,7 +576,7 @@ class AgentService:
             yield {
                 "type": "output",
                 "agent": fallback_agent,
-                "label": SUBAGENT_LABELS.get(fallback_agent, fallback_agent),
+                "label": subagents[fallback_agent].get("label") or SUBAGENT_LABELS.get(fallback_agent, fallback_agent),
                 "content": fallback_text,
             }
 
@@ -664,7 +674,7 @@ class AgentService:
             return self._merge_agent_execution_results(
                 results=results,
                 active_agents=active_agents,
-                mode=mode,
+                subagents=subagents,
             )
 
         final_sections: List[str] = []
@@ -907,8 +917,8 @@ class AgentService:
         previous_outputs: Dict[str, str],
         mode: str,
     ) -> Dict[str, Any]:
-        label = SUBAGENT_LABELS.get(agent_name, agent_name)
-        section_prefix = self._section_prefix(mode=mode, agent_name=agent_name, index=index)
+        label = subagents[agent_name].get("label") or SUBAGENT_LABELS.get(agent_name, agent_name)
+        section_prefix = self._section_prefix(mode=mode, label=label, index=index)
         events: List[Dict[str, Any]] = []
         processing_summaries: List[str] = []
         agent_output = ""
@@ -945,7 +955,7 @@ class AgentService:
         *,
         results: List[Any],
         active_agents: List[str],
-        mode: str,
+        subagents: Dict[str, Dict[str, Any]],
     ) -> Dict[str, Any]:
         events: List[Dict[str, Any]] = []
         final_sections: List[str] = []
@@ -953,9 +963,9 @@ class AgentService:
 
         for index, result in enumerate(results):
             agent_name = active_agents[index]
-            label = SUBAGENT_LABELS.get(agent_name, agent_name)
+            label = subagents[agent_name].get("label") or SUBAGENT_LABELS.get(agent_name, agent_name)
             if isinstance(result, Exception):
-                fallback_text = f"**{label}**\n\n本轮{label}暂时无法生成完整回应，请先围绕当前问题补充依据并明确下一步分工。"
+                fallback_text = "本轮角色暂时无法生成完整回应，请先围绕当前问题补充依据并明确下一步分工。"
                 events.extend([
                     {"type": "output_start", "agent": agent_name, "label": label},
                     {"type": "output", "agent": agent_name, "label": label, "content": fallback_text, "error": str(result)},
@@ -986,7 +996,7 @@ class AgentService:
         mode: str,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         agent_name = agent_def["name"]
-        label = SUBAGENT_LABELS.get(agent_name, agent_name)
+        label = agent_def.get("label") or SUBAGENT_LABELS.get(agent_name, agent_name)
         parser = ThinkTagParser(agent=agent_name, label=label)
         visible_output_seen = False
         thinking_buffer = ""
@@ -1001,7 +1011,7 @@ class AgentService:
             ("human", "{input}"),
         ])
         role_model_id = await resolve_role_model_id(
-            agent_name,
+            agent_def.get("model_role") or agent_name,
             fallback_model_id=context.get("runtime_model_id"),
         )
         runtime_llm = await get_llm(
@@ -1025,7 +1035,7 @@ class AgentService:
                 "type": "output",
                 "agent": agent_name,
                 "label": label,
-                "content": f"本轮{label}暂时无法完整生成。我先给出最小建议：围绕当前问题补充依据、明确判断标准，并把下一步分工写入协作文档。",
+                "content": "本轮角色暂时无法完整生成。可以先围绕当前问题补充依据、明确判断标准，并把下一步分工写入协作文档。",
                 "error": str(exc),
             }
         flush_events = parser.flush()
@@ -1074,8 +1084,9 @@ class AgentService:
                 "本轮没有检索到项目资料或 Wiki 引用。不得暗示资源库/Wiki 已有内容可搜索；"
                 "如需证据支持，应建议学习者先上传资料、创建 Wiki 卡片、补充选中文本或在协作文档中记录材料线索。"
             )
+        custom_roles = context.get("teacher_custom_roles") or {}
         previous_text = "\n\n".join(
-            f"【{SUBAGENT_LABELS.get(agent, agent)}】\n{output}"
+            f"【{custom_roles.get(agent, {}).get('name') or SUBAGENT_LABELS.get(agent, agent)}】\n{output}"
             for agent, output in previous_outputs.items()
             if output
         )
@@ -1167,9 +1178,15 @@ class AgentService:
         return cleaned[:900].strip()
 
     def _resolve_stage_aware_rag_plan(self, *, plan: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-        agents = plan.get("active_agents") or []
+        custom_roles = context.get("teacher_custom_roles") or {}
+        agents = {
+            custom_roles.get(role, {}).get("routing_anchor", role)
+            for role in plan.get("active_agents") or []
+        }
+        primary = plan.get("primary_subagent")
+        primary_anchor = custom_roles.get(primary, {}).get("routing_anchor", primary)
         mode = plan.get("orchestration_mode")
-        if plan.get("primary_subagent") == "problem_progressor" and mode == "single":
+        if primary_anchor == "problem_progressor" and mode == "single":
             return {
                 "should_retrieve": False,
                 "max_results": 0,
@@ -1210,7 +1227,8 @@ class AgentService:
         }
 
     def _build_ai_meta(self, *, plan: Dict[str, Any], rag_plan: Dict[str, Any]) -> Dict[str, Any]:
-        primary_agent = SUBAGENT_LABELS.get(plan.get("selected_subagent"), "AI智能助手")
+        selected_agent = plan.get("selected_subagent")
+        primary_agent = (plan.get("custom_role_labels") or {}).get(selected_agent) or SUBAGENT_LABELS.get(selected_agent, "AI智能助手")
         mode_label = self._mode_label(plan.get("orchestration_mode"))
         support_label = self._support_need_label(plan.get("support_need"))
         retrieval_label = self._retrieval_label(rag_plan.get("retrieval_mode"))
@@ -1235,10 +1253,10 @@ class AgentService:
             "active_agents": plan.get("active_agents"),
         }
 
-    def _section_prefix(self, *, mode: str, agent_name: str, index: int) -> str:
+    def _section_prefix(self, *, mode: str, label: str, index: int) -> str:
         if mode == "single":
             return ""
-        label = SUBAGENT_LABELS.get(agent_name, agent_name)
+        label = re.sub(r"([\\`*_[\]<>~])", r"\\\1", label)
         if mode == "pipeline":
             return f"**步骤 {index + 1}｜{label}**\n\n"
         if mode == "debate":

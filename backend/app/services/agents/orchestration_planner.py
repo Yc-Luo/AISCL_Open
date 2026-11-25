@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -133,8 +134,9 @@ class OrchestrationPlanner:
         *,
         enabled_subagents: Optional[List[str]] = None,
         enabled_scaffold_roles: Optional[List[str]] = None,
+        custom_roles: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> List[str]:
-        valid = set(SUBAGENT_LABELS)
+        valid = set(SUBAGENT_LABELS) | set(custom_roles or {})
         resolved: List[str] = []
         for name in enabled_subagents or []:
             if name in valid and name not in resolved:
@@ -158,12 +160,28 @@ class OrchestrationPlanner:
         enabled_subagents: Optional[List[str]] = None,
         enabled_scaffold_roles: Optional[List[str]] = None,
         teacher_orchestration_mode: Optional[str] = None,
+        custom_roles: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         stage = cls.normalize_stage(current_stage)
         available = cls.resolve_enabled_subagents(
             enabled_subagents=enabled_subagents,
             enabled_scaffold_roles=enabled_scaffold_roles,
+            custom_roles=custom_roles,
         )
+        custom_roles = custom_roles or {}
+        role_labels = {role_id: item["name"] for role_id, item in custom_roles.items()}
+        if not preferred_subagent and custom_roles:
+            mentions = [
+                (match.start(), role_id)
+                for role_id in available
+                if role_id in custom_roles
+                if (match := re.search(
+                    rf"(?:^|[\s：:，、])[@＠]{re.escape(role_labels[role_id])}(?=$|[\s：:，、。！？；,.!?;])",
+                    message or "", re.IGNORECASE,
+                ))
+            ]
+            if mentions:
+                preferred_subagent = min(mentions)[1]
         decision_source = "stage_intent_matrix"
         intent_info = cls.detect_intent(message)
         support_need = intent_info["support_need"]
@@ -178,6 +196,14 @@ class OrchestrationPlanner:
             matrix_key = (stage, intent_info["intent"])
             mode, agents = cls.MATRIX.get(matrix_key, cls.STAGE_DEFAULTS.get(stage, cls.STAGE_DEFAULTS["problem_construction"]))
 
+        if custom_roles and decision_source != "preferred_subagent":
+            # Preserve the stage matrix's role order; substitute the first eligible custom role in each family.
+            by_anchor: Dict[str, str] = {}
+            for role_id in available:
+                anchor = custom_roles.get(role_id, {}).get("routing_anchor")
+                if anchor:
+                    by_anchor.setdefault(anchor, role_id)
+            agents = [by_anchor.get(agent, agent) for agent in agents]
         agents = cls._restrict_agents(agents, available)
         if teacher_orchestration_mode in {"single", "parallel", "debate", "pipeline"} and decision_source != "preferred_subagent":
             mode = teacher_orchestration_mode
@@ -204,6 +230,7 @@ class OrchestrationPlanner:
             support_need=support_need,
             knowledge_construct=knowledge_construct,
             regulation_construct=regulation_construct,
+            role_labels=role_labels,
         )
 
         return {
@@ -212,6 +239,7 @@ class OrchestrationPlanner:
             "primary_subagent": primary_agent,
             "selected_subagent": primary_agent,
             "agent_instructions": instructions,
+            **({"custom_role_labels": role_labels} if role_labels else {}),
             "intent": intent_info["intent"],
             "intent_score": intent_info["score"],
             "decision_source": decision_source,
@@ -262,12 +290,13 @@ class OrchestrationPlanner:
         support_need: str,
         knowledge_construct: str,
         regulation_construct: str,
+        role_labels: Optional[Dict[str, str]] = None,
     ) -> Dict[str, str]:
         construct = KNOWLEDGE_CONSTRUCT_LABELS[knowledge_construct]
         regulation = REGULATION_CONSTRUCT_LABELS[regulation_construct]
         instructions: Dict[str, str] = {}
         for index, agent in enumerate(agents):
-            label = SUBAGENT_LABELS.get(agent, agent)
+            label = (role_labels or {}).get(agent) or SUBAGENT_LABELS.get(agent, agent)
             if mode == "pipeline":
                 prefix = f"这是串联接力的第 {index + 1} 步。"
             elif mode == "debate":

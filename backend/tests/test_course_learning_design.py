@@ -16,6 +16,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 with patch.object(Minio, "bucket_exists", return_value=True):
     from app.api.v1 import courses, projects
 
+from app.core.schemas.learning_design import DesignSnapshot, LearningDesign
 from app.repositories.course import Course
 from app.repositories.project import Project
 
@@ -32,12 +33,24 @@ ROLES = [
 ]
 STAGE = {"id": STAGE_IDS[1], "name": "", "activity_guidance": "$Compare two sources."}
 DESIGN = {"roles": ROLES, "orchestration_mode": "parallel", "stages": [STAGE]}
+DISABLED_BUILTINS = [{"id": role_id, "enabled": False, "prompt": ""} for role_id in ROLE_IDS]
 AI_SETTINGS = {
     "ai_scaffold_mode": "single_agent",
     "process_scaffold_mode": "off",
     "collaboration_memory_enabled": False,
     "auto_prompt_enabled": False,
 }
+
+
+def custom_role(index=0, **overrides):
+    return {
+        "id": f"custom_{index:016x}",
+        "enabled": True,
+        "prompt": "  $Private custom role instructions.  ",
+        "name": f"Source Reviewer {index}",
+        "routing_anchor": ROLE_IDS[0],
+        **overrides,
+    }
 
 
 def make_app(user):
@@ -92,6 +105,74 @@ def api(monkeypatch):
 def test_invalid_design_rejected(api, body):
     client, _, url = api
     assert client.put(url, json=body).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "roles",
+    [
+        [custom_role(), custom_role(1, name=" SOURCE REVIEWER 0 ", enabled=False)],
+        [custom_role(), custom_role(name="Different name")],
+        *[[custom_role(name=f" {label} ")] for label in ("资料研究员", "观点挑战者", "反馈追问者", "问题推进者")],
+        [custom_role(routing_anchor="cognitive_support")],
+        [custom_role(routing_anchor=custom_role(1)["id"])],
+        [custom_role(id="custom_000000000000000F")],
+        [custom_role(id="custom_000000000000000")],
+        [custom_role(id="custom_0000000000000000\n")],
+        [custom_role(name=" ")],
+        [custom_role(name="x" * 41)],
+        [custom_role(name="Source\nReviewer")],
+        [custom_role(name="Reviewer\u2028")],
+        [custom_role(prompt=" \t\n")],
+        [custom_role(prompt="x" * 2501)],
+        [custom_role(enabled="true")],
+        [custom_role(system_prompt="injected")],
+        [{k: v for k, v in custom_role().items() if k != "routing_anchor"}],
+        [{**ROLES[0], "name": "Renamed built-in", "routing_anchor": ROLE_IDS[0]}],
+        [custom_role(i) for i in range(7)],
+        [*DISABLED_BUILTINS, *(custom_role(i) for i in range(7))],
+        [*DISABLED_BUILTINS, custom_role(enabled=False)],
+    ],
+)
+def test_invalid_custom_roles_rejected(api, roles):
+    client, _, url = api
+    assert client.put(url, json={**DESIGN, "roles": roles}).status_code == 422
+
+
+def test_snapshot_normalizes_builtins_and_preserves_custom_priority():
+    first = custom_role(8, name=f"  {'n' * 40}  ", prompt="p" * 2500, enabled=False)
+    submitted = [first, *reversed(DISABLED_BUILTINS[1:]), *(custom_role(i) for i in range(5))]
+    snapshot = DesignSnapshot.from_design(LearningDesign.model_validate({**DESIGN, "roles": submitted}))
+    assert snapshot.model_dump()["roles"] == [
+        {**DISABLED_BUILTINS[0], "enabled": True},
+        *DISABLED_BUILTINS[1:],
+        {**first, "name": "n" * 40},
+        *(custom_role(i) for i in range(5)),
+    ]
+
+
+def test_public_experiment_version_only_projects_scaffold_role_families():
+    active = custom_role(2)
+    roles = [*DISABLED_BUILTINS, active, custom_role(1), custom_role(3, enabled=False, routing_anchor=ROLE_IDS[1])]
+    design = LearningDesign.model_validate({**DESIGN, "roles": roles})
+    snapshot = DesignSnapshot.from_design(design).model_dump()
+    version = {
+        "project_id": "group",
+        "ai_scaffold_mode": "multi_agent",
+        "enabled_scaffold_roles": ["feedback_prompting", active["id"]],
+    }
+    public = projects._public_experiment_version({**version, "learning_design": snapshot})
+    assert public.enabled_scaffold_roles == ["cognitive_support"]
+    assert public.learning_design_revision == snapshot["revision"]
+    assert public.stage_guidance[1].activity_guidance == STAGE["activity_guidance"]
+    assert "learning_design" not in public.model_dump()
+    for private in (active["id"], active["name"], active["prompt"].strip()):
+        assert private not in public.model_dump_json()
+
+
+def test_public_experiment_version_preserves_legacy_roles_without_design():
+    roles = ["feedback_prompting", "legacy_role"]
+    public = projects._public_experiment_version({"project_id": "group", "enabled_scaffold_roles": roles})
+    assert public.enabled_scaffold_roles == roles
 
 
 @pytest.mark.parametrize("role,user_id", [("teacher", "other"), ("student", "teacher")])
@@ -236,6 +317,65 @@ async def test_snapshot_lifecycle_and_public_projection(mongo_db):
         default_version = (await Project.get(defaults_only.json()["id"])).experiment_version
         assert default_version["learning_design"] == other_design.json()["design"]
         assert default_version["stage_sequence"] == [] and default_version["current_stage"] is None
+
+
+async def test_custom_role_changes_require_explicit_reapply_to_each_group(mongo_db):
+    course = await Course(
+        name="Inquiry", teacher_id="teacher", semester="2026-Fall", invite_code="TEST01",
+    ).insert()
+    groups = [
+        await Project(
+            name=name, owner_id="teacher", course_id=str(course.id),
+            experiment_version={"ai_scaffold_mode": "multi_agent"},
+        ).insert()
+        for name in ("Legacy group", "Target group", "Peer group")
+    ]
+    legacy, target, peer = groups
+    app = make_app(SimpleNamespace(id="teacher", role="teacher"))
+    url = f"/api/v1/courses/{course.id}/learning-design"
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        async def save(roles):
+            response = await client.put(url, json={**DESIGN, "roles": roles})
+            assert response.status_code == 200, response.text
+            assert (await client.get(url)).json() == response.json()
+            return response.json()["design"]
+
+        async def apply(group, snapshot):
+            response = await client.post(f"{url}/projects/{group.id}")
+            assert response.status_code == 200, response.text
+            assert response.json() == {"project_id": str(group.id), "revision": snapshot["revision"]}
+
+        builtin_snapshot = await save(ROLES)
+        await apply(legacy, builtin_snapshot)
+        custom_roles = [custom_role(3), custom_role(1), custom_role(2, routing_anchor=ROLE_IDS[1])]
+        original = await save([*DISABLED_BUILTINS, *custom_roles])
+        assert original["roles"] == [*DISABLED_BUILTINS, *custom_roles]
+        await apply(target, original)
+        await apply(peer, original)
+
+        edited = {**custom_roles[0], "name": "Edited reviewer", "prompt": "New instructions"}
+        stopped = {**custom_roles[1], "enabled": False}
+        added = custom_role(4, routing_anchor=ROLE_IDS[3])
+        replacement = await save([*DISABLED_BUILTINS, edited, stopped, added])
+        assert replacement["revision"] != original["revision"]
+        assert replacement["roles"] == [*DISABLED_BUILTINS, edited, stopped, added]
+        assert (await Project.get(legacy.id)).experiment_version["learning_design"] == builtin_snapshot
+        for group in (target, peer):
+            assert (await Project.get(group.id)).experiment_version["learning_design"] == original
+
+        public_url = f"/api/v1/projects/{target.id}/experiment-version"
+        visible = await client.get(public_url)
+        assert visible.status_code == 200, visible.text
+        assert visible.json()["enabled_scaffold_roles"] == ["cognitive_support", "viewpoint_challenge"]
+        assert visible.json()["learning_design_revision"] == original["revision"]
+        await apply(target, replacement)
+        visible = await client.get(public_url)
+        assert visible.status_code == 200, visible.text
+        assert visible.json()["enabled_scaffold_roles"] == ["cognitive_support", "problem_progression"]
+        assert visible.json()["learning_design_revision"] == replacement["revision"]
+        assert (await Project.get(target.id)).experiment_version["learning_design"] == replacement
+        assert (await Project.get(peer.id)).experiment_version["learning_design"] == original
 
 
 @pytest.mark.parametrize(
