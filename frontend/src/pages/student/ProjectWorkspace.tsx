@@ -27,6 +27,7 @@ import { useContextStore } from '../../stores/contextStore'
 import { usePresenceStore } from '../../stores/presenceStore'
 import { trackingService } from '../../services/tracking/TrackingService'
 import { isProcessScaffoldActive, isTutorTabEnabled } from '../../lib/experimentScaffold'
+import { teacherObservationReturn } from '../../lib/teacherCourseNavigation'
 import {
   CANONICAL_STAGES,
   formatStageLabel,
@@ -140,6 +141,8 @@ export default function Main() {
 }
 
 function Workspace({ projectId }: { projectId: string }) {
+  const { user } = useAuthStore()
+  const isStudentView = user?.role === 'student'
   const [activeTab, setActiveTab] = useState('document')
   const [currentStage, setCurrentStage] = useState<string | null>(null)
   const [isDesktopLayout, setIsDesktopLayout] = useState(() => window.matchMedia('(min-width: 1024px)').matches)
@@ -200,11 +203,12 @@ function Workspace({ projectId }: { projectId: string }) {
   }
 
   useEffect(() => {
+    if (!isStudentView) return
     const dismissed = window.localStorage.getItem('aiscl:student-onboarding-dismissed')
     if (!dismissed) {
       setOnboardingOpen(true)
     }
-  }, [])
+  }, [isStudentView])
 
   useEffect(() => {
     const mediaQuery = window.matchMedia('(min-width: 1024px)')
@@ -221,11 +225,14 @@ function Workspace({ projectId }: { projectId: string }) {
   }, [])
 
   const { connectionStatus } = useSyncStore()
-  const { user } = useAuthStore()
   const [searchParams] = useSearchParams()
   const observationSource = searchParams.get('observe')
   const isTeacherView = user?.role === 'teacher' || user?.role === 'admin'
   const fromProjectManager = observationSource === 'manager'
+  const observationProject = _project?.id === projectId ? _project : null
+  const observationReturn = isTeacherView && (!searchParams.has('returnTo') || !workspaceLoading || observationProject)
+    ? teacherObservationReturn(searchParams, observationProject)
+    : null
   const setContextProjectId = useContextStore(state => state.setProjectId)
   const setContextActiveTab = useContextStore(state => state.setActiveTab)
   const setContextCurrentStage = useContextStore(state => state.setCurrentStage)
@@ -840,20 +847,24 @@ function Workspace({ projectId }: { projectId: string }) {
     <div className="relative h-[100dvh] min-h-0 flex flex-col bg-gray-100">
       {isTeacherView && (
         <nav aria-label="教师观察导航" className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b border-slate-200 bg-white px-4 py-2 text-sm">
+          {observationProject && <span className="min-w-0 max-w-full break-words font-semibold text-slate-900">{observationProject.name}</span>}
           {(observationSource === 'monitor' || fromProjectManager) && (
             <button type="button" onClick={() => window.close()} className="inline-flex items-center gap-1.5 font-semibold text-indigo-700 hover:underline">
               <X className="h-4 w-4" />
               关闭观察页，返回原标签页
             </button>
           )}
-          <Link
-            reloadDocument
-            to={fromProjectManager ? ROUTES.TEACHER.PROJECT_MANAGER : ROUTES.TEACHER.PROJECT_MONITOR}
-            className="inline-flex items-center gap-1.5 text-slate-700 hover:underline"
-          >
-            <ArrowLeft className="h-4 w-4" />
-            {fromProjectManager ? '返回小组管理' : '返回小组观察'}
-          </Link>
+          {observationReturn && (
+            <Link
+              reloadDocument
+              to={observationReturn.to}
+              className="inline-flex items-center gap-1.5 text-slate-700 hover:underline"
+            >
+              <ArrowLeft className="h-4 w-4" />
+              {observationReturn.scoped ? '返回本班 · ' : '返回'}
+              {fromProjectManager ? '小组管理' : '小组观察'}
+            </Link>
+          )}
         </nav>
       )}
       {!isTeacherView && (
@@ -1074,10 +1085,10 @@ function Workspace({ projectId }: { projectId: string }) {
             recommendedTabs={filteredRecommendedTabs}
             disabledTabs={disabledTabs}
             hiddenTabs={hiddenTabs}
-            onOpenGuide={() => {
+            onOpenGuide={isStudentView ? () => {
               setOnboardingStep(0)
               setOnboardingOpen(true)
-            }}
+            } : undefined}
           />
           <div className="flex-1 flex flex-col min-h-0 p-2 sm:p-3 overflow-hidden">
             {workspaceLoading ? (
@@ -1264,7 +1275,7 @@ function Workspace({ projectId }: { projectId: string }) {
           onOpenTutor={() => setActiveTab('ai')}
         />
       )}
-      {currentProjectId && onboardingOpen && (
+      {isStudentView && currentProjectId && onboardingOpen && (
         <div className="pointer-events-none fixed inset-0 z-50">
           <div
             className={`pointer-events-auto absolute w-[min(22rem,calc(100vw-2rem))] rounded-2xl border border-indigo-100 bg-white p-4 shadow-2xl shadow-slate-900/15 ${GUIDE_CARD_PLACEMENT_CLASS[STUDENT_ONBOARDING_STEPS[onboardingStep].placement]}`}

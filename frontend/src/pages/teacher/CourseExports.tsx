@@ -34,10 +34,14 @@ function originalOptions(job: ExportJob): CreateExportJob {
   }
 }
 
-export default function CourseExports({ courseId }: { courseId: string }) {
+export default function CourseExports({ courseId, embedded = false }: { courseId: string; embedded?: boolean }) {
   const panelId = useId()
   const [openedCourse, setOpenedCourse] = useState<string | null>(null)
   const expanded = openedCourse === courseId
+
+  if (embedded) {
+    return <section aria-label="班级数据导出"><ExportPanel key={courseId} courseId={courseId} /></section>
+  }
 
   return (
     <section className="border-b border-slate-200 pb-3">

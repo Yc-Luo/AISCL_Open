@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
     BrainCircuit,
     BookOpen,
@@ -57,12 +57,18 @@ const getParseStatus = (resource: Resource) => {
     return { title: '等待解析入库', icon: <Clock3 className="h-4 w-4" />, className: 'bg-amber-50 text-amber-700 ring-1 ring-amber-100' };
 };
 
-export default function CourseResource() {
+type CourseResourceProps = { course?: Course };
+
+export default function CourseResource({ course }: CourseResourceProps) {
+    return <CourseResourceContent key={course?.id ?? 'all-courses'} course={course} />;
+}
+
+function CourseResourceContent({ course }: CourseResourceProps) {
     const [courses, setCourses] = useState<Course[]>([]);
-    const [selectedCourseId, setSelectedCourseId] = useState('');
+    const [globalCourseId, setGlobalCourseId] = useState('');
     const [resources, setResources] = useState<Resource[]>([]);
     const [resourceMode, setResourceMode] = useState<ResourceMode>('library');
-    const [loading, setLoading] = useState(true);
+    const [loading, setLoading] = useState(!course);
     const [resourceLoading, setResourceLoading] = useState(false);
 
     const [isUploadOpen, setIsUploadOpen] = useState(false);
@@ -72,17 +78,16 @@ export default function CourseResource() {
     const [pendingDeleteResource, setPendingDeleteResource] = useState<Resource | null>(null);
     const [deletingResource, setDeletingResource] = useState(false);
 
-    const selectedCourse = useMemo(
-        () => courses.find((course) => course.id === selectedCourseId) || null,
-        [courses, selectedCourseId]
-    );
+    const selectedCourseId = course?.id ?? globalCourseId;
+    const selectedCourse = course ?? courses.find((item) => item.id === selectedCourseId);
+    const isScoped = course !== undefined;
 
     const fetchCourses = async () => {
         try {
             setLoading(true);
             const nextCourses = await courseService.getCourses();
             setCourses(nextCourses);
-            setSelectedCourseId((previous) => {
+            setGlobalCourseId((previous) => {
                 if (previous && nextCourses.some((course) => course.id === previous)) return previous;
                 return nextCourses[0]?.id || '';
             });
@@ -115,8 +120,8 @@ export default function CourseResource() {
     }, [resourceMode]);
 
     useEffect(() => {
-        void fetchCourses();
-    }, []);
+        if (!isScoped) void fetchCourses();
+    }, [isScoped]);
 
     useEffect(() => {
         void fetchCourseResources(selectedCourseId, resourceMode);
@@ -193,7 +198,7 @@ export default function CourseResource() {
 
     return (
         <div className="space-y-6 animate-fadeIn">
-            <div className="rounded-3xl border border-gray-100 bg-white p-6 shadow-sm lg:p-8">
+            <div className="min-w-0 rounded-3xl border border-gray-100 bg-white p-4 shadow-sm sm:p-6 lg:p-8">
                 <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
                     <div>
                         <h2 className="text-3xl font-bold tracking-tight text-gray-900">课程资源中心</h2>
@@ -216,7 +221,7 @@ export default function CourseResource() {
                     </div>
                 </div>
 
-                <div className="mt-6 inline-flex rounded-2xl bg-slate-100 p-1">
+                <div className="mt-6 inline-flex max-w-full flex-wrap rounded-2xl bg-slate-100 p-1">
                     <button
                         type="button"
                         onClick={() => setResourceMode('library')}
@@ -235,23 +240,30 @@ export default function CourseResource() {
                     </button>
                 </div>
 
-                <div className="mt-6 grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(18rem,24rem)]">
+                <div className="mt-6 grid gap-4 lg:grid-cols-2">
                     <div className="rounded-2xl border border-slate-100 bg-slate-50/70 p-4">
-                        <label className="text-xs font-bold uppercase tracking-widest text-slate-400">
-                            当前班级
-                        </label>
-                        <select
-                            value={selectedCourseId}
-                            onChange={(event) => setSelectedCourseId(event.target.value)}
-                            className="mt-2 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 outline-none focus:border-indigo-300 focus:ring-2 focus:ring-indigo-100"
-                        >
-                            {courses.map((course) => (
-                                <option key={course.id} value={course.id}>
-                                    {course.name}（{course.semester}）
-                                </option>
-                            ))}
-                            {courses.length === 0 && <option value="">暂无班级</option>}
-                        </select>
+                        {course ? (
+                            <>
+                                <div className="text-xs font-bold text-slate-500">当前班级</div>
+                                <div className="mt-2 break-words text-sm font-semibold text-slate-800">{course.name}</div>
+                            </>
+                        ) : (
+                            <label className="block text-xs font-bold text-slate-500">
+                                当前班级
+                                <select
+                                    value={selectedCourseId}
+                                    onChange={(event) => setGlobalCourseId(event.target.value)}
+                                    className="mt-2 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 outline-none focus:border-indigo-300 focus:ring-2 focus:ring-indigo-100"
+                                >
+                                    {courses.map((item) => (
+                                        <option key={item.id} value={item.id}>
+                                            {item.name}（{item.semester}）
+                                        </option>
+                                    ))}
+                                    {courses.length === 0 && <option value="">暂无班级</option>}
+                                </select>
+                            </label>
+                        )}
                         <p className="mt-2 text-xs leading-5 text-slate-500">
                             {resourceMode === 'ai_knowledge'
                                 ? 'AI 知识库资料不出现在学生资源列表中，主要用于多智能体检索教师规则、理论材料和示范回答。'
@@ -382,15 +394,17 @@ export default function CourseResource() {
                     </table>
                 </div>
             ) : (
-                <div className="rounded-3xl border-2 border-dashed border-gray-100 bg-white p-16 text-center">
+                <div className="rounded-3xl border-2 border-dashed border-gray-100 bg-white px-4 py-10 text-center sm:px-8 sm:py-16">
                     <div className="mx-auto mb-6 flex h-20 w-20 items-center justify-center rounded-full bg-slate-50">
                         <HardDrive className="h-10 w-10 text-slate-300" />
                     </div>
                     <h3 className="text-xl font-bold text-gray-900">{resourceMode === 'ai_knowledge' ? '暂无 AI 知识库资料' : '暂无班级资源'}</h3>
                     <p className="mx-auto mt-2 max-w-md text-sm font-medium leading-6 text-gray-500">
-                        {resourceMode === 'ai_knowledge'
-                            ? '请选择班级后上传用于多智能体回答的理论资料、评价规则或示范对话。'
-                            : '请选择班级后上传资源。资源会直接分发给该班级下所有小组，避免重复上传和版本不一致。'}
+                        {!selectedCourse
+                            ? '请选择班级后上传资源。'
+                            : resourceMode === 'ai_knowledge'
+                                ? '可上传用于多智能体回答的理论资料、评价规则或示范对话。'
+                                : '上传后，本班所有小组均可查看资源。'}
                     </p>
                 </div>
             )}
@@ -407,7 +421,7 @@ export default function CourseResource() {
                     </DialogHeader>
 
                     <div className="min-w-0 space-y-5 pt-4">
-                        <div className="min-w-0 rounded-xl border border-indigo-100 bg-indigo-50 px-3 py-2 text-sm text-indigo-700">
+                        <div className="min-w-0 break-words rounded-xl border border-indigo-100 bg-indigo-50 px-3 py-2 text-sm text-indigo-700">
                             当前班级：<span className="font-bold">{selectedCourse?.name || '未选择班级'}</span>
                         </div>
                         <div className="space-y-2">
@@ -418,6 +432,7 @@ export default function CourseResource() {
                             `}>
                                 <input
                                     type="file"
+                                    aria-label="选择文件"
                                     className="hidden"
                                     onChange={(event) => setSelectedFile(event.target.files?.[0] || null)}
                                 />

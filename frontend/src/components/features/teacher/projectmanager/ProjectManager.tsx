@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { ArchiveRestore, FolderPlus, Search, Eye, BarChart2, MoreVertical, Users, Clock } from 'lucide-react';
 import { Button, Input, Badge, ConfirmDialog } from '../../../ui';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
@@ -6,13 +6,26 @@ import { projectService } from '../../../../services/api/project';
 import { Project } from '../../../../types';
 import ProjectEditModal from './ProjectEditModal';
 import { courseService, Course } from '../../../../services/api/course';
+import { loadTeacherProjectList, teacherObservationLink, updateProjectListParams } from '../../../../lib/teacherCourseNavigation';
 
-export default function ProjectManager() {
+const GROUPS_PER_PAGE = 24;
+
+export default function ProjectManager({ course }: { course?: Course }) {
+    return <ProjectManagerView key={course ? `course:${course.id}` : 'legacy'} course={course} />;
+}
+
+function ProjectManagerView({ course }: { course?: Course }) {
     const navigate = useNavigate();
     const [params, setParams] = useSearchParams();
-    const courseFilter = params.get('course') || '';
-    const [searchQuery, setSearchQuery] = useState('');
-    const [filterStatus, setFilterStatus] = useState<'all' | 'active' | 'completed'>('all');
+    const courseId = course?.id;
+    const courseFilter = courseId || params.get('course') || '';
+    const searchQuery = params.get('groupSearch') || '';
+    const status = params.get('groupStatus');
+    const filterStatus = status === 'active' || status === 'completed' ? status : 'all';
+    const selectedGroup = params.get('group');
+    const requestedPage = Number(params.get('groupPage'));
+    const updateFilters = (changes: Parameters<typeof updateProjectListParams>[1]) =>
+        setParams(updateProjectListParams(params, { group: '', groupPage: '', ...changes }), { replace: true });
     const [projects, setProjects] = useState<Project[]>([]);
     const [courses, setCourses] = useState<Course[]>([]);
     const [loading, setLoading] = useState(true);
@@ -24,32 +37,25 @@ export default function ProjectManager() {
     const [pendingUnarchiveProject, setPendingUnarchiveProject] = useState<Project | null>(null);
     const [unarchivingProject, setUnarchivingProject] = useState(false);
 
-    const fetchProjects = async () => {
+    const fetchProjects = useCallback(async () => {
         try {
             setLoading(true);
-            const [projectData, courseData] = await Promise.all([
-                projectService.getProjects(),
-                courseService.getCourses().catch(() => [] as Course[]),
+            const [allProjects, courseData] = await Promise.all([
+                loadTeacherProjectList(courseId),
+                courseId ? Promise.resolve([]) : courseService.getCourses().catch(() => [] as Course[]),
             ]);
-            const allProjects = [...projectData.projects];
-            for (let skip = allProjects.length; skip > 0 && skip < projectData.total;) {
-                const page = await projectService.getProjects(undefined, skip);
-                if (!page.projects.length) break;
-                allProjects.push(...page.projects);
-                skip += page.projects.length;
-            }
-            setProjects([...new Map(allProjects.map(project => [project.id, project])).values()]);
+            setProjects(allProjects);
             setCourses(courseData);
         } catch (error) {
             console.error('Failed to fetch projects:', error);
         } finally {
             setLoading(false);
         }
-    };
+    }, [courseId]);
 
     useEffect(() => {
         fetchProjects();
-    }, []);
+    }, [fetchProjects]);
 
     const handleCreate = () => {
         setEditingProject(null);
@@ -57,6 +63,7 @@ export default function ProjectManager() {
     };
 
     const handleEdit = (project: Project) => {
+        if (courseId && project.course_id !== courseId) return;
         setEditingProject(project);
         setIsModalOpen(true);
     };
@@ -106,8 +113,11 @@ export default function ProjectManager() {
         const matchesCourse = !courseFilter || (project.course_id || 'unbound') === courseFilter;
         return matchesSearch && matchesStatus && matchesCourse;
     });
-    const courseMap = new Map(courses.map(course => [course.id, course]));
-    const groupedProjects = filteredProjects.reduce<Array<{ key: string; title: string; subtitle: string; projects: Project[] }>>((groups, project) => {
+    const courseMap = new Map((course ? [course] : courses).map(course => [course.id, course]));
+    const pageCount = Math.max(1, Math.ceil(filteredProjects.length / GROUPS_PER_PAGE));
+    const page = Number.isSafeInteger(requestedPage) ? Math.min(pageCount, Math.max(1, requestedPage)) : 1;
+    const visibleProjects = course ? filteredProjects.slice((page - 1) * GROUPS_PER_PAGE, page * GROUPS_PER_PAGE) : filteredProjects;
+    const groupedProjects = visibleProjects.reduce<Array<{ key: string; title: string; subtitle: string; projects: Project[] }>>((groups, project) => {
         const course = project.course_id ? courseMap.get(project.course_id) : undefined;
         const key = project.course_id || 'unbound';
         let group = groups.find(item => item.key === key);
@@ -162,16 +172,11 @@ export default function ProjectManager() {
             {/* Filters */}
             <div className="bg-white rounded-lg border border-gray-200 p-4 shadow-sm">
                 <div className="flex flex-wrap items-center gap-3">
-                    <select
+                    {!course && <select
                         aria-label="按班级筛选"
                         className="max-w-full min-w-0 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
                         value={courseFilter}
-                        onChange={(event) => {
-                            const next = new URLSearchParams(params);
-                            if (event.target.value) next.set('course', event.target.value);
-                            else next.delete('course');
-                            setParams(next, { replace: true });
-                        }}
+                        onChange={(event) => updateFilters({ course: event.target.value })}
                     >
                         <option value="">全部班级</option>
                         {courseFilter && courseFilter !== 'unbound' && !courseMap.has(courseFilter) &&
@@ -181,34 +186,34 @@ export default function ProjectManager() {
                         ))}
                         {(courseFilter === 'unbound' || projects.some(project => !project.course_id)) &&
                             <option value="unbound">未绑定班级</option>}
-                    </select>
+                    </select>}
                     <div className="relative flex-1 max-w-md">
                         <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
                         <Input
                             placeholder="搜索小组名称或描述..."
                             value={searchQuery}
-                            onChange={(e) => setSearchQuery(e.target.value)}
+                            onChange={(e) => updateFilters({ groupSearch: e.target.value })}
                             className="pl-9"
                         />
                     </div>
                     <div className="flex items-center gap-2">
                         <Button
                             variant={filterStatus === 'all' ? 'default' : 'ghost'}
-                            onClick={() => setFilterStatus('all')}
+                            onClick={() => updateFilters({ groupStatus: '' })}
                             size="sm"
                         >
                             全部
                         </Button>
                         <Button
                             variant={filterStatus === 'active' ? 'default' : 'ghost'}
-                            onClick={() => setFilterStatus('active')}
+                            onClick={() => updateFilters({ groupStatus: 'active' })}
                             size="sm"
                         >
                             进行中
                         </Button>
                         <Button
                             variant={filterStatus === 'completed' ? 'default' : 'ghost'}
-                            onClick={() => setFilterStatus('completed')}
+                            onClick={() => updateFilters({ groupStatus: 'completed' })}
                             size="sm"
                         >
                             已归档
@@ -224,12 +229,12 @@ export default function ProjectManager() {
                         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
                             <div>
                                 <h2 className="text-base font-black text-slate-900">{group.title}</h2>
-                                <p className="text-xs font-medium text-slate-400">{group.subtitle} · {group.projects.length} 个小组</p>
+                                <p className="text-xs font-medium text-slate-400">{group.subtitle} · {course ? filteredProjects.length : group.projects.length} 个小组</p>
                             </div>
                         </div>
                         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
                             {group.projects.map((project) => (
-                    <div key={project.id} className="bg-white rounded-xl border border-gray-200 overflow-hidden shadow-sm hover:shadow-md transition-shadow">
+                    <div key={project.id} aria-current={selectedGroup === project.id ? 'true' : undefined} className={`bg-white rounded-xl border overflow-hidden shadow-sm hover:shadow-md transition-shadow ${selectedGroup === project.id ? 'border-indigo-300 ring-1 ring-indigo-200' : 'border-gray-200'}`}>
                         <div className="p-6">
                             <div className="flex justify-between items-start mb-4">
                                 <div className="flex-1 min-w-0 pr-4">
@@ -269,13 +274,13 @@ export default function ProjectManager() {
                                     className="flex-1 gap-1.5"
                                     asChild
                                 >
-                                    <Link to={`/project/${project.id}?observe=manager`} target="_blank" rel="noopener">
+                                    <Link to={teacherObservationLink(project.id, 'manager', params, courseId)} target="_blank" rel="noopener">
                                         <Eye className="w-4 h-4" />
                                         观察
                                         <span className="sr-only">（新标签页）</span>
                                     </Link>
                                 </Button>
-                                <Button
+                                {!course && <Button
                                     variant="outline"
                                     size="sm"
                                     className="flex-1 gap-1.5"
@@ -283,7 +288,7 @@ export default function ProjectManager() {
                                 >
                                     <BarChart2 className="w-4 h-4" />
                                     仪表盘
-                                </Button>
+                                </Button>}
                                 <div className="relative group/menu">
                                     <Button variant="ghost" size="sm" className="px-2">
                                         <MoreVertical className="w-4 h-4" />
@@ -328,10 +333,19 @@ export default function ProjectManager() {
                 )}
             </div>
 
+            {course && pageCount > 1 && (
+                <nav aria-label="小组列表分页" className="flex flex-wrap items-center justify-end gap-3">
+                    <Button variant="outline" size="sm" disabled={page === 1} onClick={() => updateFilters({ groupPage: page > 2 ? String(page - 1) : '' })}>上一页</Button>
+                    <span className="text-sm text-slate-600">第 {page} / {pageCount} 页</span>
+                    <Button variant="outline" size="sm" disabled={page === pageCount} onClick={() => updateFilters({ groupPage: String(page + 1) })}>下一页</Button>
+                </nav>
+            )}
+
             <ProjectEditModal
                 isOpen={isModalOpen}
                 onClose={() => setIsModalOpen(false)}
                 project={editingProject}
+                course={course}
                 onSuccess={fetchProjects}
             />
 

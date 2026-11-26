@@ -152,7 +152,7 @@ export default function TeacherDashboard() {
             isCollapsed={isCollapsed}
           />
           <div className="my-4 border-t border-gray-100 opacity-50 mx-2" />
-          {!isCollapsed && <SidebarGroupTitle label="实验操作" />}
+          {!isCollapsed && <SidebarGroupTitle label="跨班小组工具" />}
           <SidebarLink
             to={ROUTES.TEACHER.PROJECT_MANAGER}
             icon={Briefcase}
@@ -175,7 +175,7 @@ export default function TeacherDashboard() {
             isCollapsed={isCollapsed}
           />
           <div className="my-4 border-t border-gray-100 opacity-50 mx-2" />
-          {!isCollapsed && <SidebarGroupTitle label="内容与评审" />}
+          {!isCollapsed && <SidebarGroupTitle label="跨班内容与评审" />}
           <SidebarLink
             to={ROUTES.TEACHER.COURSE_RESOURCES}
             icon={FolderOpen}
@@ -238,7 +238,7 @@ export default function TeacherDashboard() {
       </div>
 
       {/* Main Content - Takes remaining space */}
-      <div className="w-full flex-1 overflow-y-auto p-4 sm:p-6 lg:p-10">
+      <div className="min-w-0 w-full flex-1 overflow-y-auto p-4 sm:p-6 lg:p-10">
         <div className="max-w-6xl mx-auto">
           <Outlet />
         </div>

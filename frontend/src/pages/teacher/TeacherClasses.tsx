@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useState } from 'react'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, BookOpen, ChevronLeft, ChevronRight, LayoutGrid, List, RefreshCw, Users } from 'lucide-react'
+import { ArrowLeft, BookOpen, ChevronLeft, ChevronRight, ClipboardList, FolderDown, LayoutGrid, List, Monitor, RefreshCw, Settings, Users } from 'lucide-react'
 import { ROUTES } from '../../config/routes'
 import { courseService, type Course, type Student } from '../../services/api/course'
 import { useAuthStore } from '../../stores/authStore'
@@ -8,9 +8,40 @@ import ClassAISettings from './ClassAISettings'
 import CourseExports from './CourseExports'
 import CourseLearningDesign from './CourseLearningDesign'
 
+const ProjectManager = lazy(() => import('../../components/features/teacher/projectmanager/ProjectManager'))
+const ProjectMonitor = lazy(() => import('../../components/features/teacher/projectmonitor/ProjectMonitor'))
+const CourseTaskRelease = lazy(() => import('../../components/features/teacher/taskrelease/CourseTaskRelease'))
+const CourseResource = lazy(() => import('../../components/features/teacher/courseresource/CourseResource'))
+const AssignmentReview = lazy(() => import('../../components/features/teacher/assignmentreview/AssignmentReview'))
+const ClassManagement = lazy(() => import('../../components/features/teacher/classmanagement/ClassManagement'))
+
 type Load<T> = { data: T } | { error: string } | null
 const home = ROUTES.TEACHER.OVERVIEW
 const selectStyle = 'max-w-full min-w-0 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm'
+const classSections = [
+  { id: 'overview', label: '班级概览', icon: BookOpen },
+  { id: 'members', label: '成员与小组', icon: Users },
+  { id: 'activity', label: '活动设计', icon: ClipboardList },
+  { id: 'observe', label: '小组观察', icon: Monitor },
+  { id: 'outcomes', label: '成果与导出', icon: FolderDown },
+  { id: 'settings', label: '班级设置', icon: Settings },
+] as const
+type ClassSection = typeof classSections[number]['id']
+const classPanels = {
+  members: [{ id: 'roster', label: '学生名单' }, { id: 'groups', label: '小组管理' }],
+  activity: [{ id: 'design', label: 'AI 与阶段' }, { id: 'tasks', label: '任务发布' }, { id: 'resources', label: '课程资料' }],
+  outcomes: [{ id: 'exports', label: '数据导出' }, { id: 'reviews', label: '成果评审' }],
+} as const
+const homeFilters = ['year', 'term', 'view', 'density']
+
+function getHomeParams(params: URLSearchParams) {
+  const next = new URLSearchParams()
+  for (const key of homeFilters) {
+    const value = params.get(key)
+    if (value !== null) next.set(key, value)
+  }
+  return next
+}
 
 function academicYear(semester: string) {
   const range = semester.match(/^\s*(\d{4})\s*[-–—/]\s*(\d{4})(?!\d)/)
@@ -53,7 +84,7 @@ function OwnedClasses({ userId, courseId, params, change }: {
     return () => { active = false }
   }, [attempt, userId])
 
-  const search = params.toString()
+  const search = getHomeParams(params).toString()
   if (courseId) {
     const course = result && 'data' in result ? result.data.find(item => item.id === courseId) : undefined
     return (
@@ -61,7 +92,10 @@ function OwnedClasses({ userId, courseId, params, change }: {
         <Link to={{ pathname: home, search }} className="inline-flex items-center gap-2 text-sm font-medium text-indigo-700 hover:underline">
           <ArrowLeft size={16} /> 返回我的班级
         </Link>
-        {course ? <ClassDetail key={course.id} course={course} /> : (
+        {course ? <ClassDetail key={course.id} course={course} params={params}
+          onUpdated={updated => setResult(previous => previous && 'data' in previous
+            ? { data: previous.data.map(item => item.id === updated.id ? updated : item) }
+            : previous)} /> : (
           <LoadMessage result={result} empty="找不到该班级，或该班级不属于当前账号。"
             retry={() => { setResult(null); setAttempt(attempt + 1) }} />
         )}
@@ -140,42 +174,106 @@ function OwnedClasses({ userId, courseId, params, change }: {
   )
 }
 
-function ClassDetail({ course }: { course: Course }) {
+function ClassDetail({ course, params, onUpdated }: {
+  course: Course
+  params: URLSearchParams
+  onUpdated: (course: Course) => void
+}) {
+  const active = classSections.find(section => section.id === params.get('section'))?.id ?? 'overview'
+  const panels = active in classPanels ? classPanels[active as keyof typeof classPanels] : undefined
+  const panel = panels?.find(item => item.id === params.get('panel'))?.id ?? panels?.[0].id
+  const pathname = `${home}/${encodeURIComponent(course.id)}`
+  const location = (section: ClassSection, subview?: string) => {
+    const next = getHomeParams(params)
+    if (section !== 'overview') next.set('section', section)
+    if (subview) next.set('panel', subview)
+    return { pathname, search: next.toString() }
+  }
+  const classNavLink = (current: boolean) => `inline-flex min-h-9 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1.5 font-medium focus-visible:outline-indigo-600 ${current ? 'bg-indigo-100 text-indigo-900' : 'text-slate-700 hover:bg-slate-100'}`
+  const navStyle = 'flex min-w-0 flex-wrap gap-1 text-sm'
+
+  return (
+    <>
+      <header className="space-y-1">
+        <h1 className="break-words text-2xl font-semibold">{course.name}</h1>
+        <p className="break-words text-sm text-slate-600">{course.semester || '未设置学期'} · {course.students.length} 名在册学生</p>
+      </header>
+      <nav aria-label="班级工作台" className={`${navStyle} border-y border-slate-200 py-2`}>
+        {classSections.map(({ id, label, icon: Icon }) => (
+          <Link key={id} to={location(id)} aria-current={active === id ? 'page' : undefined}
+            className={classNavLink(active === id)}>
+            <Icon size={16} className="shrink-0" aria-hidden="true" /> {label}
+          </Link>
+        ))}
+      </nav>
+      {panels && (
+        <nav aria-label="班级分区" className={navStyle}>
+          {panels.map(item => (
+            <Link key={item.id} to={location(active, item.id)} aria-current={panel === item.id ? 'page' : undefined}
+              className={classNavLink(panel === item.id)}>{item.label}</Link>
+          ))}
+        </nav>
+      )}
+      <Suspense fallback={<p role="status" className="py-3 text-sm text-slate-600">正在加载班级分区…</p>}>
+        {active === 'overview' && (
+          <section aria-label="班级概览" className="space-y-5">
+            {course.description && <p className="whitespace-pre-wrap break-words text-sm text-slate-700">{course.description}</p>}
+            <dl className="grid gap-4 border-b border-slate-200 pb-5 text-sm sm:grid-cols-2">
+              <div>
+                <dt className="text-slate-600">在册学生</dt>
+                <dd className="mt-1"><Link to={location('members')} className="font-medium text-indigo-700 hover:underline">{course.students.length} 人 · 查看名单</Link></dd>
+              </div>
+              <div>
+                <dt className="text-slate-600">班级邀请码</dt>
+                <dd className="mt-1 break-all font-mono font-medium">{course.invite_code || '未设置'}</dd>
+              </div>
+            </dl>
+          </section>
+        )}
+        {active === 'members' && (panel === 'groups' ? <ProjectManager course={course} /> : <ClassRoster courseId={course.id} />)}
+        {active === 'activity' && (
+          panel === 'tasks' ? <CourseTaskRelease course={course} /> :
+            panel === 'resources' ? <CourseResource course={course} /> :
+              <div className="min-w-0 space-y-5">
+                <ClassAISettings courseId={course.id} />
+                <CourseLearningDesign courseId={course.id} />
+              </div>
+        )}
+        {active === 'observe' && <ProjectMonitor course={course} />}
+        {active === 'outcomes' && (panel === 'reviews' ? <AssignmentReview courseId={course.id} /> : <CourseExports courseId={course.id} embedded />)}
+        {active === 'settings' && <ClassManagement course={course} onCourseUpdated={onUpdated} />}
+      </Suspense>
+    </>
+  )
+}
+
+function ClassRoster({ courseId }: { courseId: string }) {
   const [result, setResult] = useState<Load<Student[]>>(null)
   const [attempt, setAttempt] = useState(0)
   useEffect(() => {
     let active = true
-    courseService.getCourseStudents(course.id).then(
+    courseService.getCourseStudents(courseId).then(
       students => { if (active) setResult({ data: students }) },
       () => { if (active) setResult({ error: '无法加载学生名单' }) }
     )
     return () => { active = false }
-  }, [course.id, attempt])
+  }, [courseId, attempt])
 
   const students = result && 'data' in result ? result.data : []
   return (
-    <>
-      <header className="space-y-2 border-b border-slate-200 pb-5">
-        <p className="text-sm font-medium text-indigo-700">班级详情</p>
-        <h1 className="break-words text-2xl font-semibold">{course.name}</h1>
-        <p className="break-words text-sm text-slate-600">{course.semester || '未设置学期'} · {course.students.length} 名在册学生</p>
-        {course.description && <p className="whitespace-pre-wrap break-words text-sm text-slate-700">{course.description}</p>}
-        <Link to={`${ROUTES.TEACHER.PROJECT_MANAGER}?course=${encodeURIComponent(course.id)}`}
-          className="inline-flex items-center gap-2 rounded-md border border-slate-200 px-3 py-1.5 text-sm font-medium hover:bg-slate-50">
-          <Users size={16} /> 管理本班小组
+    <section aria-labelledby="class-roster">
+      <header className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <h2 id="class-roster" className="flex items-center gap-2 font-semibold"><Users size={18} /> 学生名单</h2>
+        <Link to={`${ROUTES.TEACHER.STUDENTS}?courseId=${encodeURIComponent(courseId)}`}
+          className="rounded-md border border-slate-300 px-2.5 py-1.5 text-sm font-medium hover:bg-slate-100">
+          导入与管理学生
         </Link>
       </header>
-      <ClassAISettings courseId={course.id} />
-      <CourseLearningDesign courseId={course.id} />
-      <CourseExports courseId={course.id} />
-      <section aria-labelledby="class-roster">
-        <h2 id="class-roster" className="mb-3 flex items-center gap-2 font-semibold"><Users size={18} /> 学生名单</h2>
-        {students.length ? (
-          <StudentRoster students={students} />
-        ) : <LoadMessage result={result} empty="暂无学生名单记录。"
-          retry={() => { setResult(null); setAttempt(attempt + 1) }} />}
-      </section>
-    </>
+      {students.length ? (
+        <StudentRoster students={students} />
+      ) : <LoadMessage result={result} empty="暂无学生名单记录。"
+        retry={() => { setResult(null); setAttempt(attempt + 1) }} />}
+    </section>
   )
 }
 

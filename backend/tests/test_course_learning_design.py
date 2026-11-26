@@ -199,6 +199,40 @@ async def mongo_db():
         mongo.close()
 
 
+async def test_project_listing_intersects_course_filter_with_membership_and_pagination(mongo_db):
+    first, second, foreign = [
+        await Course(
+            name=f"Course {number}", teacher_id=owner, semester="2026-Fall", invite_code=f"FILTER{number}"
+        ).insert()
+        for number, owner in enumerate(("teacher", "teacher", "other"))
+    ]
+    visible = await Project(name="Member group", owner_id="student", course_id=str(first.id)).insert()
+    archived = await Project(
+        name="Archived group", owner_id="peer", course_id=str(first.id), is_archived=True
+    ).insert()
+    sibling = await Project(name="Sibling group", owner_id="student", course_id=str(second.id)).insert()
+    await Project(name="External group", owner_id="other", course_id=str(foreign.id)).insert()
+    user = SimpleNamespace(id="teacher", role="teacher")
+    url = "/api/v1/projects"
+
+    async with AsyncClient(transport=ASGITransport(app=make_app(user)), base_url="http://test") as client:
+        async def list_groups(**params):
+            response = await client.get(url, params=params)
+            assert response.status_code == 200, response.text
+            result = response.json()
+            return {group["id"] for group in result["projects"]}, result["total"]
+
+        assert await list_groups() == ({str(visible.id), str(archived.id), str(sibling.id)}, 3)
+        assert await list_groups(course_id=str(first.id), limit=1, skip=1) == ({str(archived.id)}, 2)
+        assert await list_groups(course_id=str(first.id), archived=False) == ({str(visible.id)}, 1)
+        assert await list_groups(course_id=str(foreign.id)) == (set(), 0)
+
+        user.role, user.id = "student", "student"
+        assert await list_groups(course_id=str(first.id)) == ({str(visible.id)}, 1)
+        user.id = "unassigned"
+        assert await list_groups(course_id=str(first.id)) == (set(), 0)
+
+
 async def test_snapshot_lifecycle_and_public_projection(mongo_db):
     course = await Course(
         name="Inquiry", teacher_id="teacher", semester="2026-Fall", invite_code="TEST01",

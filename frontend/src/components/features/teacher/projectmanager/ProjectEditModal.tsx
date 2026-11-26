@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { isAxiosError } from 'axios'
 import {
     Dialog,
     DialogContent,
@@ -32,6 +33,7 @@ interface ProjectEditModalProps {
     isOpen: boolean
     onClose: () => void
     project?: Project | null // if null/undefined, it's "Create" mode
+    course?: Course
     onSuccess: () => void
 }
 
@@ -39,6 +41,7 @@ export default function ProjectEditModal({
     isOpen,
     onClose,
     project,
+    course,
     onSuccess
 }: ProjectEditModalProps) {
     const isEdit = !!project
@@ -50,6 +53,9 @@ export default function ProjectEditModal({
         course_id: '',
         inherit_course_template: true,
     })
+    const scopedCourseId = course?.id
+    const courseId = scopedCourseId || formData.course_id
+    const outOfScope = Boolean(scopedCourseId && project && project.course_id !== scopedCourseId)
     const [courses, setCourses] = useState<Course[]>([])
 
     // Members state
@@ -68,6 +74,7 @@ export default function ProjectEditModal({
 
     // Initialize data
     useEffect(() => {
+        if (scopedCourseId) return
         const fetchCourses = async () => {
             try {
                 const data = await courseService.getCourses()
@@ -77,10 +84,13 @@ export default function ProjectEditModal({
             }
         }
         fetchCourses()
-    }, [])
+    }, [scopedCourseId])
 
     useEffect(() => {
-        if (isOpen) setNotice(null)
+        if (!isOpen || outOfScope) return
+        setNotice(null)
+        setSearchTerm('')
+        setSearchResults([])
         if (project) {
             setFormData({
                 name: project.name,
@@ -102,14 +112,14 @@ export default function ProjectEditModal({
                 name: '',
                 description: '',
                 is_archived: false,
-                course_id: '',
+                course_id: scopedCourseId || '',
                 inherit_course_template: true,
             })
             setMembers([])
             setLeaderId('')
             setResources([])
         }
-    }, [project, isOpen])
+    }, [project, isOpen, outOfScope, scopedCourseId])
 
     useEffect(() => {
         if (members.length === 0) {
@@ -123,7 +133,7 @@ export default function ProjectEditModal({
     }, [leaderId, members])
 
     useEffect(() => {
-        if (!isOpen || !formData.course_id) {
+        if (!isOpen || outOfScope || !courseId) {
             setCourseStudents([])
             return
         }
@@ -132,7 +142,7 @@ export default function ProjectEditModal({
         const fetchCourseStudents = async () => {
             setLoadingCourseStudents(true)
             try {
-                const students = await courseService.getCourseStudents(formData.course_id)
+                const students = await courseService.getCourseStudents(courseId)
                 if (!cancelled) {
                     setCourseStudents(students as User[])
                 }
@@ -148,7 +158,7 @@ export default function ProjectEditModal({
         return () => {
             cancelled = true
         }
-    }, [formData.course_id, isOpen])
+    }, [courseId, isOpen, outOfScope])
 
     const fetchResources = async (id: string) => {
         try {
@@ -189,7 +199,7 @@ export default function ProjectEditModal({
             const users = await userService.searchUsers({
                 search: val,
                 role: 'student',
-                class_id: formData.course_id || undefined,
+                class_id: courseId || undefined,
             })
             setSearchResults(users.filter(u => !members.find(m => m.id === u.id)))
         } catch (error) {
@@ -251,7 +261,7 @@ export default function ProjectEditModal({
     }
 
     const handleSubmit = async () => {
-        if (!formData.name.trim()) return
+        if (!formData.name.trim() || outOfScope) return
         const resolvedLeaderId = leaderId || members[0]?.id || ''
         if (members.length > 0 && !resolvedLeaderId) {
             setNotice({ type: 'error', message: '请先指定小组组长。' })
@@ -307,7 +317,7 @@ export default function ProjectEditModal({
                 const newProj = await projectService.createProject({
                     name: formData.name,
                     description: formData.description,
-                    course_id: formData.course_id || undefined,
+                    course_id: courseId || undefined,
                     inherit_course_template: formData.inherit_course_template,
                 })
                 // Add members if any
@@ -332,11 +342,12 @@ export default function ProjectEditModal({
             }
             onSuccess()
             onClose()
-        } catch (error: any) {
+        } catch (error) {
             console.error('Submit failed:', error)
+            const detail = isAxiosError<{ detail?: unknown }>(error) ? error.response?.data?.detail : undefined
             setNotice({
                 type: 'error',
-                message: error?.response?.data?.detail || '操作失败，请检查输入、成员权限或班级绑定状态。',
+                message: typeof detail === 'string' && detail ? detail : '操作失败，请检查输入、成员权限或班级绑定状态。',
             })
         } finally {
             setLoading(false)
@@ -344,7 +355,7 @@ export default function ProjectEditModal({
     }
 
     return (
-        <Dialog open={isOpen} onOpenChange={onClose}>
+        <Dialog open={isOpen && !outOfScope} onOpenChange={onClose}>
             <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto custom-scrollbar">
                 <DialogHeader>
                     <DialogTitle>{isEdit ? '修改小组' : '创建新小组'}</DialogTitle>
@@ -384,6 +395,9 @@ export default function ProjectEditModal({
                         </div>
                         {!isEdit && (
                             <>
+                                {course ? (
+                                    <p className="text-sm text-slate-700">所属班级：{course.name}</p>
+                                ) : (
                                 <div className="space-y-2">
                                     <label className="text-sm font-medium text-slate-700">所属班级（可选）</label>
                                     <select
@@ -404,7 +418,8 @@ export default function ProjectEditModal({
                                         ))}
                                     </select>
                                 </div>
-                                {formData.course_id && (
+                                )}
+                                {courseId && (
                                     <label className="flex items-start gap-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-3 text-sm text-slate-700">
                                         <input
                                             type="checkbox"
@@ -427,7 +442,7 @@ export default function ProjectEditModal({
                             <label className="text-sm font-medium text-slate-700">小组成员 ({members.length})</label>
                         </div>
 
-                        {formData.course_id && (
+                        {courseId && (
                             <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
                                 <div className="mb-2 flex items-center justify-between gap-3">
                                     <div className="flex items-center gap-2 text-xs font-semibold text-slate-600">
@@ -487,7 +502,7 @@ export default function ProjectEditModal({
                             <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
                             <Input
                                 className="pl-9"
-                                placeholder={formData.course_id ? "在当前班级内搜索学生..." : "搜索并添加学生..."}
+                                placeholder={courseId ? "在当前班级内搜索学生..." : "搜索并添加学生..."}
                                 value={searchTerm}
                                 onChange={(e: React.ChangeEvent<HTMLInputElement>) => handleSearchUsers(e.target.value)}
                             />
@@ -631,7 +646,7 @@ export default function ProjectEditModal({
                     <Button
                         className="bg-indigo-600 hover:bg-indigo-700 text-white"
                         onClick={handleSubmit}
-                        disabled={loading || !formData.name.trim() || (!isEdit && members.length === 0)}
+                        disabled={loading || outOfScope || !formData.name.trim() || (!isEdit && members.length === 0)}
                     >
                         {loading && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
                         {isEdit ? '保存修改' : '立即创建'}

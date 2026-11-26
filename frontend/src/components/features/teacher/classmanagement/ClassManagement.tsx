@@ -30,7 +30,10 @@ const DEFAULT_TASK_TITLE = '项目说明';
 
 const DEFAULT_TASK_CONTENT = '请在这里填写本次活动或项目的完整说明，包括活动背景、目标任务、协作方式、成果要求、提交方式或其他需要学生提前了解的内容。';
 
-export default function ClassManagement() {
+export default function ClassManagement({ course: scopedCourse, onCourseUpdated }: {
+    course?: Course;
+    onCourseUpdated?: (course: Course) => void;
+} = {}) {
     const navigate = useNavigate();
     const now = new Date();
     const currentYear = now.getFullYear();
@@ -73,8 +76,8 @@ export default function ClassManagement() {
     };
 
     useEffect(() => {
-        fetchCourses();
-    }, []);
+        if (!scopedCourse) void fetchCourses();
+    }, [scopedCourse]);
 
     const handleCopyCode = (code: string, id: string) => {
         navigator.clipboard.writeText(code);
@@ -110,16 +113,21 @@ export default function ClassManagement() {
         if (!selectedCourse) return;
         try {
             setSubmitting(true);
-            await courseService.updateCourse(selectedCourse.id, {
+            const updated = await courseService.updateCourse(selectedCourse.id, {
                 name,
                 semester: semester === selectedCourse.semester ? undefined : semester,
                 description,
-                initial_task_document_title: initialTaskTitle || undefined,
-                initial_task_document_content: initialTaskContent,
+                initial_task_document_title: initialTaskTitle !== (selectedCourse.initial_task_document_title ?? '')
+                    ? initialTaskTitle.trim() || undefined
+                    : undefined,
+                initial_task_document_content: initialTaskContent !== (selectedCourse.initial_task_document_content ?? '')
+                    ? initialTaskContent
+                    : undefined,
             });
             setIsEditOpen(false);
             resetForm();
-            fetchCourses();
+            if (scopedCourse) onCourseUpdated?.(updated);
+            else void fetchCourses();
             setNotice({ type: 'success', message: '班级设置已更新。若已创建小组，学生端项目说明同步仍取决于后端同步策略。' });
         } catch (error) {
             console.error('Update course failed:', error);
@@ -159,8 +167,8 @@ export default function ClassManagement() {
         setName(course.name);
         setSemester(course.semester);
         setDescription(course.description || '');
-        setInitialTaskTitle(course.initial_task_document_title || DEFAULT_TASK_TITLE);
-        setInitialTaskContent(course.initial_task_document_content || DEFAULT_TASK_CONTENT);
+        setInitialTaskTitle(course.initial_task_document_title ?? '');
+        setInitialTaskContent(course.initial_task_document_content ?? '');
         setIsEditOpen(true);
     };
 
@@ -169,7 +177,7 @@ export default function ClassManagement() {
         course.semester.toLowerCase().includes(searchQuery.toLowerCase())
     );
 
-    if (loading && courses.length === 0) {
+    if (!scopedCourse && loading && courses.length === 0) {
         return <div className="flex items-center justify-center h-64">
             <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600"></div>
             <span className="ml-3 text-slate-500 font-medium">加载班级中...</span>
@@ -178,7 +186,15 @@ export default function ClassManagement() {
 
     return (
         <div className="space-y-6 animate-fadeIn pb-10">
-            {/* Header */}
+            {scopedCourse ? (
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-4">
+                    <h2 className="font-semibold text-slate-900">班级基本信息</h2>
+                    <Button variant="outline" onClick={() => openEdit(scopedCourse)} className="gap-2">
+                        <Settings className="h-4 w-4" aria-hidden="true" />
+                        编辑班级信息
+                    </Button>
+                </div>
+            ) : (
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div>
                     <h1 className="text-2xl font-bold text-slate-900 tracking-tight">班级管理</h1>
@@ -192,6 +208,7 @@ export default function ClassManagement() {
                     创建新班级
                 </Button>
             </div>
+            )}
 
             {notice && (
                 <div className={`rounded-2xl border px-4 py-3 text-sm font-medium ${notice.type === 'success'
@@ -202,6 +219,7 @@ export default function ClassManagement() {
                 </div>
             )}
 
+            {!scopedCourse && <>
             {/* Stats Row */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                 <div className="bg-white rounded-2xl border border-slate-100 p-6 shadow-sm">
@@ -426,6 +444,7 @@ export default function ClassManagement() {
                     </form>
                 </DialogContent>
             </Dialog>
+            </>}
 
             {/* Edit Modal */}
             <Dialog open={isEditOpen} onOpenChange={setIsEditOpen}>
@@ -433,7 +452,7 @@ export default function ClassManagement() {
                         <DialogHeader>
                             <DialogTitle className="text-2xl font-bold">修改班级信息</DialogTitle>
                             <DialogDescription className="text-slate-500 mt-2">
-                            更新班级名称、学期和项目说明。项目说明会同步到学生端小组文档，作为任务理解与问题构建的起点。
+                            班级名称、学期、描述和项目说明。
                             </DialogDescription>
                         </DialogHeader>
                     <form onSubmit={handleUpdate} className="space-y-6 mt-6">
@@ -486,7 +505,7 @@ export default function ClassManagement() {
                                 className="min-h-56 w-full rounded-xl border-none bg-slate-50 px-3 py-2 text-sm leading-6 outline-none focus:ring-2 focus:ring-indigo-500"
                                 placeholder="填写完整项目说明，可包含活动背景、任务目标、协作方式、成果要求、提交方式等。"
                             />
-                            <p className="text-xs leading-5 text-slate-500">这里会作为整体内容同步到学生端小组文档，不再强制拆成固定条目。</p>
+                            <p className="text-xs leading-5 text-slate-500">修改此处会同步到现有小组，并可能替换其中的项目说明文档。</p>
                         </div>
                         <DialogFooter className="pt-4">
                             <Button type="button" variant="ghost" onClick={() => setIsEditOpen(false)} className="rounded-xl">取消</Button>

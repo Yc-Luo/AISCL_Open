@@ -36,7 +36,14 @@ function saveBlob(blob: Blob, filename: string) {
   URL.revokeObjectURL(url)
 }
 
-export default function AssignmentReview() {
+type AssignmentReviewProps = { courseId?: string }
+
+export default function AssignmentReview({ courseId }: AssignmentReviewProps) {
+  return <AssignmentReviewContent key={courseId ?? 'all-courses'} courseId={courseId} />
+}
+
+function AssignmentReviewContent({ courseId }: AssignmentReviewProps) {
+  const isScoped = courseId !== undefined
   const [submissions, setSubmissions] = useState<TeacherSubmission[]>([])
   const [loading, setLoading] = useState(true)
   const [query, setQuery] = useState('')
@@ -47,25 +54,33 @@ export default function AssignmentReview() {
   const [savingReview, setSavingReview] = useState(false)
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null)
 
-  const loadSubmissions = async () => {
-    try {
-      setLoading(true)
-      const data = await taskService.getTeacherSubmissions({
-        status: statusFilter === 'all' ? undefined : statusFilter,
-      })
-      setSubmissions(data)
-    } catch (error) {
-      console.error('Failed to fetch submissions:', error)
-      setToast({ message: '成果提交记录加载失败，请检查班级权限或网络连接。', type: 'error' })
-    } finally {
-      setLoading(false)
-    }
-  }
-
   useEffect(() => {
+    if (isScoped && !courseId) {
+      setLoading(false)
+      return
+    }
+
+    let active = true
+    const loadSubmissions = async () => {
+      try {
+        setLoading(true)
+        const data = await taskService.getTeacherSubmissions({
+          ...(isScoped ? { course_id: courseId } : {}),
+          status: statusFilter === 'all' ? undefined : statusFilter,
+        })
+        if (active) setSubmissions(data)
+      } catch (error) {
+        if (!active) return
+        console.error('Failed to fetch submissions:', error)
+        setSubmissions([])
+        setToast({ message: '成果提交记录加载失败，请检查班级权限或网络连接。', type: 'error' })
+      } finally {
+        if (active) setLoading(false)
+      }
+    }
     void loadSubmissions()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [statusFilter])
+    return () => { active = false }
+  }, [courseId, isScoped, statusFilter])
 
   useEffect(() => {
     setReviewComment(selected?.task.review_comment || '')
@@ -136,11 +151,13 @@ export default function AssignmentReview() {
   }
 
   return (
-    <div className="space-y-6 animate-fadeIn">
-      <div className="flex flex-col gap-4 rounded-3xl border border-slate-100 bg-white p-6 shadow-sm lg:flex-row lg:items-end lg:justify-between">
+    <div className="min-w-0 space-y-6 animate-fadeIn">
+      <div className="flex flex-col gap-4 rounded-3xl border border-slate-100 bg-white p-4 shadow-sm sm:p-6 lg:flex-row lg:items-end lg:justify-between">
         <div>
           <h2 className="text-3xl font-bold tracking-tight text-slate-900">成果审查中心</h2>
-          <p className="mt-2 text-sm text-slate-500">按班级、小组和任务集中查看成果文件、提交状态与教师反馈。</p>
+          <p className="mt-2 text-sm text-slate-500">
+            {isScoped ? '查看本班各小组的成果文件、提交状态与教师反馈。' : '按班级、小组和任务集中查看成果文件、提交状态与教师反馈。'}
+          </p>
         </div>
         <div className="flex flex-wrap gap-3">
           <div className="rounded-2xl bg-indigo-50 px-4 py-3">
@@ -151,14 +168,18 @@ export default function AssignmentReview() {
             <div className="text-xs font-bold text-amber-500">待审查</div>
             <div className="mt-1 text-2xl font-black text-amber-900">{pendingReviewCount}</div>
           </div>
-          <Button onClick={exportTable} className="self-center rounded-2xl bg-slate-900 text-white hover:bg-slate-800">
-            <ArrowDownToLine className="mr-2 h-4 w-4" />
-            导出清单
-          </Button>
-          <Button onClick={exportArtifactsZip} className="self-center rounded-2xl bg-indigo-600 text-white hover:bg-indigo-700">
-            <FileArchive className="mr-2 h-4 w-4" />
-            下载全部成果
-          </Button>
+          {!isScoped && (
+            <>
+              <Button onClick={exportTable} className="self-center rounded-2xl bg-slate-900 text-white hover:bg-slate-800">
+                <ArrowDownToLine className="mr-2 h-4 w-4" />
+                导出清单
+              </Button>
+              <Button onClick={exportArtifactsZip} className="self-center rounded-2xl bg-indigo-600 text-white hover:bg-indigo-700">
+                <FileArchive className="mr-2 h-4 w-4" />
+                下载全部成果
+              </Button>
+            </>
+          )}
         </div>
       </div>
 
@@ -169,11 +190,12 @@ export default function AssignmentReview() {
             <input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="搜索班级、小组、任务或文件名"
+              placeholder={isScoped ? '搜索小组、任务或文件名' : '搜索班级、小组、任务或文件名'}
               className="w-full rounded-2xl border border-slate-200 py-2 pl-9 pr-3 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
             />
           </div>
           <select
+            aria-label="提交状态"
             value={statusFilter}
             onChange={(event) => setStatusFilter(event.target.value)}
             className="rounded-2xl border border-slate-200 px-3 py-2 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
@@ -199,7 +221,7 @@ export default function AssignmentReview() {
             <table className="min-w-full divide-y divide-slate-100 text-sm">
               <thead className="bg-slate-50 text-left text-xs font-bold uppercase tracking-wide text-slate-400">
                 <tr>
-                  <th className="px-4 py-3">班级 / 小组</th>
+                  <th className="px-4 py-3">{isScoped ? '小组' : '班级 / 小组'}</th>
                   <th className="px-4 py-3">任务</th>
                   <th className="px-4 py-3">状态</th>
                   <th className="px-4 py-3">成果</th>
@@ -213,7 +235,7 @@ export default function AssignmentReview() {
                   <tr key={item.task.id} className="hover:bg-indigo-50/40">
                     <td className="px-4 py-3">
                       <div className="font-bold text-slate-900">{item.project_name}</div>
-                      <div className="text-xs text-slate-400">{item.course_name || '未绑定班级'}</div>
+                      {!isScoped && <div className="text-xs text-slate-400">{item.course_name || '未绑定班级'}</div>}
                     </td>
                     <td className="max-w-xs px-4 py-3">
                       <div className="truncate font-semibold text-slate-800" title={item.task.title}>{item.task.title}</div>

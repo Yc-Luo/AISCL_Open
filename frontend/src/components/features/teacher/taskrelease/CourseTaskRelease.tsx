@@ -65,11 +65,17 @@ const toApiPayload = (form: ReleaseForm): CourseTaskReleaseCreateRequest => ({
   allow_late_submission: form.allow_late_submission,
 })
 
-export default function CourseTaskRelease() {
+type CourseTaskReleaseProps = { course?: Course }
+
+export default function CourseTaskRelease({ course }: CourseTaskReleaseProps) {
+  return <CourseTaskReleaseContent key={course?.id ?? 'all-courses'} course={course} />
+}
+
+function CourseTaskReleaseContent({ course }: CourseTaskReleaseProps) {
   const [courses, setCourses] = useState<Course[]>([])
-  const [selectedCourseId, setSelectedCourseId] = useState('')
+  const [globalCourseId, setGlobalCourseId] = useState('')
   const [releases, setReleases] = useState<CourseTaskReleaseItem[]>([])
-  const [loadingCourses, setLoadingCourses] = useState(true)
+  const [loadingCourses, setLoadingCourses] = useState(!course)
   const [loadingReleases, setLoadingReleases] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [closingId, setClosingId] = useState<string | null>(null)
@@ -77,10 +83,9 @@ export default function CourseTaskRelease() {
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
   const [releaseStep, setReleaseStep] = useState(0)
 
-  const selectedCourse = useMemo(
-    () => courses.find((course) => course.id === selectedCourseId) || null,
-    [courses, selectedCourseId]
-  )
+  const selectedCourseId = course?.id ?? globalCourseId
+  const selectedCourse = course ?? courses.find((item) => item.id === selectedCourseId)
+  const isScoped = course !== undefined
 
   const openReleaseCount = useMemo(
     () => releases.filter((release) => release.status === 'open').length,
@@ -88,12 +93,14 @@ export default function CourseTaskRelease() {
   )
 
   useEffect(() => {
+    if (isScoped) return
+
     const loadCourses = async () => {
       try {
         setLoadingCourses(true)
         const data = await courseService.getCourses()
         setCourses(data)
-        setSelectedCourseId((previous) => {
+        setGlobalCourseId((previous) => {
           if (previous && data.some((course) => course.id === previous)) return previous
           return data[0]?.id || ''
         })
@@ -106,7 +113,7 @@ export default function CourseTaskRelease() {
     }
 
     void loadCourses()
-  }, [])
+  }, [isScoped])
 
   useEffect(() => {
     if (!selectedCourseId) {
@@ -218,7 +225,7 @@ export default function CourseTaskRelease() {
 
   return (
     <div className="space-y-6">
-      <section className="rounded-3xl border border-slate-100 bg-white p-6 shadow-sm">
+      <section className="min-w-0 rounded-3xl border border-slate-100 bg-white p-4 shadow-sm sm:p-6">
         <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
           <div>
             <div className="mb-2 inline-flex items-center gap-2 rounded-full bg-indigo-50 px-3 py-1 text-xs font-semibold text-indigo-700">
@@ -231,9 +238,9 @@ export default function CourseTaskRelease() {
             </p>
           </div>
           <div className="grid grid-cols-2 gap-3 sm:flex">
-            <div className="rounded-2xl bg-slate-50 px-4 py-3">
+            <div className="min-w-0 rounded-2xl bg-slate-50 px-4 py-3">
               <div className="text-xs text-slate-500">当前班级</div>
-              <div className="mt-1 max-w-[180px] truncate text-sm font-semibold text-slate-900">
+              <div className="mt-1 break-words text-sm font-semibold text-slate-900 sm:max-w-[180px]">
                 {selectedCourse?.name || '未选择'}
               </div>
             </div>
@@ -262,34 +269,36 @@ export default function CourseTaskRelease() {
         </div>
       )}
 
-      {courses.length === 0 ? (
+      {!selectedCourse ? (
         <div className="rounded-3xl border border-dashed border-slate-200 bg-white p-12 text-center">
           <FileText className="mx-auto mb-4 h-10 w-10 text-slate-300" />
           <h2 className="text-lg font-semibold text-slate-900">暂无可管理班级</h2>
           <p className="mt-2 text-sm text-slate-500">请先在“班级管理”中创建班级，再发布小组任务。</p>
         </div>
       ) : (
-        <div className="grid gap-6 xl:grid-cols-[minmax(0,1.15fr)_minmax(360px,0.85fr)]">
-          <section className="rounded-3xl border border-slate-100 bg-white p-6 shadow-sm">
+        <div className="grid min-w-0 gap-6 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,0.85fr)]">
+          <section className="min-w-0 rounded-3xl border border-slate-100 bg-white p-4 shadow-sm sm:p-6">
             <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
               <div>
                 <h2 className="text-xl font-bold text-slate-900">发布新任务</h2>
-                <p className="mt-1 text-sm text-slate-500">任务会同步到所选班级下所有未归档小组。</p>
+                <p className="mt-1 text-sm text-slate-500">{isScoped ? '任务会同步到本班所有未归档小组。' : '任务会同步到所选班级下所有未归档小组。'}</p>
               </div>
-              <label className="block min-w-[220px]">
-                <span className="mb-1 block text-xs font-semibold text-slate-500">发布班级</span>
-                <select
-                  value={selectedCourseId}
-                  onChange={(event) => setSelectedCourseId(event.target.value)}
-                  className="w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
-                >
-                  {courses.map((course) => (
-                    <option key={course.id} value={course.id}>
-                      {course.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              {!isScoped && (
+                <label className="block min-w-0 sm:w-56">
+                  <span className="mb-1 block text-xs font-semibold text-slate-500">发布班级</span>
+                  <select
+                    value={selectedCourseId}
+                    onChange={(event) => setGlobalCourseId(event.target.value)}
+                    className="w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+                  >
+                    {courses.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
             </div>
 
             <div className="space-y-5">
@@ -311,7 +320,7 @@ export default function CourseTaskRelease() {
                       }`}>
                         {index + 1}
                       </span>
-                      <span className="text-sm font-bold">{step.label}</span>
+                      <span className="text-sm font-bold">{isScoped && index === 0 ? '设置任务与时限' : step.label}</span>
                     </div>
                     <p className="text-xs leading-5">{step.description}</p>
                   </button>
@@ -337,7 +346,7 @@ export default function CourseTaskRelease() {
                         type="datetime-local"
                         value={form.due_at}
                         onChange={(event) => updateForm('due_at', event.target.value)}
-                        className="w-full rounded-2xl border border-slate-200 px-4 py-3 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+                        className="min-w-0 w-full rounded-2xl border border-slate-200 px-4 py-3 text-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
                       />
                     </label>
                     <label className="flex items-center gap-3 rounded-2xl border border-slate-200 px-4 py-3 text-sm text-slate-600">
@@ -407,7 +416,7 @@ export default function CourseTaskRelease() {
                       ? '项目说明会同步到小组任务，并作为学生端任务说明内容。'
                       : '按步骤填写可以减少学生端任务说明缺失或发布对象错误。'}
                 </span>
-                <div className="flex items-center justify-end gap-2">
+                <div className="flex flex-wrap items-center justify-end gap-2">
                   <Button
                     type="button"
                     variant="outline"
@@ -445,7 +454,7 @@ export default function CourseTaskRelease() {
             </div>
           </section>
 
-          <section className="rounded-3xl border border-slate-100 bg-white p-6 shadow-sm">
+          <section className="min-w-0 rounded-3xl border border-slate-100 bg-white p-4 shadow-sm sm:p-6">
             <div className="mb-5 flex items-center justify-between">
               <div>
                 <h2 className="text-xl font-bold text-slate-900">发布记录</h2>

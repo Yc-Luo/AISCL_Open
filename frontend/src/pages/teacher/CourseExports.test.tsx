@@ -277,11 +277,12 @@ it('exposes exports only under owned class details and cancels requests on accou
     </MemoryRouter>
   )
   const { rerender } = render(classPage())
-  await screen.findByText('班级详情')
+  const exports = await screen.findByRole('link', { name: '成果与导出' })
   expect(get).not.toHaveBeenCalled()
   let resolveGroups!: (value: { data: { groups: typeof groups } }) => void
   get.mockImplementationOnce(() => new Promise(resolve => { resolveGroups = resolve }))
-  toggle()
+  fireEvent.click(exports)
+  await waitFor(() => expect(get).toHaveBeenCalledTimes(2))
   const signal = get.mock.calls[0][1]?.signal
   try {
     auth.user = { id: 'other' }
@@ -289,7 +290,7 @@ it('exposes exports only under owned class details and cancels requests on accou
     expect(signal?.aborted).toBe(true)
     await act(async () => { resolveGroups({ data: { groups } }) })
     expect(screen.getByText('找不到该班级，或该班级不属于当前账号。')).toBeTruthy()
-    expect(screen.queryByRole('button', { name: '成果与导出' })).toBeNull()
+    expect(screen.queryByRole('link', { name: '成果与导出' })).toBeNull()
     expect(get).toHaveBeenCalledTimes(2)
   } finally {
     auth.user = { id: 'owner' }

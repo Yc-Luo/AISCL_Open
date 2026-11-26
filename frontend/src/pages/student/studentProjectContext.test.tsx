@@ -88,6 +88,22 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
 describe('student project context', () => {
+  it('only opens the first-visit student guide for students, never for a teacher observer', async () => {
+    vi.stubGlobal('localStorage', { getItem: () => null, setItem: () => {} })
+    mocks.getProject.mockResolvedValue({ ...project('group-a'), course_id: 'course-a' })
+    const first = open('/project/group-a')
+    await screen.findByRole('button', { name: '关闭使用指南' })
+    first.unmount()
+
+    useAuthStore.setState({ user: { ...useAuthStore.getState().user!, role: 'teacher' } })
+    const returnTo = '/teacher/overview/course-a?section=observe&groupSearch=alpha'
+    open(`/project/group-a?observe=monitor&returnTo=${encodeURIComponent(returnTo)}`)
+    const link = await screen.findByRole('link', { name: /返回本班.*小组观察/ })
+    expect(link.getAttribute('href')).toBe(`${returnTo}&group=group-a`)
+    expect(screen.getByRole('navigation', { name: '教师观察导航' }).textContent).toContain('group-a')
+    expect(screen.queryByRole('button', { name: '关闭使用指南' })).toBeNull()
+  })
+
   it('uses the list for an ungrouped student, without starting a workspace', async () => {
     open('/student/dashboard')
     expect(await screen.findByText('还没有小组')).toBeTruthy()

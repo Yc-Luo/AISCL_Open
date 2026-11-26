@@ -9,8 +9,8 @@ export type ProjectListResponse = {
 export type ProjectCreateRequest = CreateProjectData
 
 export const projectService = {
-  async getProjects(archived?: boolean, skip?: number): Promise<ProjectListResponse> {
-    return newProjectService.getProjects(archived, skip)
+  async getProjects(archived?: boolean, skip?: number, courseId?: string): Promise<ProjectListResponse> {
+    return newProjectService.getProjects(archived, skip, courseId)
   },
 
   async getProject(projectId: string): Promise<Project> {

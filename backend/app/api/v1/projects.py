@@ -187,6 +187,7 @@ async def get_projects(
     limit: int = Query(100, ge=1, le=100),
     archived: Optional[bool] = None,
     current_user: User = Depends(get_current_user),
+    course_id: Optional[str] = None,
 ) -> ProjectListResponse:
     """Get current user's projects."""
     query = {}
@@ -211,6 +212,8 @@ async def get_projects(
 
     if archived is not None:
         query["is_archived"] = archived
+    if course_id:
+        query["course_id"] = course_id
 
     projects_cursor = Project.find(query).sort("_id").skip(skip).limit(limit)
     projects_list = await projects_cursor.to_list()

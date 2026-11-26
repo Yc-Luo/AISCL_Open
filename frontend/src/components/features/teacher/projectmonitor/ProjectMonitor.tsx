@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import {
     BarChart3,
     BookOpen,
@@ -17,12 +17,12 @@ import {
 import { Button, Input, Badge } from '../../../ui';
 import { useToast } from '../../../ui/Toast';
 import { courseService, Course } from '../../../../services/api/course';
-import { projectService } from '../../../../services/api/project';
 import { analyticsService } from '../../../../services/api/analytics';
 import { chatService, TeacherHelpRequest } from '../../../../services/api/chat';
 import { Project } from '../../../../types';
 import { trackingService } from '../../../../services/tracking/TrackingService';
 import { formatStageLabel } from '../../../../lib/stageModel';
+import { loadTeacherProjectList, teacherObservationLink, updateProjectListParams } from '../../../../lib/teacherCourseNavigation';
 import { syncService } from '../../../../services/sync/SyncService';
 import { ChatOperation } from '../../../../types/sync';
 import { usePresenceStore } from '../../../../stores/presenceStore';
@@ -173,18 +173,28 @@ function getStatusMeta(status: GroupStatus) {
     return map[status];
 }
 
-export default function ProjectMonitor() {
+export default function ProjectMonitor({ course }: { course?: Course }) {
+    return <ProjectMonitorView key={course ? `course:${course.id}` : 'legacy'} course={course} />;
+}
+
+function ProjectMonitorView({ course }: { course?: Course }) {
     const navigate = useNavigate();
-    const [courses, setCourses] = useState<Course[]>([]);
+    const [params, setParams] = useSearchParams();
+    const courseId = course?.id;
+    const [legacyCourses, setLegacyCourses] = useState<Course[]>([]);
+    const courses = useMemo(() => course ? [course] : legacyCourses, [course, legacyCourses]);
     const [projects, setProjects] = useState<Project[]>([]);
-    const [selectedCourseId, setSelectedCourseId] = useState<string>('all');
-    const [selectedProjectId, setSelectedProjectId] = useState<string>('');
-    const [archiveFilter, setArchiveFilter] = useState<ArchiveFilter>('all');
+    const selectedCourseId = courseId || params.get('course') || 'all';
+    const requestedProjectId = params.get('group');
+    const archive = params.get('groupStatus');
+    const archiveFilter: ArchiveFilter = archive === 'active' || archive === 'archived' ? archive : 'all';
     const [projectAnalytics, setProjectAnalytics] = useState<Record<string, ProjectAnalyticsSnapshot>>({});
     const [loading, setLoading] = useState(true);
     const [analyticsLoading, setAnalyticsLoading] = useState(false);
-    const [searchQuery, setSearchQuery] = useState('');
-    const [onlyNeedsAttention, setOnlyNeedsAttention] = useState(false);
+    const searchQuery = params.get('groupSearch') || '';
+    const onlyNeedsAttention = params.get('groupAttention') === '1';
+    const updateFilters = (changes: Parameters<typeof updateProjectListParams>[1]) =>
+        setParams(updateProjectListParams(params, changes), { replace: true });
     const [groupSupportDraft, setGroupSupportDraft] = useState('');
     const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
     const [replyPublicByRequest, setReplyPublicByRequest] = useState<Record<string, boolean>>({});
@@ -194,24 +204,26 @@ export default function ProjectMonitor() {
     const [supportHistory, setSupportHistory] = useState<Record<string, SupportHistoryItem[]>>({});
     const [helpRequests, setHelpRequests] = useState<HelpRequest[]>(emptyHelpRequests);
     const [lastHelpRefreshAt, setLastHelpRefreshAt] = useState<string | null>(null);
+    const refreshedHelpProjectIds = useRef(new Set<string>());
     const dashboardViewTrackedRef = useRef(false);
     const toast = useToast();
-    const selectedPresenceUsers = usePresenceStore((state) => state.getProjectUsers(selectedProjectId));
     const markPresenceOnline = usePresenceStore((state) => state.markOnline);
 
     useEffect(() => {
+        let cancelled = false;
         const fetchOverviewData = async () => {
             try {
                 setLoading(true);
-                const [coursesData, projectsData] = await Promise.all([
-                    courseService.getCourses(),
-                    projectService.getProjects(),
+                const [coursesData, projectList] = await Promise.all([
+                    courseId ? Promise.resolve([]) : courseService.getCourses(),
+                    loadTeacherProjectList(courseId, !courseId),
                 ]);
-                setCourses(coursesData);
-                setProjects(projectsData.projects);
-                setSelectedProjectId((current) => current || projectsData.projects[0]?.id || '');
+                if (cancelled) return;
+                setLegacyCourses(coursesData);
+                setProjects(projectList);
+                setLoading(false);
                 const helpRequestGroups = await Promise.all(
-                    projectsData.projects.map(async (project: Project) => {
+                    projectList.map(async (project) => {
                         try {
                             const response = await chatService.getTeacherHelpRequests(project.id, 'pending');
                             return response.requests.map(mapHelpRequest);
@@ -221,43 +233,21 @@ export default function ProjectMonitor() {
                         }
                     })
                 );
-                setHelpRequests(helpRequestGroups.flat());
+                if (cancelled) return;
+                const initialRequests = helpRequestGroups.flat().filter((request) =>
+                    !refreshedHelpProjectIds.current.has(request.projectId)
+                );
+                setHelpRequests((previous) => [...previous, ...initialRequests]);
             } catch (error) {
                 console.error('Failed to fetch monitor data:', error);
             } finally {
-                setLoading(false);
+                if (!cancelled) setLoading(false);
             }
         };
 
-        fetchOverviewData();
-    }, []);
-
-    useEffect(() => {
-        if (!selectedProjectId || projectAnalytics[selectedProjectId]) return;
-
-        let cancelled = false;
-        const fetchSelectedAnalytics = async () => {
-            try {
-                setAnalyticsLoading(true);
-                const data = await analyticsService.getDashboardData(selectedProjectId);
-                if (!cancelled) {
-                    setProjectAnalytics((previous) => ({
-                        ...previous,
-                        [selectedProjectId]: data,
-                    }));
-                }
-            } catch (error) {
-                console.error('Failed to fetch selected project analytics:', error);
-            } finally {
-                if (!cancelled) setAnalyticsLoading(false);
-            }
-        };
-
-        fetchSelectedAnalytics();
-        return () => {
-            cancelled = true;
-        };
-    }, [projectAnalytics, selectedProjectId]);
+        void fetchOverviewData();
+        return () => { cancelled = true; };
+    }, [courseId]);
 
     const courseById = useMemo(() => {
         return new Map(courses.map((course) => [course.id, course]));
@@ -353,12 +343,34 @@ export default function ProjectMonitor() {
         return groups.filter((group) => group.projects.length > 0);
     }, [courses, filteredProjects]);
 
+    // Only a group resolved from the filtered, authorized list may start room or analytics calls.
+    const selectedProject = filteredProjects.find((project) => project.id === requestedProjectId) || filteredProjects[0];
+    const selectedProjectId = selectedProject?.id || '';
+    const selectedAnalytics = selectedProjectId ? projectAnalytics[selectedProjectId] : undefined;
+    const selectedPresenceUsers = usePresenceStore((state) => state.getProjectUsers(selectedProjectId));
+
     useEffect(() => {
-        if (filteredProjects.length === 0) return;
-        if (!filteredProjects.some((project) => project.id === selectedProjectId)) {
-            setSelectedProjectId(filteredProjects[0].id);
+        if (!selectedProjectId || selectedAnalytics) {
+            setAnalyticsLoading(false);
+            return;
         }
-    }, [filteredProjects, selectedProjectId]);
+        let cancelled = false;
+        const fetchSelectedAnalytics = async () => {
+            try {
+                setAnalyticsLoading(true);
+                const data = await analyticsService.getDashboardData(selectedProjectId);
+                if (!cancelled) {
+                    setProjectAnalytics((previous) => ({ ...previous, [selectedProjectId]: data }));
+                }
+            } catch (error) {
+                console.error('Failed to fetch selected project analytics:', error);
+            } finally {
+                if (!cancelled) setAnalyticsLoading(false);
+            }
+        };
+        void fetchSelectedAnalytics();
+        return () => { cancelled = true; };
+    }, [selectedAnalytics, selectedProjectId]);
 
     useEffect(() => {
         setGroupSupportDraft('');
@@ -367,7 +379,6 @@ export default function ProjectMonitor() {
         setSupportFeedback(null);
     }, [selectedProjectId]);
 
-    const selectedProject = filteredProjects.find((project) => project.id === selectedProjectId) || filteredProjects[0];
     const selectedMetrics = selectedProject ? getProjectMetrics(selectedProject) : null;
     const selectedCourse = selectedProject?.course_id ? courseById.get(selectedProject.course_id) : undefined;
     const selectedHelpRequests = selectedProject
@@ -408,6 +419,7 @@ export default function ProjectMonitor() {
             try {
                 const response = await chatService.getTeacherHelpRequests(selectedProject.id, 'pending');
                 if (cancelled) return;
+                refreshedHelpProjectIds.current.add(selectedProject.id);
                 const nextRequests = response.requests.map(mapHelpRequest);
                 setHelpRequests((previous) => [
                     ...previous.filter((request) => request.projectId !== selectedProject.id),
@@ -497,6 +509,7 @@ export default function ProjectMonitor() {
                     ].slice(0, 5),
                 };
             });
+            refreshedHelpProjectIds.current.add(selectedProject.id);
             setHelpRequests((previous) =>
                 previous.map((item) =>
                     item.id === request.id ? { ...item, status: 'replied' } : item
@@ -564,7 +577,7 @@ export default function ProjectMonitor() {
     }
 
     return (
-        <div className="min-h-screen animate-fadeIn overflow-visible lg:h-[calc(100vh-2rem)] lg:min-h-[720px] lg:overflow-hidden">
+        <div className={course ? 'min-w-0 animate-fadeIn' : 'min-h-screen animate-fadeIn overflow-visible lg:h-[calc(100vh-2rem)] lg:min-h-[720px] lg:overflow-hidden'}>
             <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
                 <div>
                     <h1 className="text-2xl font-bold text-slate-900">小组监控</h1>
@@ -573,19 +586,19 @@ export default function ProjectMonitor() {
                     </p>
                 </div>
                 <div className="grid grid-cols-2 gap-2 text-center sm:grid-cols-4">
-                    <MiniStat label="班级" value={courses.length} />
+                    {!course && <MiniStat label="班级" value={courses.length} />}
                     <MiniStat label="学生" value={totalStudents} />
                     <MiniStat label="小组" value={projects.length} />
                     <MiniStat label="需关注" value={attentionCount} tone={attentionCount > 0 ? 'warning' : 'normal'} />
                 </div>
             </div>
 
-            <div className="grid min-h-0 grid-cols-1 gap-4 lg:h-[calc(100%-5.5rem)] lg:grid-cols-[240px_minmax(0,1fr)] 2xl:grid-cols-[260px_minmax(0,1fr)_340px]">
-                <aside className="flex max-h-[420px] min-h-0 flex-col rounded-2xl border border-slate-200 bg-white shadow-sm lg:max-h-none lg:row-span-2 2xl:row-span-1">
+            <div className={`grid min-h-0 grid-cols-1 gap-4 lg:grid-cols-[240px_minmax(0,1fr)] 2xl:grid-cols-[260px_minmax(0,1fr)_340px] ${course ? '' : 'lg:h-[calc(100%-5.5rem)]'}`}>
+                <aside className={`flex min-h-0 flex-col rounded-2xl border border-slate-200 bg-white shadow-sm lg:row-span-2 2xl:row-span-1 ${course ? 'max-h-[600px]' : 'max-h-[420px] lg:max-h-none'}`}>
                     <div className="border-b border-slate-100 p-3">
                         <div className="flex items-center justify-between">
                             <div>
-                                <h2 className="text-sm font-bold text-slate-900">班级 / 小组</h2>
+                                <h2 className="text-sm font-bold text-slate-900">{course ? '本班小组' : '班级 / 小组'}</h2>
                                 <p className="mt-1 text-xs text-slate-500">点击小组切换观察对象</p>
                             </div>
                             <Badge className="border-indigo-100 bg-indigo-50 text-indigo-700">
@@ -597,15 +610,15 @@ export default function ProjectMonitor() {
                                 <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
                                 <Input
                                     value={searchQuery}
-                                    onChange={(event) => setSearchQuery(event.target.value)}
+                                    onChange={(event) => updateFilters({ groupSearch: event.target.value })}
                                     placeholder="搜索小组..."
                                     className="pl-9"
                                 />
                             </div>
                             <div className="space-y-2">
-                                <select
+                                {!course && <select
                                     value={selectedCourseId}
-                                    onChange={(event) => setSelectedCourseId(event.target.value)}
+                                    onChange={(event) => updateFilters({ course: event.target.value === 'all' ? '' : event.target.value, group: '' })}
                                     className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-indigo-300 focus:ring-2 focus:ring-indigo-100"
                                 >
                                     <option value="all">全部班级</option>
@@ -613,7 +626,7 @@ export default function ProjectMonitor() {
                                         <option key={course.id} value={course.id}>{getCourseLabel(course)}</option>
                                     ))}
                                     <option value={UNASSIGNED_COURSE_ID}>未绑定班级</option>
-                                </select>
+                                </select>}
                                 <div className="grid grid-cols-3 gap-1 rounded-lg bg-slate-100 p-1 text-xs font-semibold">
                                     {([
                                         ['all', '全部'],
@@ -623,7 +636,7 @@ export default function ProjectMonitor() {
                                         <button
                                             key={value}
                                             type="button"
-                                            onClick={() => setArchiveFilter(value)}
+                                            onClick={() => updateFilters({ groupStatus: value === 'all' ? '' : value })}
                                             className={`rounded-md px-2 py-1.5 transition ${archiveFilter === value
                                                 ? 'bg-white text-indigo-700 shadow-sm'
                                                 : 'text-slate-500 hover:text-slate-900'
@@ -635,7 +648,7 @@ export default function ProjectMonitor() {
                                 </div>
                                 <button
                                     type="button"
-                                    onClick={() => setOnlyNeedsAttention((value) => !value)}
+                                    onClick={() => updateFilters({ groupAttention: onlyNeedsAttention ? '' : '1' })}
                                     className={`w-full rounded-lg border px-3 py-2 text-xs font-semibold transition ${onlyNeedsAttention
                                         ? 'border-amber-200 bg-amber-50 text-amber-700'
                                         : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'
@@ -671,7 +684,8 @@ export default function ProjectMonitor() {
                                                     <button
                                                         key={project.id}
                                                         type="button"
-                                                        onClick={() => setSelectedProjectId(project.id)}
+                                                        onClick={() => updateFilters({ group: project.id })}
+                                                        aria-pressed={selected}
                                                         className={`w-full rounded-xl border px-3 py-2.5 text-left transition ${selected
                                                             ? 'border-indigo-200 bg-indigo-50 shadow-sm ring-1 ring-indigo-100 [box-shadow:inset_3px_0_0_#4f46e5]'
                                                             : 'border-slate-100 bg-white hover:border-slate-200 hover:bg-slate-50'
@@ -742,19 +756,19 @@ export default function ProjectMonitor() {
                                             className="gap-2"
                                             asChild
                                         >
-                                            <Link to={`/project/${selectedProject.id}?observe=monitor`} target="_blank" rel="noopener">
+                                            <Link to={teacherObservationLink(selectedProject.id, 'monitor', params, courseId)} target="_blank" rel="noopener">
                                                 <Eye className="h-4 w-4" />
                                                 新标签页观察
                                             </Link>
                                         </Button>
-                                        <Button
+                                        {!course && <Button
                                             variant="outline"
                                             className="gap-2"
                                             onClick={() => navigate(`/teacher/project-dashboard?project=${selectedProject.id}`)}
                                         >
                                             <BarChart3 className="h-4 w-4" />
                                             查看数据
-                                        </Button>
+                                        </Button>}
                                     </div>
                                 </div>
                             </section>

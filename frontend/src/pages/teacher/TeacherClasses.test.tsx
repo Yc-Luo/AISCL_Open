@@ -22,6 +22,24 @@ vi.mock('../../services/api/project', () => ({ projectService: { getProjects: vi
 vi.mock('./TeacherModelConnections', () => ({
   default: ({ onChanged }: { onChanged: () => void }) => <button type="button" onClick={onChanged}>更新连接</button>,
 }))
+vi.mock('../../components/features/teacher/projectmanager/ProjectManager', () => ({
+  default: ({ course }: { course: { id: string } }) => <p data-testid="scoped-groups">{course.id}</p>,
+}))
+vi.mock('../../components/features/teacher/projectmonitor/ProjectMonitor', () => ({
+  default: ({ course }: { course: { id: string } }) => <p data-testid="scoped-observe">{course.id}</p>,
+}))
+vi.mock('../../components/features/teacher/taskrelease/CourseTaskRelease', () => ({
+  default: ({ course }: { course: { id: string } }) => <p data-testid="scoped-tasks">{course.id}</p>,
+}))
+vi.mock('../../components/features/teacher/courseresource/CourseResource', () => ({
+  default: ({ course }: { course: { id: string } }) => <p data-testid="scoped-resources">{course.id}</p>,
+}))
+vi.mock('../../components/features/teacher/assignmentreview/AssignmentReview', () => ({
+  default: ({ courseId }: { courseId: string }) => <p data-testid="scoped-reviews">{courseId}</p>,
+}))
+vi.mock('./CourseExports', () => ({
+  default: ({ courseId }: { courseId: string }) => <p data-testid="scoped-exports">{courseId}</p>,
+}))
 
 function open(path = '') {
   const course = { teacher_id: 'me', students: ['s1'], invite_code: '', created_at: '' }
@@ -59,6 +77,7 @@ it('filters owned courses and preserves view settings when returning from the ro
   fireEvent.click(screen.getByRole('button', { name: '列表' }))
   fireEvent.change(screen.getByLabelText('密度'), { target: { value: 'compact' } })
   fireEvent.click(screen.getByRole('link', { name: /春季班/ }))
+  fireEvent.click(screen.getByRole('link', { name: '成员与小组' }))
   await screen.findByText('学生甲')
   expect(courseService.getCourseStudents).toHaveBeenCalledWith('spring')
   fireEvent.click(screen.getByRole('link', { name: '返回我的班级' }))
@@ -67,17 +86,44 @@ it('filters owned courses and preserves view settings when returning from the ro
   expect(screen.queryByText('秋季班')).toBeNull()
 })
 
-it('does not fetch the roster for a direct link to an unowned class', async () => {
-  open('/other')
+it('does not mount a section for a direct link to an unowned class', async () => {
+  open('/other?section=activity&panel=tasks')
   await screen.findByText('找不到该班级，或该班级不属于当前账号。')
   expect(courseService.getCourseStudents).not.toHaveBeenCalled()
   expect(courseService.getCourseAISettings).not.toHaveBeenCalled()
   expect(courseService.getLearningDesign).not.toHaveBeenCalled()
   expect(courseService.getLearningDesignModels).not.toHaveBeenCalled()
+  expect(screen.queryByTestId('scoped-tasks')).toBeNull()
+})
+
+it('keeps each section in the selected class and removes observation filters from sibling links', async () => {
+  open('/fall?section=observe&group=g1&status=attention&view=list')
+  const nav = await screen.findByRole('navigation', { name: '班级工作台' })
+  const tab = (name: string) => within(nav).getByRole('link', { name })
+  expect(tab('小组观察').getAttribute('aria-current')).toBe('page')
+  expect((await screen.findByTestId('scoped-observe')).textContent).toBe('fall')
+  expect(tab('活动设计').getAttribute('href')).toBe('/teacher/overview/fall?view=list&section=activity')
+  expect(courseService.getCourseStudents).not.toHaveBeenCalled()
+  expect(courseService.getCourseAISettings).not.toHaveBeenCalled()
+
+  fireEvent.click(tab('成员与小组'))
+  expect((await screen.findByRole('link', { name: '导入与管理学生' })).getAttribute('href'))
+    .toBe('/teacher/student-list?courseId=fall')
+  fireEvent.click(screen.getByRole('link', { name: '小组管理' }))
+  expect((await screen.findByTestId('scoped-groups')).textContent).toBe('fall')
+  fireEvent.click(tab('活动设计'))
+  fireEvent.click(screen.getByRole('link', { name: '任务发布' }))
+  expect((await screen.findByTestId('scoped-tasks')).textContent).toBe('fall')
+  fireEvent.click(screen.getByRole('link', { name: '课程资料' }))
+  expect((await screen.findByTestId('scoped-resources')).textContent).toBe('fall')
+  fireEvent.click(tab('成果与导出'))
+  expect((await screen.findByTestId('scoped-exports')).textContent).toBe('fall')
+  fireEvent.click(screen.getByRole('link', { name: '成果评审' }))
+  expect((await screen.findByTestId('scoped-reviews')).textContent).toBe('fall')
 })
 
 it('pages the roster, clamps jumps and resets the page when the page size changes', async () => {
-  open('/spring')
+  open('/spring?section=members')
   vi.mocked(courseService.getCourseStudents).mockResolvedValueOnce(
     Array.from({ length: 106 }, (_, i) => ({ id: String(i), username: `成员${i + 1}`, email: '' })),
   )
@@ -113,7 +159,7 @@ it('pages the roster, clamps jumps and resets the page when the page size change
 })
 
 it('does not show pagination while the roster is loading or empty', async () => {
-  open('/spring')
+  open('/spring?section=members')
   vi.mocked(courseService.getCourseStudents).mockResolvedValueOnce([])
   expect(screen.queryByLabelText('每页条数')).toBeNull()
   await screen.findByText('暂无学生名单记录。')
@@ -123,7 +169,7 @@ it('does not show pagination while the roster is loading or empty', async () => 
 })
 
 it('validates class AI settings and loads saved values without affecting other classes', async () => {
-  open('/spring')
+  open('/spring?section=activity')
   const saved = new Map<string, CourseAISettings>()
   vi.mocked(courseService.getCourseAISettings).mockImplementation(async id => saved.get(id) ?? null)
   vi.mocked(courseService.updateCourseAISettings).mockImplementation(async (id, settings) => {
@@ -174,15 +220,35 @@ it('validates class AI settings and loads saved values without affecting other c
 
   fireEvent.click(screen.getByRole('link', { name: '返回我的班级' }))
   fireEvent.click(screen.getByRole('link', { name: /秋季班/ }))
+  fireEvent.click(screen.getByRole('link', { name: '活动设计' }))
   expect((await screen.findByLabelText<HTMLSelectElement>('AI 回答模式')).value).toBe('single_agent')
   expect(screen.getByLabelText<HTMLInputElement>('共享记忆').checked).toBe(false)
   expect(screen.getByText(/尚未配置/)).toBeTruthy()
   fireEvent.click(screen.getByRole('link', { name: '返回我的班级' }))
   fireEvent.click(screen.getByRole('link', { name: /春季班/ }))
+  fireEvent.click(screen.getByRole('link', { name: '活动设计' }))
   expect((await screen.findByLabelText<HTMLSelectElement>('AI 回答模式')).value).toBe('multi_agent')
   expect(screen.getByLabelText<HTMLInputElement>('过程支架').checked).toBe(false)
   expect(screen.getByLabelText<HTMLInputElement>('共享记忆').checked).toBe(true)
   expect(screen.queryByText(/尚未配置/)).toBeNull()
+})
+
+it('edits the current class without publishing an unchanged project brief or loading another class', async () => {
+  open('/fall?section=settings')
+  const edit = await screen.findByRole('button', { name: '编辑班级信息' })
+  const courses = await vi.mocked(courseService.getCourses).mock.results[0].value
+  vi.mocked(courseService.updateCourse).mockResolvedValue({ ...courses[0], name: '秋季班新名称' })
+  fireEvent.click(edit)
+  const dialog = within(screen.getByRole('dialog', { name: '修改班级信息' }))
+  expect(dialog.getByLabelText<HTMLTextAreaElement>('项目说明内容').value).toBe('')
+  fireEvent.change(dialog.getByLabelText('班级名称'), { target: { value: '秋季班新名称' } })
+  fireEvent.click(dialog.getByRole('button', { name: '确认修改' }))
+  await screen.findByRole('heading', { name: '秋季班新名称' })
+  expect(courseService.updateCourse).toHaveBeenCalledWith('fall', expect.objectContaining({
+    name: '秋季班新名称', initial_task_document_title: undefined, initial_task_document_content: undefined,
+  }))
+  expect(courseService.getCourses).toHaveBeenCalledTimes(1)
+  expect(screen.queryByRole('button', { name: '创建新班级' })).toBeNull()
 })
 
 it('creates and edits classes without selecting or submitting templates', async () => {
@@ -217,7 +283,7 @@ const existingDesign: DesignSnapshot = {
 }
 
 it('opens the learning design on demand, edits sparse snapshots and restores a role without saving example text', async () => {
-  open('/spring')
+  open('/spring?section=activity')
   vi.mocked(courseService.getLearningDesign).mockResolvedValue(existingDesign)
   vi.mocked(courseService.saveLearningDesign).mockImplementation(async (_, design) => ({ ...design, revision: 'r2' }))
 
@@ -278,7 +344,7 @@ it('opens the learning design on demand, edits sparse snapshots and restores a r
 })
 
 it('saves class, built-in and custom model choices separately from the role JSON', async () => {
-  open('/spring')
+  open('/spring?section=activity')
   const custom = { id: 'custom_example', name: '核验员', prompt: '核验资料', enabled: true, routing_anchor: 'evidence_researcher' } as const
   vi.mocked(courseService.getLearningDesign).mockResolvedValue({ ...existingDesign, roles: [...existingDesign.roles, custom], model_assignments: null })
   vi.mocked(courseService.getLearningDesignModels).mockResolvedValue([{ id: 'connection-a', name: '模型 A' }, { id: 'connection-b', name: '模型 B' }])
@@ -314,7 +380,7 @@ it('saves class, built-in and custom model choices separately from the role JSON
 })
 
 it('refreshes after connection changes and requires an explicit change for unavailable choices', async () => {
-  open('/spring')
+  open('/spring?section=activity')
   vi.mocked(courseService.getLearningDesign).mockResolvedValue({ ...existingDesign, model_assignments: { default_model_id: 'old', role_model_ids: {} } })
   vi.mocked(courseService.getLearningDesignModels).mockResolvedValueOnce([{ id: 'old', name: '旧模型' }])
   vi.mocked(courseService.saveLearningDesign).mockImplementation(async (_, design) => ({ ...design, revision: 'r2' }))
@@ -338,7 +404,7 @@ it('refreshes after connection changes and requires an explicit change for unava
 })
 
 it('retries the catalog locally and leaves unassigned designs usable while it fails', async () => {
-  open('/spring')
+  open('/spring?section=activity')
   vi.mocked(courseService.getLearningDesign).mockResolvedValue({ ...existingDesign, model_assignments: null })
   vi.mocked(courseService.getLearningDesignModels).mockRejectedValueOnce(new Error('private diagnostic'))
     .mockResolvedValueOnce([{ id: 'new', name: '新连接' }])
@@ -357,7 +423,7 @@ it('retries the catalog locally and leaves unassigned designs usable while it fa
 })
 
 it('cleans up role bindings when a role is restored or removed', async () => {
-  open('/spring')
+  open('/spring?section=activity')
   const custom = { id: 'custom_example', name: '核验员', prompt: '核验资料', enabled: true, routing_anchor: 'evidence_researcher' } as const
   vi.mocked(courseService.getLearningDesign).mockResolvedValue({
     ...existingDesign, roles: [...existingDesign.roles, custom],
@@ -377,7 +443,7 @@ it('cleans up role bindings when a role is restored or removed', async () => {
 })
 
 it('requires a confirmed save and explicit confirmation before applying to one eligible group on a later page', async () => {
-  open('/spring')
+  open('/spring?section=activity')
   vi.mocked(courseService.saveLearningDesign).mockRejectedValueOnce(new Error('save failed'))
     .mockImplementation(async (_, design) => ({ ...design, revision: 'r2' }))
   vi.mocked(courseService.applyLearningDesign).mockRejectedValueOnce(new Error('apply failed'))
@@ -427,7 +493,7 @@ it('requires a confirmed save and explicit confirmation before applying to one e
 })
 
 it('saves custom roles in order, reloads them, and saves removal without applying either revision', async () => {
-  open('/spring')
+  open('/spring?section=activity')
   vi.mocked(courseService.getLearningDesign).mockResolvedValue(existingDesign)
   vi.mocked(courseService.saveLearningDesign).mockImplementation(async (_, design) => ({ ...design, revision: 'r2' }))
   fireEvent.click(await screen.findByRole('button', { name: '班级学习设计' }))
@@ -469,7 +535,7 @@ it('saves custom roles in order, reloads them, and saves removal without applyin
   expect(second.id).not.toBe(first.id)
 
   cleanup()
-  open('/spring')
+  open('/spring?section=activity')
   vi.mocked(courseService.getLearningDesign).mockResolvedValue({ ...submitted, revision: 'r2' })
   vi.mocked(courseService.saveLearningDesign).mockImplementation(async (_, design) => ({ ...design, revision: 'r3' }))
   fireEvent.click(await screen.findByRole('button', { name: '班级学习设计' }))
@@ -496,7 +562,7 @@ it('saves custom roles in order, reloads them, and saves removal without applyin
 })
 
 it('validates custom role names and prompts, enforces the cap, and counts enabled custom roles', async () => {
-  open('/spring')
+  open('/spring?section=activity')
   fireEvent.click(await screen.findByRole('button', { name: '班级学习设计' }))
   const add = await screen.findByRole<HTMLButtonElement>('button', { name: '添加自定义角色' })
   const save = screen.getByRole<HTMLButtonElement>('button', { name: '保存学习设计' })
