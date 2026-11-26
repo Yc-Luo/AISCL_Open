@@ -7,6 +7,9 @@ from beanie import Document
 from pydantic import Field
 from pymongo import IndexModel
 
+TEACHER_COURSE_EXPORT = "teacher_course_export"
+ACTIVE_EXPORT_STATES = ["queued", "running"]
+
 
 class ExportJob(Document):
     """Asynchronous export job state."""
@@ -18,6 +21,12 @@ class ExportJob(Document):
     requested_by: str = Field(..., index=True)
     include_files: bool = False
     include_raw_heartbeat: bool = False
+    export_profile: Optional[str] = None
+    project_ids: list[str] = Field(default_factory=list)
+    from_date: Optional[str] = None
+    through_date: Optional[str] = None
+    stage_id: Optional[str] = None
+    missing_files: int = Field(default=0, ge=0)
     progress: int = Field(default=0, ge=0, le=100)
     message: str = ""
     filename: Optional[str] = None
@@ -37,5 +46,14 @@ class ExportJob(Document):
             [("requested_by", 1), ("created_at", -1)],
             [("course_id", 1), ("created_at", -1)],
             [("status", 1), ("created_at", -1)],
+            IndexModel(
+                [("requested_by", 1), ("job_type", 1)],
+                name="one_active_teacher_export",
+                unique=True,
+                partialFilterExpression={
+                    "job_type": TEACHER_COURSE_EXPORT,
+                    "status": {"$in": ACTIVE_EXPORT_STATES},
+                },
+            ),
             IndexModel([("created_at", 1)], expireAfterSeconds=604800),
         ]

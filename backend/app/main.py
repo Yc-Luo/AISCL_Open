@@ -14,6 +14,7 @@ from app.api.v1 import (
     projects,
     storage,
     courses,
+    course_exports,
     teacher_model_connections,
     course_task_releases,
     tasks,
@@ -40,6 +41,7 @@ from app.core.db.mongodb import mongodb
 from app.websocket.socketio_server import socketio_app
 from app.websocket.yjs_server import websocket_endpoint
 from app.core.tasks import run_periodic_updates, run_resource_parse_updates
+from app.services.teacher_course_exports import recover_interrupted_teacher_exports, stop_teacher_exports
 import asyncio
 
 logger = logging.getLogger(__name__)
@@ -51,6 +53,7 @@ async def lifespan(app: FastAPI):
     # Startup
     setup_logging()  # Setup logging first
     await mongodb.connect()
+    await recover_interrupted_teacher_exports()
     await get_redis_client()  # Initialize Redis connection
     
     # Start background tasks
@@ -77,6 +80,7 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
         
+    await stop_teacher_exports()
     await close_redis_client()
     await mongodb.disconnect()
 
@@ -190,6 +194,7 @@ app.include_router(users.router, prefix="/api/v1")
 app.include_router(projects.router, prefix="/api/v1")
 app.include_router(storage.router, prefix="/api/v1")
 app.include_router(courses.router, prefix="/api/v1")
+app.include_router(course_exports.router, prefix="/api/v1")
 app.include_router(teacher_model_connections.router, prefix="/api/v1")
 app.include_router(course_task_releases.router, prefix="/api/v1")
 app.include_router(tasks.router, prefix="/api/v1")

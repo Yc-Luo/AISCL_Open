@@ -5,6 +5,7 @@ import { ROUTES } from '../../config/routes'
 import { courseService, type Course, type Student } from '../../services/api/course'
 import { useAuthStore } from '../../stores/authStore'
 import ClassAISettings from './ClassAISettings'
+import CourseExports from './CourseExports'
 import CourseLearningDesign from './CourseLearningDesign'
 
 type Load<T> = { data: T } | { error: string } | null
@@ -166,6 +167,7 @@ function ClassDetail({ course }: { course: Course }) {
       </header>
       <ClassAISettings courseId={course.id} />
       <CourseLearningDesign courseId={course.id} />
+      <CourseExports courseId={course.id} />
       <section aria-labelledby="class-roster">
         <h2 id="class-roster" className="mb-3 flex items-center gap-2 font-semibold"><Users size={18} /> 学生名单</h2>
         {students.length ? (

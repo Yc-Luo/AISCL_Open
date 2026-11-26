@@ -1022,6 +1022,13 @@ def _export_job_response(job: ExportJob) -> Dict[str, Any]:
     }
 
 
+async def _get_admin_export_job(job_id: str) -> ExportJob:
+    job = await ExportJob.get(job_id)
+    if not job or job.job_type != "course_research_package":
+        raise HTTPException(status_code=404, detail="Export job not found")
+    return job
+
+
 @router.post("/courses/{course_id}/research-package/jobs", status_code=status.HTTP_202_ACCEPTED)
 async def create_course_research_package_job(
     course_id: str,
@@ -1055,9 +1062,7 @@ async def get_export_job(
 ) -> Dict[str, Any]:
     """Return export job state."""
     await _require_admin(current_user)
-    job = await ExportJob.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Export job not found")
+    job = await _get_admin_export_job(job_id)
     return _export_job_response(job)
 
 
@@ -1068,9 +1073,7 @@ async def get_export_job_download_link(
 ) -> Dict[str, Any]:
     """Return a short-lived browser-native download URL for a completed export."""
     await _require_admin(current_user)
-    job = await ExportJob.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Export job not found")
+    job = await _get_admin_export_job(job_id)
     if job.status != "completed" or not job.file_path or not os.path.exists(job.file_path):
         raise HTTPException(status_code=409, detail="Export job is not ready for download")
     expires = int(time.time()) + EXPORT_DOWNLOAD_LINK_TTL_SECONDS
@@ -1090,9 +1093,7 @@ async def download_export_job(
 ) -> StreamingResponse:
     """Download a completed export job ZIP file."""
     await _require_admin(current_user)
-    job = await ExportJob.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Export job not found")
+    job = await _get_admin_export_job(job_id)
     return _export_file_response(job)
 
 
@@ -1103,9 +1104,7 @@ async def signed_download_export_job(
     signature: str = Query(...),
 ) -> StreamingResponse:
     """Download a completed export job through a short-lived signed URL."""
-    job = await ExportJob.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Export job not found")
+    job = await _get_admin_export_job(job_id)
     _verify_export_download_signature(job, expires, signature)
     return _export_file_response(job)
 
