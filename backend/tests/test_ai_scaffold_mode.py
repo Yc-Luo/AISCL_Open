@@ -68,7 +68,7 @@ class ModeTests(TestCase):
 class RuntimeTests(IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.user = SimpleNamespace(id="user")
-        self.conversation = SimpleNamespace(id="conversation", project_id="project", user_id="user", save=AsyncMock())
+        self.conversation = SimpleNamespace(id="conversation", project_id="project", user_id="user", category="chat", save=AsyncMock())
         self.enterContext(patch.object(ai.AIConversation, "get", AsyncMock(return_value=self.conversation)))
         self.chat_data = ai.AIChatRequest(
             project_id="project", message="question", use_rag=False, conversation_id="conversation"
@@ -121,6 +121,7 @@ class RuntimeTests(IsolatedAsyncioTestCase):
                         patch.object(ai.ai_service, "raw_chat_stream", Mock(side_effect=reply_stream)) as raw, \
                         patch.object(ai.agent_service, "chat_stream", Mock(side_effect=reply_stream)) as graph:
                     message.find.return_value.count = AsyncMock(return_value=1)
+                    message.find.return_value.exists = AsyncMock(return_value=False)
                     message.return_value = SimpleNamespace(id="message", insert=AsyncMock())
                     response = await ai.chat_stream.__wrapped__(self.chat_data, None, self.user)
                     events = "".join([chunk async for chunk in response.body_iterator])

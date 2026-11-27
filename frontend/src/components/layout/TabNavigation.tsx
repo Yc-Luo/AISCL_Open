@@ -9,7 +9,6 @@ const tabs = [
   { id: 'inquiry' },
   { id: 'wiki' },
   { id: 'resources' },
-  { id: 'ai' },
   { id: 'dashboard' },
 ]
 
@@ -19,7 +18,6 @@ interface TabNavigationProps {
   currentStage?: string | null
   recommendedTabs?: string[]
   disabledTabs?: string[]
-  hiddenTabs?: string[]
   onOpenGuide?: () => void
 }
 
@@ -29,7 +27,6 @@ export default function TabNavigation({
   currentStage,
   recommendedTabs = [],
   disabledTabs = [],
-  hiddenTabs = [],
   onOpenGuide,
 }: TabNavigationProps) {
   const handleTabChange = (tabId: string) => {
@@ -68,7 +65,7 @@ export default function TabNavigation({
     <div className="border-b border-gray-200 bg-white">
       <div className="flex min-w-0 items-center gap-2 px-3">
         <nav className="flex min-w-0 flex-1 items-center gap-4 overflow-x-auto px-2 lg:justify-center" aria-label="工作区">
-          {tabs.filter((tab) => !hiddenTabs.includes(tab.id)).map((tab) => {
+          {tabs.map((tab) => {
             const isRecommended = recommendedTabs.includes(tab.id)
             const isDisabled = disabledTabs.includes(tab.id)
             return (

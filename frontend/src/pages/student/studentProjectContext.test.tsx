@@ -40,8 +40,10 @@ vi.mock('../../components/features/student/wiki/ProjectWiki', () => ({ default: 
 vi.mock('../../components/features/student/dashboard/LearningDashboard', () => ({ default: () => null }))
 vi.mock('../../components/features/student/document/DocumentEditor', () => ({ default: () => null }))
 vi.mock('../../modules/inquiry/components/InquirySpace', () => ({ InquirySpace: () => null }))
-vi.mock('../../components/features/student/ai/AITutor', () => ({ default: () => null }))
-vi.mock('../../components/features/student/ai/ContextualAIAssistant', () => ({ default: () => null }))
+vi.mock('../../components/features/student/ai/ContextualAIAssistant', () => ({
+  default: ({ isOpen, projectId, initialConversationId }: { isOpen: boolean; projectId: string; initialConversationId?: string }) =>
+    <output aria-label="浮动助手状态">{[projectId, isOpen ? '打开' : '收起', initialConversationId].filter(Boolean).join(' ')}</output>,
+}))
 vi.mock('../../components/features/student/settings/Settings', () => ({ default: () => null }))
 vi.mock('../../components/ui', async () => ({
   ConfirmDialog: (await import('../../components/ui/confirm-dialog')).default,
@@ -88,6 +90,16 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
 describe('student project context', () => {
+  it('opens old personal-AI deep links in the current student workspace and clears them when switching groups', async () => {
+    mocks.getProject.mockResolvedValueOnce(project('group-a')).mockResolvedValueOnce(project('group-b'))
+    mocks.getExperimentVersion.mockResolvedValue({ ai_scaffold_mode: 'single_agent' })
+    open('/project/group-a?tab=ai&conversation=old-thread')
+    await screen.findByText('group-a 打开 old-thread')
+    fireEvent.click(screen.getByText('切换测试小组'))
+    await screen.findByText('group-b 收起')
+    expect(screen.queryByText('group-a 打开 old-thread')).toBeNull()
+  })
+
   it('only opens the first-visit student guide for students, never for a teacher observer', async () => {
     vi.stubGlobal('localStorage', { getItem: () => null, setItem: () => {} })
     mocks.getProject.mockResolvedValue({ ...project('group-a'), course_id: 'course-a' })
@@ -102,6 +114,7 @@ describe('student project context', () => {
     expect(link.getAttribute('href')).toBe(`${returnTo}&group=group-a`)
     expect(screen.getByRole('navigation', { name: '教师观察导航' }).textContent).toContain('group-a')
     expect(screen.queryByRole('button', { name: '关闭使用指南' })).toBeNull()
+    expect(screen.queryByLabelText('浮动助手状态')).toBeNull()
   })
 
   it('uses the list for an ungrouped student, without starting a workspace', async () => {

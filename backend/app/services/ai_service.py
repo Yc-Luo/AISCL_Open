@@ -12,14 +12,14 @@ import tiktoken
 from app.core.llm_config import course_dialogue_llm, get_llm, get_llm_for_role
 from app.core.llm_runtime import guarded_ainvoke, guarded_astream
 from app.repositories.ai_conversation import AIConversation
-from app.repositories.ai_message import AIMessage as AIMessageModel
+from app.repositories.ai_message import AIMessage as AIMessageModel, assistant_reply_content
 from app.repositories.ai_role import AIRole
 
 
 AISCL_PLATFORM_GUIDE = (
     "AISCL 平台功能速查：协作文档用于共同撰写和沉淀结论；论证空间用于结构化观点、证据、反驳和关系；"
     "小组资料用于上传课程资源、学习资料、图片和成果材料；知识沉淀用于形成任务简报、概念卡、证据卡、观点卡、争议卡和阶段结论；"
-    "AI 对话适合个人深入追问，小组聊天 @AISCL智能助手 适合公开协作支架；学习概览查看 4C 和过程建议；"
+    "页面右侧的个人 AI 助手适合私下追问，小组聊天 @AISCL智能助手 适合公开协作支架；学习概览查看过程建议；"
     "教师支持用于低频向教师求助；任务清单用于分解小组待办，教师发布的限时任务需要上传成果并提交。"
     "只有当上下文提供实际检索结果或引用来源时，才建议查看资源库或 Wiki 中的现有内容；"
     "如果没有检索结果，不要假设资源库/Wiki 已有内容可查，应建议先上传资料、创建 Wiki 卡片或补充材料线索。"
@@ -38,6 +38,18 @@ PEDAGOGICAL_RESPONSE_CONTRACT = (
 EMPTY_DIRECT_REPLY_FALLBACK = (
     "本轮没有生成有效回应。你可以把当前问题和希望我回答的方向再发一次，我会继续回复。"
 )
+
+
+def personal_tutor_history(messages: list[AIMessageModel]) -> str:
+    return "\n".join(
+        f"{'学习者' if item.role == 'user' else 'AI'}：{item.dialogue_content[:500]}"
+        for item in messages[-6:]
+        if item.dialogue_content
+    )
+
+
+def _attachment_assisted(attachments, history: list[AIMessageModel]) -> bool:
+    return bool(attachments) or any(item.attachments or item.private_attachment_reply is not None for item in history)
 
 DIRECT_LLM_FORMATTING_INSTRUCTION = (
     "你是直接对话模型。请直接回答用户问题，不要扮演 AISCL 多智能体角色，也不要套用"
@@ -379,6 +391,8 @@ class AIService:
         message_metadata: Optional[dict] = None,
         graph_context: Optional[dict] = None,
         course_models: Optional[dict] = None,
+        attachments: Optional[list] = None,
+        attachment_context: str = "",
     ) -> dict:
         """Non-streaming chat with AI.
 
@@ -449,7 +463,11 @@ class AIService:
                 persona_key=conversation.persona_id,
                 message=message,
                 session_id=str(conversation.id),
-                context={**(context or {}), **graph_context},
+                context={
+                    **(context or {}), **graph_context,
+                    "personal_tutor_history": personal_tutor_history(history),
+                    "private_attachment_context": attachment_context,
+                },
             ):
                 if isinstance(event, str):
                     chunks.append(event)
@@ -466,13 +484,13 @@ class AIService:
             messages = [SystemMessage(content=sys_prompt)]
             for msg in history:
                 if msg.role == "user":
-                    messages.append(HumanMessage(content=msg.content))
+                    messages.append(HumanMessage(content=msg.dialogue_content))
                 else:
-                    messages.append(AIMessage(content=msg.content))
+                    messages.append(AIMessage(content=msg.dialogue_content))
             messages.append(HumanMessage(content=message))
-            if context:
-                context_text = "\n\nContext:\n" + AIService.format_context_for_prompt(context)
-                messages[-1] = HumanMessage(content=message + context_text)
+            context_text = AIService.format_context_for_prompt(context) if context else ""
+            if context_text or attachment_context:
+                messages[-1] = HumanMessage(content="\n\n".join(filter(None, [context_text, attachment_context, message])))
             messages = AIService.truncate_context(messages, AIService.MAX_CONTEXT_TOKENS)
             if course_models and course_models.get("default_model_id"):
                 async with course_dialogue_llm(
@@ -492,20 +510,23 @@ class AIService:
             conversation_id=str(conversation.id),
             role="user",
             content=message,
+            attachments=attachments or [],
         )
         await user_message.insert()
 
         ai_message = AIMessageModel(
             conversation_id=str(conversation.id),
             role="assistant",
-            content=response_text,
+            **assistant_reply_content(response_text, attachment_assisted=_attachment_assisted(attachments, history)),
             citations=citations,
             metadata=message_metadata,
         )
         await ai_message.insert()
+        conversation.updated_at = datetime.utcnow()
+        await conversation.save()
 
         # Generate dynamic suggestions
-        suggestions = [] if graph_context or course_models else await AIService.generate_followup_suggestions(response_text)
+        suggestions = [] if graph_context or course_models or _attachment_assisted(attachments, history) else await AIService.generate_followup_suggestions(response_text)
 
         return {
             "conversation_id": str(conversation.id),
@@ -665,6 +686,8 @@ class AIService:
         model_id: Optional[str] = None,
         context_messages: Optional[List[dict]] = None,
         course_model_owner_id: Optional[str] = None,
+        attachments: Optional[list] = None,
+        attachment_context: str = "",
     ) -> dict:
         """Direct non-streaming chat: preserve history with only neutral readability guidance."""
         if conversation_id:
@@ -690,7 +713,9 @@ class AIService:
 
         messages = AIService._coerce_raw_context_messages(context_messages)
         for msg in history:
-            messages.append(HumanMessage(content=msg.content) if msg.role == "user" else AIMessage(content=msg.content))
+            messages.append(HumanMessage(content=msg.dialogue_content) if msg.role == "user" else AIMessage(content=msg.dialogue_content))
+        if attachment_context:
+            messages.append(HumanMessage(content=attachment_context))
         messages.append(HumanMessage(content=message))
         messages = AIService._with_direct_formatting_instruction(messages)
         messages = AIService.truncate_raw_messages(messages, AIService.MAX_CONTEXT_TOKENS)
@@ -705,11 +730,12 @@ class AIService:
             conversation_id=str(conversation.id),
             role="user",
             content=message,
+            attachments=attachments or [],
         ).insert()
         ai_message = AIMessageModel(
             conversation_id=str(conversation.id),
             role="assistant",
-            content=response_text,
+            **assistant_reply_content(response_text, attachment_assisted=_attachment_assisted(attachments, history)),
         )
         await ai_message.insert()
         conversation.updated_at = datetime.utcnow()
@@ -733,6 +759,8 @@ class AIService:
         model_id: Optional[str] = None,
         context_messages: Optional[List[dict]] = None,
         course_model_owner_id: Optional[str] = None,
+        attachments: Optional[list] = None,
+        attachment_context: str = "",
     ) -> AsyncIterator[str]:
         """Direct streaming chat: preserve history with only neutral readability guidance."""
         if conversation_id:
@@ -758,7 +786,9 @@ class AIService:
 
         messages = AIService._coerce_raw_context_messages(context_messages)
         for msg in history:
-            messages.append(HumanMessage(content=msg.content) if msg.role == "user" else AIMessage(content=msg.content))
+            messages.append(HumanMessage(content=msg.dialogue_content) if msg.role == "user" else AIMessage(content=msg.dialogue_content))
+        if attachment_context:
+            messages.append(HumanMessage(content=attachment_context))
         messages.append(HumanMessage(content=message))
         messages = AIService._with_direct_formatting_instruction(messages)
         messages = AIService.truncate_raw_messages(messages, AIService.MAX_CONTEXT_TOKENS)
@@ -767,6 +797,7 @@ class AIService:
             conversation_id=str(conversation.id),
             role="user",
             content=message,
+            attachments=attachments or [],
         ).insert()
 
         full_response = ""
@@ -787,7 +818,7 @@ class AIService:
         await AIMessageModel(
             conversation_id=str(conversation.id),
             role="assistant",
-            content=full_response,
+            **assistant_reply_content(full_response, attachment_assisted=_attachment_assisted(attachments, history)),
         ).insert()
         conversation.updated_at = datetime.utcnow()
         await conversation.save()

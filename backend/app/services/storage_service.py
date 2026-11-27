@@ -42,6 +42,7 @@ class StorageService:
     def __init__(self):
         """Initialize storage client."""
         self._bucket_checked = False
+        self._private_ai_bucket_checked = False
         if settings.STORAGE_TYPE == "minio":
             internal_endpoint, internal_secure = _parse_minio_endpoint(
                 settings.MINIO_ENDPOINT, settings.MINIO_USE_SSL
@@ -88,6 +89,21 @@ class StorageService:
             self._bucket_checked = True
         except Exception as e:  # noqa: BLE001
             logger.warning("Storage bucket check skipped during startup: %s", e)
+
+    @property
+    def private_ai_bucket(self) -> str:
+        return f"{settings.MINIO_BUCKET_NAME[:52].rstrip('-.')}-ai-private"
+
+    def _ensure_private_ai_bucket(self) -> None:
+        if self._private_ai_bucket_checked:
+            return
+        if not self.client.bucket_exists(self.private_ai_bucket):
+            try:
+                self.client.make_bucket(self.private_ai_bucket)
+            except S3Error as exc:
+                if exc.code != "BucketAlreadyOwnedByYou":
+                    raise
+        self._private_ai_bucket_checked = True
 
     def generate_presigned_put_url(
         self, file_key: str, expires_in: int = 300
@@ -155,7 +171,7 @@ class StorageService:
         """
         return self.generate_presigned_get_url(file_key, use_cdn=use_cdn)
 
-    def delete_file(self, file_key: str) -> bool:
+    def delete_file(self, file_key: str, *, private_ai: bool = False) -> bool:
         """Delete a file from storage."""
         if not self.client:
             return False
@@ -163,7 +179,8 @@ class StorageService:
         self._ensure_bucket_exists()
 
         try:
-            self.client.remove_object(settings.MINIO_BUCKET_NAME, file_key)
+            bucket = self.private_ai_bucket if private_ai else settings.MINIO_BUCKET_NAME
+            self.client.remove_object(bucket, file_key)
             return True
         except S3Error:
             return False
@@ -186,17 +203,23 @@ class StorageService:
         except S3Error as e:
             raise ValueError(f"Failed to upload file: {e}")
 
-    def upload_file_object(self, file_key: str, file_obj: BinaryIO, length: int, content_type: str) -> None:
+    def upload_file_object(
+        self, file_key: str, file_obj: BinaryIO, length: int, content_type: str,
+        *, private_ai: bool = False,
+    ) -> None:
         """Upload a file-like object without loading the whole file into memory."""
         if not self.client:
             raise ValueError("Storage client not initialized")
 
-        self._ensure_bucket_exists()
+        if private_ai:
+            self._ensure_private_ai_bucket()
+        else:
+            self._ensure_bucket_exists()
 
         try:
             file_obj.seek(0)
             self.client.put_object(
-                settings.MINIO_BUCKET_NAME,
+                self.private_ai_bucket if private_ai else settings.MINIO_BUCKET_NAME,
                 file_key,
                 file_obj,
                 length=length,
@@ -204,6 +227,10 @@ class StorageService:
             )
         except S3Error as e:
             raise ValueError(f"Failed to upload file: {e}")
+
+    def open_private_ai_object(self, file_key: str, *, length: int = 0):
+        """Open an authenticated server-side stream. Never sign a public URL."""
+        return self.client.get_object(self.private_ai_bucket, file_key, length=length)
 
     def get_file_bytes(self, file_key: str) -> bytes:
         """Download file bytes from object storage."""

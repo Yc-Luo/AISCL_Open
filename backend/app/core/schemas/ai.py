@@ -28,9 +28,18 @@ class AIChatRequest(BaseModel):
     preferred_subagent: Optional[str] = Field(default=None, max_length=100)
     active_tab: Optional[str] = Field(default=None, max_length=100)
     selected_text: Optional[str] = Field(default=None, max_length=2000)
+    selected_document_id: Optional[str] = Field(default=None, max_length=100)
     selected_resource_id: Optional[str] = Field(default=None, max_length=100)
     selected_inquiry_node_id: Optional[str] = Field(default=None, max_length=100)
     context_source: Optional[str] = Field(default=None, max_length=100)
+    attachment_ids: List[str] = Field(default_factory=list, max_length=3)
+
+
+class AIAttachmentResponse(BaseModel):
+    id: str
+    filename: str
+    size: int
+    mime_type: str
 
 
 class AIChatResponse(BaseModel):
@@ -168,6 +177,8 @@ class AIMessageResponse(BaseModel):
     content: str
     citations: List[dict] = Field(default_factory=list)
     ai_meta: Optional[AITutorMetaResponse] = None
+    attachments: List[AIAttachmentResponse] = Field(default_factory=list)
+    private_context: bool = False
     created_at: datetime
 
     class Config:

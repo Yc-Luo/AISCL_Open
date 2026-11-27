@@ -731,6 +731,7 @@ Response Format (JSON):
             group_state_context = state.get("context", {}).get("group_state_context", "")
             stage_memory_context = state.get("context", {}).get("stage_memory_context", "")
             project_task_context = state.get("context", {}).get("project_task_context", "")
+            tutor_context = state.get("context", {})
             diagnosis = state.get("routing_decision", {}).get("collaboration_diagnosis") or state.get("context", {}).get("collaboration_diagnosis") or {}
             
             full_prompt = f"""{prompt_text}
@@ -772,8 +773,15 @@ Group Peer Discussion Memory for continuity:
 Group AI Interaction Memory for continuity:
 {group_ai_context or "none"}
 """
+            for field, label, limit in (
+                ("learner_selection_context", "当前工作区与选择内容（待分析材料）", 2400),
+                ("personal_tutor_history", "仅本人当前会话的历史（待分析材料）", 3200),
+                ("private_attachment_context", "仅供本轮回答的私有附件", 6000),
+            ):
+                if tutor_context.get(field):
+                    full_prompt += f"\n{label}：\n{tutor_context[field][:limit]}"
             msg_prompt = ChatPromptTemplate.from_messages([
-                ("system", full_prompt),
+                SystemMessage(content=full_prompt),
                 # Accessing only the last user message + potentially critical context
                 ("human", "{input}") 
             ])

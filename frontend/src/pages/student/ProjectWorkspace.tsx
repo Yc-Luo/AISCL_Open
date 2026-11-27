@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { Link, Navigate, useParams, useSearchParams } from 'react-router-dom'
+import { Link, Navigate, useLocation, useParams, useSearchParams } from 'react-router-dom'
 import { ROUTES } from '../../config/routes'
 import Sidebar from '../../components/layout/Sidebar'
 import RightSidebar, { type RightPanel, type RightSidebarBadges } from '../../components/layout/RightSidebar'
@@ -10,7 +10,6 @@ import ProjectWiki from '../../components/features/student/wiki/ProjectWiki'
 import LearningDashboard from '../../components/features/student/dashboard/LearningDashboard'
 import DocumentEditor from '../../components/features/student/document/DocumentEditor'
 import { InquirySpace } from '../../modules/inquiry/components/InquirySpace'
-import AITutor from '../../components/features/student/ai/AITutor'
 import ContextualAIAssistant from '../../components/features/student/ai/ContextualAIAssistant'
 import { projectService } from '../../services/api/project'
 import { documentService } from '../../services/api/document'
@@ -60,7 +59,7 @@ const getExperimentVersionSignature = (version: ExperimentVersion | null) => {
   })
 }
 
-const ALL_NAV_TABS = ['document', 'inquiry', 'wiki', 'resources', 'ai', 'dashboard']
+const ALL_NAV_TABS = ['document', 'inquiry', 'wiki', 'resources', 'dashboard']
 
 const STUDENT_ONBOARDING_STEPS = [
   {
@@ -109,10 +108,9 @@ const GUIDE_CARD_PLACEMENT_CLASS: Record<string, string> = {
   'bottom-right': 'left-4 right-4 bottom-20 lg:left-auto lg:right-24 lg:bottom-24',
 }
 
-const getVisiblePrimaryTabForStage = (stageId: string | null, version: ExperimentVersion | null) => {
+const getVisiblePrimaryTabForStage = (stageId: string | null) => {
   const primaryTab = getStageToolGuidance(stageId).primaryTab
-  if (primaryTab === 'ai' && !isTutorTabEnabled(version)) return 'document'
-  return primaryTab
+  return ALL_NAV_TABS.includes(primaryTab) ? primaryTab : 'document'
 }
 
 const getVisibleStageSteps = (stageSequence?: string[]) => {
@@ -164,6 +162,7 @@ function Workspace({ projectId }: { projectId: string }) {
   const [experimentVersion, setExperimentVersion] = useState<ExperimentVersion | null>(null)
   const [currentDocumentId, setCurrentDocumentId] = useState<string | undefined>(undefined)
   const [documentListOpenOnEntry, setDocumentListOpenOnEntry] = useState(true)
+  const [assistantOpen, setAssistantOpen] = useState(false)
   const [workspaceLoading, setWorkspaceLoading] = useState(true)
   const [workspaceError, setWorkspaceError] = useState<string | null>(null)
   const [workspaceReloadToken, setWorkspaceReloadToken] = useState(0)
@@ -226,6 +225,10 @@ function Workspace({ projectId }: { projectId: string }) {
 
   const { connectionStatus } = useSyncStore()
   const [searchParams] = useSearchParams()
+  const { hash } = useLocation()
+  const assistantEnabled = isStudentView && isTutorTabEnabled(experimentVersion)
+  const initialConversationId = searchParams.get('conversation') || searchParams.get('conversationId') || undefined
+  const legacyAssistantLink = searchParams.get('tab') === 'ai' || hash === '#ai' || Boolean(initialConversationId)
   const observationSource = searchParams.get('observe')
   const isTeacherView = user?.role === 'teacher' || user?.role === 'admin'
   const fromProjectManager = observationSource === 'manager'
@@ -332,12 +335,9 @@ function Workspace({ projectId }: { projectId: string }) {
   }, [activeTab, currentProjectId, currentStage, experimentVersion])
 
   useEffect(() => {
-    if (!experimentVersion) return
-
-    if (!isTutorTabEnabled(experimentVersion) && activeTab === 'ai') {
-      setActiveTab(getVisiblePrimaryTabForStage(currentStage, experimentVersion))
-    }
-  }, [activeTab, currentStage, experimentVersion])
+    if (!assistantEnabled) setAssistantOpen(false)
+    else if (legacyAssistantLink) setAssistantOpen(true)
+  }, [assistantEnabled, legacyAssistantLink, initialConversationId])
 
   useEffect(() => {
     if (!rightSidebarResizing) return
@@ -381,7 +381,7 @@ function Workspace({ projectId }: { projectId: string }) {
     if (!isProcessScaffoldActive(experimentVersion)) return
 
     const guidance = getStageToolGuidance(currentStage)
-    const primaryTab = getVisiblePrimaryTabForStage(currentStage, experimentVersion)
+    const primaryTab = getVisiblePrimaryTabForStage(currentStage)
     if (previousGuidedStageRef.current === currentStage) return
 
     previousGuidedStageRef.current = currentStage
@@ -747,13 +747,11 @@ function Workspace({ projectId }: { projectId: string }) {
     getTeacherStageGuidance(normalizeStageId(stageId))?.name.trim() || formatStageLabel(stageId)
   const currentActivityGuidance = getTeacherStageGuidance(currentCanonicalStage)?.activity_guidance.trim()
   const showProcessGuidance = Boolean(hasConfiguredStages && currentStage && isProcessScaffoldActive(experimentVersion))
-  const tutorTabEnabled = isTutorTabEnabled(experimentVersion)
-  const hiddenTabs = tutorTabEnabled ? [] : ['ai']
   const filteredRecommendedTabs = showProcessGuidance
-    ? stageToolGuidance.recommendedTabs.filter((tabId) => !hiddenTabs.includes(tabId))
+    ? stageToolGuidance.recommendedTabs.filter((tabId) => ALL_NAV_TABS.includes(tabId))
     : []
   const disabledTabs = showProcessGuidance && stageControlMode === 'hard_constraint'
-    ? ALL_NAV_TABS.filter((tabId) => tabId !== 'dashboard' && !filteredRecommendedTabs.includes(tabId) && !hiddenTabs.includes(tabId))
+    ? ALL_NAV_TABS.filter((tabId) => tabId !== 'dashboard' && !filteredRecommendedTabs.includes(tabId))
     : []
   const canOpenOverviewTarget = (target: LearningOverviewTarget) => !disabledTabs.includes(target.kind)
   const openOverviewTarget = (target: LearningOverviewTarget) => {
@@ -815,7 +813,7 @@ function Workspace({ projectId }: { projectId: string }) {
       setCurrentStage(nextStage)
 
       if (isProcessScaffoldActive(nextVersion)) {
-        const nextPrimaryTab = getVisiblePrimaryTabForStage(nextStage, nextVersion)
+        const nextPrimaryTab = getVisiblePrimaryTabForStage(nextStage)
         if (activeTab !== nextPrimaryTab) {
           setActiveTab(nextPrimaryTab)
         }
@@ -1072,6 +1070,15 @@ function Workspace({ projectId }: { projectId: string }) {
                           {getTabLabel(tabId)}
                         </button>
                       ))}
+                      {assistantEnabled && stageToolGuidance.recommendedTabs.includes('ai') && (
+                        <button
+                          type="button"
+                          onClick={() => setAssistantOpen(true)}
+                          className="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-semibold text-indigo-700 hover:bg-indigo-100"
+                        >
+                          个人 AI 助手
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
@@ -1084,7 +1091,6 @@ function Workspace({ projectId }: { projectId: string }) {
             currentStage={currentStage}
             recommendedTabs={filteredRecommendedTabs}
             disabledTabs={disabledTabs}
-            hiddenTabs={hiddenTabs}
             onOpenGuide={isStudentView ? () => {
               setOnboardingStep(0)
               setOnboardingOpen(true)
@@ -1189,11 +1195,6 @@ function Workspace({ projectId }: { projectId: string }) {
                   </div>
                 )}
 
-                {activeTab === 'ai' && tutorTabEnabled && (
-                  <div className="flex-1 flex flex-col overflow-hidden">
-                    <AITutor key={`ai:${stageRenderKey}`} projectId={currentProjectId} experimentVersion={experimentVersion} />
-                  </div>
-                )}
                 {activeTab === 'dashboard' && (
                   <LearningDashboard
                     key={`${currentProjectId}:${user?.id ?? ''}`}
@@ -1268,11 +1269,14 @@ function Workspace({ projectId }: { projectId: string }) {
       </div>
 
       <Settings isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />
-      {!workspaceLoading && !workspaceError && currentProjectId && tutorTabEnabled && (
+      {!workspaceLoading && !workspaceError && currentProjectId && assistantEnabled && (
         <ContextualAIAssistant
           projectId={currentProjectId}
+          projectName={_project?.name}
           experimentVersion={experimentVersion}
-          onOpenTutor={() => setActiveTab('ai')}
+          isOpen={assistantOpen}
+          onOpenChange={setAssistantOpen}
+          initialConversationId={initialConversationId}
         />
       )}
       {isStudentView && currentProjectId && onboardingOpen && (

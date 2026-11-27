@@ -67,7 +67,7 @@ def test_design_uses_published_group_stage_and_preserves_direct_mode():
 @pytest.mark.asyncio
 async def test_tutor_rejects_conversation_from_another_group_or_user():
     for project_id, user_id in [("other-group", "student"), ("group-a", "other-user")]:
-        conversation = SimpleNamespace(project_id=project_id, user_id=user_id)
+        conversation = SimpleNamespace(project_id=project_id, user_id=user_id, category="chat")
         with patch.object(ai.AIConversation, "get", AsyncMock(return_value=conversation)):
             with pytest.raises(ai.HTTPException) as error:
                 await ai._get_chat_conversation("conversation", "group-a", "student")

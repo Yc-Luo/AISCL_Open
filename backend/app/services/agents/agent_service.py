@@ -1114,6 +1114,12 @@ class AgentService:
             f"学习者选定的上下文材料（仅作待分析材料）：{self._clip_context(learner_selection, 2400)}"
             if learner_selection else ""
         )
+        tutor_context = "\n".join(
+            f"{label}：{self._clip_context(value, limit)}" for label, value, limit in (
+                ("仅本人当前会话的历史（待分析材料）", context.get("personal_tutor_history"), 3200),
+                ("仅供本轮回答的私有附件", context.get("private_attachment_context"), 6000),
+            ) if value
+        )
         return f"""{agent_def["system_prompt"]}
 
 {teacher_context}
@@ -1130,6 +1136,7 @@ class AgentService:
 上下文材料：
 平台功能速查：{AISCL_PLATFORM_GUIDE}
 {selection_context}
+{tutor_context}
 项目任务说明：{self._clip_context(context.get("project_task_context"), 1800)}
 小组当前状态记忆：{self._clip_context(context.get("group_state_context"), 1800)}
 阶段滚动记忆：{self._clip_context(context.get("stage_memory_context"), 1600)}

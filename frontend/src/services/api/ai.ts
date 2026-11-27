@@ -15,6 +15,39 @@ export interface ChatMessage {
     created_at?: string
 }
 
+export interface AIAttachment {
+    id: string
+    filename: string
+    size: number
+    mime_type: string
+}
+
+export interface AIConversationSummary {
+    id: string
+    project_id: string
+    title: string
+    updated_at: string
+}
+
+export interface AICitation {
+    resource_id?: string
+    resource_type?: string
+    title?: string
+}
+
+export interface AIHistoryMessage {
+    id: string
+    role: 'user' | 'assistant' | 'system'
+    content: string
+    created_at: string
+    citations?: AICitation[]
+    ai_meta?: AIStreamMeta['ai_meta'] | null
+    attachments?: AIAttachment[]
+    private_context?: boolean
+}
+
+type AIPage = { skip: number; limit: number }
+
 export interface InterventionCheckContextPayload {
     last_message_time?: string
     recent_messages: Array<{
@@ -48,6 +81,7 @@ export interface AIResearchContextPayload {
     preferred_subagent?: string
     active_tab?: string
     selected_text?: string
+    selected_document_id?: string
     selected_resource_id?: string
     selected_inquiry_node_id?: string
     context_source?: string
@@ -71,7 +105,7 @@ export interface AIStreamMeta {
         orchestration_mode?: string
         active_agents?: string[]
     }
-    citations?: Array<Record<string, unknown>>
+    citations?: AICitation[]
     conversation_id?: string
     message_id?: string
     citation_count?: number
@@ -97,7 +131,8 @@ export const aiService = {
         conversationId: string | null | undefined,
         message: string,
         projectId: string,
-        researchContext?: AIResearchContextPayload
+        researchContext?: AIResearchContextPayload,
+        attachmentIds?: string[],
     ) => {
         const response = await api.post('/ai/chat', {
             project_id: projectId,
@@ -109,9 +144,11 @@ export const aiService = {
             preferred_subagent: researchContext?.preferred_subagent,
             active_tab: researchContext?.active_tab,
             selected_text: researchContext?.selected_text,
+            selected_document_id: researchContext?.selected_document_id,
             selected_resource_id: researchContext?.selected_resource_id,
             selected_inquiry_node_id: researchContext?.selected_inquiry_node_id,
             context_source: researchContext?.context_source,
+            attachment_ids: attachmentIds,
         })
         return response.data
     },
@@ -123,6 +160,7 @@ export const aiService = {
             conversation_id?: string
             role_id?: string
             use_rag?: boolean
+            attachment_ids?: string[]
         } & AIResearchContextPayload,
         handlers?: {
             onChunk?: (chunk: string, fullText: string) => void
@@ -130,7 +168,8 @@ export const aiService = {
             onMeta?: (meta: AIStreamMeta) => void
             onDone?: (meta: AIStreamMeta) => void
             onError?: (error: AIStreamStatus) => void
-        }
+        },
+        signal?: AbortSignal,
     ) => {
         const token = localStorage.getItem('access_token')
         const response = await fetch(`${config.apiBaseUrl}/api/v1/ai/chat/stream`, {
@@ -140,6 +179,7 @@ export const aiService = {
                 ...(token ? { Authorization: `Bearer ${token}` } : {}),
             },
             body: JSON.stringify(payload),
+            signal,
         })
 
         if (!response.ok) {
@@ -283,14 +323,27 @@ export const aiService = {
     },
 
     // Get conversations for a project
-    getConversations: async (projectId: string): Promise<any> => {
-        const response = await api.get(`/ai/conversations/${projectId}`)
+    getConversations: async (projectId: string, params?: AIPage, signal?: AbortSignal): Promise<{ conversations: AIConversationSummary[]; total: number }> => {
+        const response = await api.get(`/ai/conversations/${encodeURIComponent(projectId)}`, { params, signal })
         return response.data
     },
 
     // Get messages for a conversation
-    getMessages: async (conversationId: string): Promise<any> => {
-        const response = await api.get(`/ai/conversations/${conversationId}/messages`)
+    getMessages: async (conversationId: string, params?: AIPage, signal?: AbortSignal): Promise<{ messages: AIHistoryMessage[]; total: number }> => {
+        const response = await api.get(`/ai/conversations/${encodeURIComponent(conversationId)}/messages`, { params, signal })
+        return response.data
+    },
+
+    uploadAttachment: async (projectId: string, file: File, signal?: AbortSignal): Promise<AIAttachment> => {
+        const form = new FormData()
+        form.append('project_id', projectId)
+        form.append('file', file)
+        const response = await api.post('/ai/attachments', form, { signal })
+        return response.data
+    },
+
+    getAttachment: async (attachmentId: string, signal?: AbortSignal): Promise<Blob> => {
+        const response = await api.get(`/ai/attachments/${encodeURIComponent(attachmentId)}`, { responseType: 'blob', signal })
         return response.data
     },
 

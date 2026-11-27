@@ -32,6 +32,7 @@ class MongoDB:
         from app.repositories.calendar_event import CalendarEvent
         from app.repositories.resource import Resource
         from app.repositories.ai_conversation import AIConversation
+        from app.repositories.ai_attachment import AIAttachment
         from app.repositories.ai_message import AIMessage
         from app.repositories.activity_log import ActivityLog
         from app.repositories.research_event import ResearchEvent
@@ -68,6 +69,7 @@ class MongoDB:
                 CalendarEvent,
                 Resource,
                 AIConversation,
+                AIAttachment,
                 AIMessage,
                 ActivityLog,
                 ResearchEvent,
